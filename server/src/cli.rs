@@ -64,7 +64,8 @@ enum Command {
         /// Read-only TeslaMate Postgres URL.
         #[arg(long, env = "TESLAMATE_DATABASE_URL")]
         source: String,
-        /// Rows per batch. Positions use one multi-row insert per batch.
+        /// Rows per batch for every table except positions.
+        /// Positions are read 5000 rows at a time.
         #[arg(long, default_value_t = 1000)]
         batch_size: i64,
     },
