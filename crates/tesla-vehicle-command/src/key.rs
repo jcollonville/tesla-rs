@@ -6,7 +6,6 @@ use std::path::Path;
 
 use p256::SecretKey;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding};
-use rand_core::OsRng;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use zeroize::Zeroize;
 
@@ -44,8 +43,15 @@ impl PrivateKey {
     ///
     /// Returns [`CommandError::Entropy`] when the operating system RNG fails.
     pub fn generate() -> Result<Self, CommandError> {
-        let key = SecretKey::random(&mut OsRng);
-        Ok(Self::from_secret_key(&key))
+        let mut bytes = [0_u8; 32];
+        loop {
+            getrandom::getrandom(&mut bytes).map_err(|_| CommandError::Entropy)?;
+            if let Ok(key) = SecretKey::from_slice(&bytes) {
+                bytes.zeroize();
+                return Ok(Self::from_secret_key(&key));
+            }
+            bytes.zeroize();
+        }
     }
 
     /// Loads a PEM private key.

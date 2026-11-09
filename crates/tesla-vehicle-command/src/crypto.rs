@@ -5,7 +5,7 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, KeyInit};
 use hmac::{Hmac, Mac};
 use p256::PublicKey;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use secrecy::{ExposeSecret, SecretBox};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -159,7 +159,7 @@ pub(crate) fn random_bytes<const N: usize>() -> Result<[u8; N], CommandError> {
 }
 
 pub(crate) fn uncompressed_public(key: &p256::SecretKey) -> [u8; PUBLIC_KEY_LEN] {
-    let encoded = key.public_key().to_encoded_point(false);
+    let encoded = key.public_key().to_sec1_point(false);
     let mut out = [0_u8; PUBLIC_KEY_LEN];
     out.copy_from_slice(encoded.as_bytes());
     out
