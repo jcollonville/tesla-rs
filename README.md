@@ -10,7 +10,7 @@ The crates are written to be reused by other programs. They do not depend on the
 | --- | --- | --- | --- |
 | `crates/tesla-auth` | OAuth 2.0 authorization code with PKCE, refresh, partner tokens, token storage | implemented | MIT OR Apache-2.0 |
 | `crates/tesla-fleet-api` | Async Fleet API client (vehicles, live and cached data, wake, fleet status, telemetry config, charging history, partner registration) | implemented | MIT OR Apache-2.0 |
-| `crates/tesla-vehicle-command` | Virtual key and signed vehicle commands | not started | MIT OR Apache-2.0 |
+| `crates/tesla-vehicle-command` | Virtual key, session handshake, and signed vehicle commands | implemented | MIT OR Apache-2.0 |
 | `crates/tesla-fleet-telemetry` | Fleet Telemetry protobuf decoding and mutual-TLS websocket receiver | implemented | MIT OR Apache-2.0 |
 | `server/` | `tesla-logger`, a self-hosted drive, charge, and state archive (Docker and Home Assistant) | not started | AGPL-3.0-only |
 
@@ -25,6 +25,8 @@ The crates are written to be reused by other programs. They do not depend on the
 * Refresh tokens are single-use (Tesla keeps the previous one valid for up to 24 hours if it was not saved). `Session` serializes refresh inside one process.
 * `vehicle_data` and `wake_up` are billable. The Fleet client never calls `wake_up` for you. A sleeping vehicle comes back as `FleetError::DeviceUnavailable`. Prefer `fleet_status` or `vehicle_data_cached`, and Fleet Telemetry for ongoing data.
 * ID tokens are stored and redacted. This crate does not validate their signatures.
+* `tesla-vehicle-command` keeps the P-256 scalar and the session key in `secrecy` containers and zeroizes them on drop. MAC checks are constant-time. SHA-1 is used only for the protocol's `K = SHA-1(x)[:16]` derivation. Private keys are not logged.
+* Fleet API `wake_up` remains explicit. `Vehicle::wake` calls it once and does not hide the billing.
 
 ## Try the login example
 
@@ -38,6 +40,8 @@ cargo run -p list-vehicles
 ```
 
 The program prints an authorize URL, waits for the browser callback, and lists vehicle name, VIN, and state. It does not print tokens. Set `TESLA_TOKEN_FILE` to persist them.
+
+`examples/lock-unlock` reads that token file, a P-256 PEM from `TESLA_KEY_FILE`, and `TESLA_VIN`. `lock-unlock keygen` writes a new key and prints only the public key. `lock` and `unlock` call `wake_up` once, then the signed command. BLE is not implemented.
 
 ## Development
 

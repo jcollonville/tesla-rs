@@ -4,13 +4,16 @@ members = [
     "crates/tesla-auth",
     "crates/tesla-fleet-api",
     "crates/tesla-fleet-telemetry",
+    "crates/tesla-vehicle-command",
     "examples/list-vehicles",
+    "examples/lock-unlock",
     "examples/telemetry-receiver",
 ]
 default-members = [
     "crates/tesla-auth",
     "crates/tesla-fleet-api",
     "crates/tesla-fleet-telemetry",
+    "crates/tesla-vehicle-command",
 ]
 
 [workspace.package]
@@ -34,6 +37,7 @@ sha2 = "0.10"
 tesla-auth = { version = "0.1.0", path = "crates/tesla-auth" }
 tesla-fleet-api = { version = "0.1.0", path = "crates/tesla-fleet-api" }
 tesla-fleet-telemetry = { version = "0.1.0", path = "crates/tesla-fleet-telemetry" }
+tesla-vehicle-command = { version = "0.1.0", path = "crates/tesla-vehicle-command" }
 thiserror = "2"
 tokio = { version = "1.44", default-features = false }
 url = "2"
