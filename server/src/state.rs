@@ -414,6 +414,91 @@ fn is_updating(obs: &Observation) -> bool {
     status.contains("install") || status.contains("download")
 }
 
+/// Drive boundaries implied by one Owner API streaming sample.
+///
+/// An unknown shift keeps the current drive open. Streaming frames often omit
+/// `shift_state` when the value did not change, and that must not close the drive.
+/// A charge stays open until a drive actually starts. Fleet polling remains the
+/// source that notices sleep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StreamDrive {
+    pub start_drive: bool,
+    pub end_drive: bool,
+    pub end_charge: bool,
+    pub activity: Activity,
+    pub driving: bool,
+}
+
+pub(crate) fn stream_drive_decision(
+    tracker: &Tracker,
+    shift: Option<&str>,
+    speed_kmh: Option<f64>,
+) -> StreamDrive {
+    let known = match normalized_shift(shift) {
+        Some("D" | "R" | "N") => Some(true),
+        Some("P") => Some(false),
+        _ => match speed_kmh {
+            Some(speed) if speed.is_finite() && speed > 1.0 => Some(true),
+            _ => None,
+        },
+    };
+    let driving = known.unwrap_or(tracker.drive_open);
+    let start_drive = driving && !tracker.drive_open;
+    let end_drive = !driving && tracker.drive_open;
+    let end_charge = start_drive && tracker.charge_open;
+    let charge_open = tracker.charge_open && !end_charge;
+    let activity = if driving {
+        Activity::Driving
+    } else if charge_open {
+        Activity::Charging
+    } else if tracker.activity == Activity::Updating {
+        Activity::Updating
+    } else {
+        Activity::Online
+    };
+    StreamDrive {
+        start_drive,
+        end_drive,
+        end_charge,
+        activity,
+        driving,
+    }
+}
+
+/// A streamed fix within two seconds of a polled row is the same moment.
+///
+/// Poll rows are every fifteen seconds or slower, so this only drops the stream
+/// sample that landed on the poll. Neighbouring one-hertz samples stay.
+#[allow(dead_code)] // Unit tests lock this window. The SQL uses the same two seconds.
+pub(crate) fn stream_collides_with_poll(at: DateTime<Utc>, poll_at: DateTime<Utc>) -> bool {
+    at.signed_duration_since(poll_at)
+        .num_milliseconds()
+        .unsigned_abs()
+        <= 2_000
+}
+
+/// Whether this streaming fix should become a `positions` row.
+pub(crate) fn should_store_stream_position(
+    driving: bool,
+    ending_drive: bool,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+) -> bool {
+    let Some(latitude) = latitude else {
+        return false;
+    };
+    let Some(longitude) = longitude else {
+        return false;
+    };
+    if !latitude.is_finite() || !longitude.is_finite() {
+        return false;
+    }
+    if latitude.abs() < 1e-7 && longitude.abs() < 1e-7 {
+        return false;
+    }
+    driving || ending_drive
+}
+
 fn normalized_shift(shift: Option<&str>) -> Option<&str> {
     match shift.map(str::trim) {
         Some("D" | "d") => Some("D"),
@@ -741,8 +826,8 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use super::{
-        Activity, Observation, Presence, Tracker, Transition, reduce, summarize_charge,
-        summarize_drive,
+        Activity, Observation, Presence, Tracker, Transition, reduce, should_store_stream_position,
+        stream_collides_with_poll, stream_drive_decision, summarize_charge, summarize_drive,
     };
 
     fn at(minute: i64) -> chrono::DateTime<Utc> {
@@ -917,5 +1002,85 @@ mod tests {
         assert_eq!(summary.is_dc, Some(true));
         assert_eq!(summary.charger_type.as_deref(), Some("Combo"));
         assert!((summary.max_power_kw.unwrap() - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stream_shift_keeps_an_open_drive_and_a_charge() {
+        let parked = Tracker {
+            activity: Activity::Online,
+            drive_open: false,
+            charge_open: false,
+        };
+        let started = stream_drive_decision(&parked, Some("D"), Some(0.0));
+        assert!(started.start_drive);
+        assert!(started.driving);
+        assert_eq!(started.activity, Activity::Driving);
+
+        let driving = Tracker {
+            activity: Activity::Driving,
+            drive_open: true,
+            charge_open: false,
+        };
+        let held = stream_drive_decision(&driving, None, None);
+        assert!(!held.end_drive);
+        assert!(held.driving);
+        let ended = stream_drive_decision(&driving, Some("P"), Some(0.0));
+        assert!(ended.end_drive);
+        assert_eq!(ended.activity, Activity::Online);
+
+        let charging = Tracker {
+            activity: Activity::Charging,
+            drive_open: false,
+            charge_open: true,
+        };
+        let still = stream_drive_decision(&charging, Some("P"), Some(0.0));
+        assert!(!still.end_charge);
+        assert_eq!(still.activity, Activity::Charging);
+        let depart = stream_drive_decision(&charging, None, Some(5.0));
+        assert!(depart.start_drive);
+        assert!(depart.end_charge);
+
+        let updating = Tracker {
+            activity: Activity::Updating,
+            drive_open: false,
+            charge_open: false,
+        };
+        assert_eq!(
+            stream_drive_decision(&updating, None, None).activity,
+            Activity::Updating
+        );
+
+        let poll = at(0);
+        assert!(stream_collides_with_poll(poll, poll));
+        assert!(stream_collides_with_poll(poll + Duration::seconds(2), poll));
+        assert!(!stream_collides_with_poll(
+            poll + Duration::seconds(3),
+            poll
+        ));
+        assert!(should_store_stream_position(
+            true,
+            false,
+            Some(48.1),
+            Some(11.5)
+        ));
+        assert!(!should_store_stream_position(
+            false,
+            false,
+            Some(48.1),
+            Some(11.5)
+        ));
+        assert!(should_store_stream_position(
+            false,
+            true,
+            Some(48.1),
+            Some(11.5)
+        ));
+        assert!(!should_store_stream_position(
+            true,
+            false,
+            Some(0.0),
+            Some(0.0)
+        ));
+        assert!(!should_store_stream_position(true, false, None, Some(11.5)));
     }
 }

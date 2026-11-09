@@ -5,8 +5,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use tokio::sync::Mutex;
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Serializes `sqlx::migrate!` across `#[tokio::test]` runtimes.
+///
+/// `0001_init.sql` creates one `positions` partition per month from 2012 through
+/// 2035, and each partition keeps several locks until that transaction commits.
+/// The lock table is cluster-wide (`max_locks_per_transaction`, Postgres SQLSTATE
+/// 53200). Parallel migrations overflow it. The lock is released before the test
+/// body runs, so queries still overlap. The server process migrates once at
+/// startup and does not take this lock.
+static MIGRATION: Mutex<()> = Mutex::const_new(());
 
 pub(crate) struct TestDb {
     pub pool: PgPool,
@@ -54,10 +65,12 @@ impl TestDb {
 
     pub(crate) async fn migrated(prefix: &str) -> Option<Self> {
         let db = Self::create(prefix).await?;
+        let guard = MIGRATION.lock().await;
         sqlx::migrate!("./migrations")
             .run(&db.pool)
             .await
             .expect("migrate");
+        drop(guard);
         Some(db)
     }
 }

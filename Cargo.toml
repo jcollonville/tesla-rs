@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/tesla-auth",
+    "crates/tesla-owner-api",
     "crates/tesla-fleet-api",
     "crates/tesla-fleet-telemetry",
     "crates/tesla-vehicle-command",
@@ -12,6 +13,7 @@ members = [
 ]
 default-members = [
     "crates/tesla-auth",
+    "crates/tesla-owner-api",
     "crates/tesla-fleet-api",
     "crates/tesla-fleet-telemetry",
     "crates/tesla-vehicle-command",
@@ -36,6 +38,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tesla-auth = { version = "0.1.0", path = "crates/tesla-auth" }
+tesla-owner-api = { version = "0.1.0", path = "crates/tesla-owner-api" }
 tesla-fleet-api = { version = "0.1.0", path = "crates/tesla-fleet-api" }
 tesla-fleet-telemetry = { version = "0.1.0", path = "crates/tesla-fleet-telemetry" }
 tesla-vehicle-command = { version = "0.1.0", path = "crates/tesla-vehicle-command" }

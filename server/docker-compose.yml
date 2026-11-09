@@ -31,6 +31,7 @@ services:
       DATABASE_URL: postgres://tesla_logger:${POSTGRES_PASSWORD:-change-me}@postgres:5432/tesla_logger
       TESLA_LISTEN_ADDR: 0.0.0.0:4000
       TESLA_TOKEN_STORE_PATH: /data/tokens.json
+      TESLA_OWNER_TOKEN_STORE_PATH: /data/owner-tokens.json
       TESLA_PRIVATE_KEY_PATH: /keys/private-key.pem
     volumes:
       - logger-data:/data

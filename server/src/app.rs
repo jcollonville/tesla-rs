@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tesla_auth::{AuthClient, ClientConfig, PendingAuthorization, Scope, Session};
+use tesla_owner_api::OwnerLogin;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, watch};
 
@@ -18,6 +19,7 @@ use crate::geocode::Geocoder;
 use crate::http;
 use crate::ingest::{self, Archive, FleetPoll, PollPolicy};
 use crate::mqtt;
+use crate::owner_stream::{self, StreamBoard};
 use crate::persist::LiveEvent;
 use crate::telemetry;
 
@@ -38,6 +40,9 @@ pub(crate) struct Inner {
     pub revealed: Mutex<HashMap<String, String>>,
     pub global_error: Arc<Mutex<Option<String>>>,
     pub archive: Arc<Archive>,
+    pub owner_pending: Mutex<Option<(OwnerLogin, Instant)>>,
+    pub stream_board: StreamBoard,
+    pub owner_tokens: watch::Sender<u64>,
 }
 
 pub(crate) struct UiSession {
@@ -103,6 +108,18 @@ pub(crate) async fn serve() -> Result<(), AppError> {
         )
         .await;
     });
+    let owner_state = state.clone();
+    let owner_rx = shutdown_rx.clone();
+    let owner_task = tokio::spawn(async move {
+        owner_stream::run(
+            &owner_state.inner.config,
+            Arc::clone(&owner_state.inner.archive),
+            owner_state.inner.stream_board.clone(),
+            owner_state.inner.owner_tokens.subscribe(),
+            owner_rx,
+        )
+        .await;
+    });
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(%listen, "listening");
     axum::serve(listener, http::router(state))
@@ -115,6 +132,7 @@ pub(crate) async fn serve() -> Result<(), AppError> {
     let _ = poll.await;
     let _ = telemetry_task.await;
     let _ = mqtt_task.await;
+    let _ = owner_task.await;
     Ok(())
 }
 
@@ -138,12 +156,15 @@ pub(crate) async fn build(config: Config) -> Result<AppState, AppError> {
         .await?;
     sqlx::migrate!("./migrations").run(&db).await?;
     let (events, _) = broadcast::channel(256);
+    let (stream_kick, _) = broadcast::channel(32);
+    let (owner_tokens, _) = watch::channel(0_u64);
     let geocoder = Geocoder::from_config(&config)?;
     let archive = Arc::new(Archive {
         db: db.clone(),
         geocoder,
         events: events.clone(),
         runtimes: Arc::new(Mutex::new(HashMap::new())),
+        stream_kick,
     });
     Ok(AppState {
         inner: Arc::new(Inner {
@@ -157,6 +178,9 @@ pub(crate) async fn build(config: Config) -> Result<AppState, AppError> {
             revealed: Mutex::new(HashMap::new()),
             global_error: Arc::new(Mutex::new(None)),
             archive,
+            owner_pending: Mutex::new(None),
+            stream_board: StreamBoard::default(),
+            owner_tokens,
         }),
     })
 }
@@ -264,12 +288,15 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
     .unwrap();
     let session = Arc::new(Session::new(auth, SharedTokenStore(Arc::clone(&store))));
     let (events, _) = broadcast::channel(16);
+    let (stream_kick, _) = broadcast::channel(8);
+    let (owner_tokens, _) = watch::channel(0_u64);
     let geocoder = Geocoder::disabled();
     let archive = Arc::new(Archive {
         db: pool.clone(),
         geocoder,
         events: events.clone(),
         runtimes: Arc::new(Mutex::new(HashMap::new())),
+        stream_kick,
     });
     AppState {
         inner: Arc::new(Inner {
@@ -283,6 +310,9 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
             revealed: Mutex::new(HashMap::new()),
             global_error: Arc::new(Mutex::new(None)),
             archive,
+            owner_pending: Mutex::new(None),
+            stream_board: StreamBoard::default(),
+            owner_tokens,
         }),
     }
 }
