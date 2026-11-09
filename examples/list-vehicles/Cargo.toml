@@ -1,0 +1,22 @@
+[package]
+name = "list-vehicles"
+description = "Local OAuth login example that lists Tesla vehicles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "list-vehicles"
+path = "src/main.rs"
+
+[dependencies]
+secrecy.workspace = true
+tesla-auth.workspace = true
+tesla-fleet-api.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
