@@ -3,13 +3,30 @@
 
 //! Idempotent, resumable import from a TeslaMate 4.x Postgres database.
 //!
-//! The source connection is set read-only. Rows are copied in id order and the
-//! cursor is committed with each batch, so a crash resumes at the last id.
-//! TeslaMate already stores kilometres, km/h, and Celsius. Those values are not
-//! converted again. The column list was checked against TeslaMate 4.x
-//! (`VERSION` 4.5.0-dev) schemas for cars, drives, positions, charging_processes,
-//! charges, addresses, and geofences. `drives.ascent` / `drives.descent` are
-//! optional and were added by migration `20250613133700`.
+//! The source connection is read-only and pinned to UTC. Rows are copied in id
+//! order and the cursor is committed with each batch, so a crash resumes at the
+//! last id. TeslaMate already stores kilometres, km/h, and Celsius. Those values
+//! are not converted again.
+//!
+//! Column types were checked against TeslaMate v4.1.1
+//! (`teslamate-org/teslamate` tag `v4.1.1`, `priv/repo/migrations`). Every
+//! selected value is cast in SQL: `smallint` to `integer`, `numeric` and `real`
+//! to `float8`, `varchar` and the `billing_type` enum to `text`, `json` to
+//! `jsonb`, and `timestamp` without time zone to `timestamptz` with
+//! `AT TIME ZONE 'UTC'`. TeslaMate stores UTC in `timestamp(6)`, not
+//! `timestamptz` (the positions BRIN index uses `timestamp_minmax_multi_ops`).
+//! `drives.ascent` / `drives.descent` are optional smallints added by migration
+//! `20250613133700`.
+//!
+//! Each table is read with `WHERE id > cursor ORDER BY id LIMIT batch`. Positions
+//! and charge samples are inserted as one multi-row statement per page. `batch`
+//! is at most 2000. A position row binds 18 parameters, which stays under
+//! Postgres' 65535-parameter limit, and only that page is resident. A same-host
+//! Postgres 16 imported about 24,000 position rows per second with pages of
+//! 2,000, so 9.3 million positions is about 7 minutes. A NAS disk or a remote
+//! database is slower; half that rate is a fair planning figure. Progress is
+//! logged when a table starts and then about every 5 seconds (`done`, `total`,
+//! `percent`, `rows_per_sec`). Re-running continues from the committed cursor.
 
 use std::collections::{HashMap, HashSet};
 
@@ -50,6 +67,9 @@ async fn read_only_pool(url: &str) -> Result<PgPool, AppError> {
         .max_connections(2)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
+                sqlx::query("SET TIME ZONE 'UTC'")
+                    .execute(&mut *conn)
+                    .await?;
                 sqlx::query("SET default_transaction_read_only = on")
                     .execute(&mut *conn)
                     .await?;
@@ -107,6 +127,7 @@ pub(crate) async fn import_pools(
 }
 
 fn normalize_batch(batch: i64) -> Result<i64, AppError> {
+    // 2000 position rows × 18 parameters = 36000, under the 65535 protocol limit.
     if (1..=2_000).contains(&batch) {
         Ok(batch)
     } else {
@@ -259,12 +280,16 @@ const REQUIRED: &[(&str, &str)] = &[
 
 async fn copy_cars(dest: &PgPool, source: &PgPool, batch: i64) -> Result<u64, AppError> {
     let mut copied = 0u64;
+    let mut progress =
+        TableProgress::open(source, "cars", cursor(dest, "teslamate.cars").await?).await?;
     loop {
         let cursor = cursor(dest, "teslamate.cars").await?;
         let rows: Vec<TmCar> = sqlx::query_as(
-            "SELECT id::bigint AS id, eid::bigint AS eid, vid::bigint AS vid, vin, name, model,
-                    efficiency::float8 AS efficiency, trim_badging, marketing_name, exterior_color,
-                    wheel_type, spoiler_type, display_priority
+            "SELECT id::bigint AS id, eid::bigint AS eid, vid::bigint AS vid, vin::text AS vin,
+                    name::text AS name, model::text AS model, efficiency::float8 AS efficiency,
+                    trim_badging::text AS trim_badging, marketing_name::text AS marketing_name,
+                    exterior_color::text AS exterior_color, wheel_type::text AS wheel_type,
+                    spoiler_type::text AS spoiler_type, display_priority::integer AS display_priority
              FROM cars WHERE id > $1 ORDER BY id LIMIT $2",
         )
         .bind(cursor)
@@ -319,7 +344,9 @@ async fn copy_cars(dest: &PgPool, source: &PgPool, batch: i64) -> Result<u64, Ap
         }
         save_cursor(&mut tx, "teslamate.cars", last).await?;
         tx.commit().await?;
+        progress.advance(rows.len() as u64);
     }
+    progress.finish();
     Ok(copied)
 }
 
@@ -342,12 +369,22 @@ struct TmCar {
 
 async fn copy_addresses(dest: &PgPool, source: &PgPool, batch: i64) -> Result<u64, AppError> {
     let mut copied = 0u64;
+    let mut progress = TableProgress::open(
+        source,
+        "addresses",
+        cursor(dest, "teslamate.addresses").await?,
+    )
+    .await?;
     loop {
         let cursor = cursor(dest, "teslamate.addresses").await?;
         let rows: Vec<TmAddress> = sqlx::query_as(
-            "SELECT id::bigint AS id, display_name, name, house_number, road, neighbourhood, city,
-                    county, state, state_district, postcode, country, latitude::float8 AS latitude,
-                    longitude::float8 AS longitude, osm_id::bigint AS osm_id, osm_type, raw
+            "SELECT id::bigint AS id, display_name::text AS display_name, name::text AS name,
+                    house_number::text AS house_number, road::text AS road,
+                    neighbourhood::text AS neighbourhood, city::text AS city, county::text AS county,
+                    state::text AS state, state_district::text AS state_district,
+                    postcode::text AS postcode, country::text AS country,
+                    latitude::float8 AS latitude, longitude::float8 AS longitude,
+                    osm_id::bigint AS osm_id, osm_type::text AS osm_type, raw::jsonb AS raw
              FROM addresses WHERE id > $1 ORDER BY id LIMIT $2",
         )
         .bind(cursor)
@@ -397,7 +434,9 @@ async fn copy_addresses(dest: &PgPool, source: &PgPool, batch: i64) -> Result<u6
         }
         save_cursor(&mut tx, "teslamate.addresses", last).await?;
         tx.commit().await?;
+        progress.advance(rows.len() as u64);
     }
+    progress.finish();
     Ok(copied)
 }
 
@@ -424,12 +463,19 @@ struct TmAddress {
 
 async fn copy_geofences(dest: &PgPool, source: &PgPool, batch: i64) -> Result<u64, AppError> {
     let mut copied = 0u64;
+    let mut progress = TableProgress::open(
+        source,
+        "geofences",
+        cursor(dest, "teslamate.geofences").await?,
+    )
+    .await?;
     loop {
         let cursor = cursor(dest, "teslamate.geofences").await?;
         let rows: Vec<TmFence> = sqlx::query_as(
-            "SELECT id::bigint AS id, name, latitude::float8 AS latitude, longitude::float8 AS longitude,
-                    radius::float8 AS radius, cost_per_unit::float8 AS cost_per_unit,
-                    session_fee::float8 AS session_fee, billing_type::text AS billing_type
+            "SELECT id::bigint AS id, name::text AS name, latitude::float8 AS latitude,
+                    longitude::float8 AS longitude, radius::float8 AS radius,
+                    cost_per_unit::float8 AS cost_per_unit, session_fee::float8 AS session_fee,
+                    billing_type::text AS billing_type
              FROM geofences WHERE id > $1 ORDER BY id LIMIT $2",
         )
         .bind(cursor)
@@ -472,7 +518,9 @@ async fn copy_geofences(dest: &PgPool, source: &PgPool, batch: i64) -> Result<u6
         }
         save_cursor(&mut tx, "teslamate.geofences", last).await?;
         tx.commit().await?;
+        progress.advance(rows.len() as u64);
     }
+    progress.finish();
     Ok(copied)
 }
 
@@ -499,12 +547,24 @@ async fn copy_drives(
     fences: &HashMap<i64, i64>,
     efficiency: &HashMap<i64, Option<f64>>,
 ) -> Result<u64, AppError> {
-    let ascent_sql = if ascent { "d.ascent" } else { "NULL::integer" };
-    let descent_sql = if ascent { "d.descent" } else { "NULL::integer" };
+    let ascent_sql = if ascent {
+        "d.ascent::integer"
+    } else {
+        "NULL::integer"
+    };
+    let descent_sql = if ascent {
+        "d.descent::integer"
+    } else {
+        "NULL::integer"
+    };
     let sql = format!(
-        "SELECT d.id::bigint AS id, d.car_id::bigint AS car_id, d.start_date, d.end_date,
-                d.distance::float8 AS distance, d.duration_min, d.start_km::float8 AS start_km,
-                d.end_km::float8 AS end_km, d.speed_max, d.power_max, d.power_min,
+        "SELECT d.id::bigint AS id, d.car_id::bigint AS car_id,
+                (d.start_date AT TIME ZONE 'UTC') AS start_date,
+                (d.end_date AT TIME ZONE 'UTC') AS end_date,
+                d.distance::float8 AS distance, d.duration_min::integer AS duration_min,
+                d.start_km::float8 AS start_km, d.end_km::float8 AS end_km,
+                d.speed_max::integer AS speed_max, d.power_max::integer AS power_max,
+                d.power_min::integer AS power_min,
                 d.start_ideal_range_km::float8 AS start_ideal_range_km,
                 d.end_ideal_range_km::float8 AS end_ideal_range_km,
                 d.start_rated_range_km::float8 AS start_rated_range_km,
@@ -524,6 +584,8 @@ async fn copy_drives(
          WHERE d.id > $1 ORDER BY d.id LIMIT $2"
     );
     let mut copied = 0u64;
+    let mut progress =
+        TableProgress::open(source, "drives", cursor(dest, "teslamate.drives").await?).await?;
     loop {
         let cursor = cursor(dest, "teslamate.drives").await?;
         let rows: Vec<TmDrive> = sqlx::query_as(&sql)
@@ -620,7 +682,9 @@ async fn copy_drives(
         }
         save_cursor(&mut tx, "teslamate.drives", last).await?;
         tx.commit().await?;
+        progress.advance(rows.len() as u64);
     }
+    progress.finish();
     Ok(copied)
 }
 
@@ -664,18 +728,28 @@ async fn copy_charges(
     fences: &HashMap<i64, i64>,
 ) -> Result<u64, AppError> {
     let mut copied = 0u64;
+    let mut progress = TableProgress::open(
+        source,
+        "charging_processes",
+        cursor(dest, "teslamate.charges").await?,
+    )
+    .await?;
     loop {
         let cursor = cursor(dest, "teslamate.charges").await?;
         let rows: Vec<TmProcess> = sqlx::query_as(
-            "SELECT c.id::bigint AS id, c.car_id::bigint AS car_id, c.start_date, c.end_date,
+            "SELECT c.id::bigint AS id, c.car_id::bigint AS car_id,
+                    (c.start_date AT TIME ZONE 'UTC') AS start_date,
+                    (c.end_date AT TIME ZONE 'UTC') AS end_date,
                     c.charge_energy_added::float8 AS charge_energy_added,
                     c.charge_energy_used::float8 AS charge_energy_used,
-                    c.start_battery_level, c.end_battery_level,
+                    c.start_battery_level::integer AS start_battery_level,
+                    c.end_battery_level::integer AS end_battery_level,
                     c.start_rated_range_km::float8 AS start_rated_range_km,
                     c.end_rated_range_km::float8 AS end_rated_range_km,
                     c.start_ideal_range_km::float8 AS start_ideal_range_km,
                     c.end_ideal_range_km::float8 AS end_ideal_range_km,
-                    c.duration_min, c.address_id::bigint AS address_id,
+                    c.duration_min::integer AS duration_min,
+                    c.address_id::bigint AS address_id,
                     c.geofence_id::bigint AS geofence_id, c.cost::float8 AS cost,
                     c.outside_temp_avg::float8 AS outside_temp_avg,
                     p.latitude::float8 AS latitude, p.longitude::float8 AS longitude
@@ -742,7 +816,9 @@ async fn copy_charges(
         }
         save_cursor(&mut tx, "teslamate.charges", last).await?;
         tx.commit().await?;
+        progress.advance(rows.len() as u64);
     }
+    progress.finish();
     Ok(copied)
 }
 
@@ -776,17 +852,27 @@ async fn copy_charge_samples(
     charges: &HashMap<i64, i64>,
 ) -> Result<u64, AppError> {
     let mut copied = 0u64;
+    let mut progress = TableProgress::open(
+        source,
+        "charges",
+        cursor(dest, "teslamate.charge_samples").await?,
+    )
+    .await?;
     loop {
         let cursor = cursor(dest, "teslamate.charge_samples").await?;
         let rows: Vec<TmSample> = sqlx::query_as(
-            "SELECT id::bigint AS id, charging_process_id::bigint AS charging_process_id, date,
-                    battery_level, usable_battery_level,
+            "SELECT id::bigint AS id, charging_process_id::bigint AS charging_process_id,
+                    (date AT TIME ZONE 'UTC') AS date,
+                    battery_level::integer AS battery_level,
+                    usable_battery_level::integer AS usable_battery_level,
                     charge_energy_added::float8 AS charge_energy_added,
-                    charger_power, charger_voltage, charger_actual_current,
+                    charger_power::integer AS charger_power,
+                    charger_voltage::integer AS charger_voltage,
+                    charger_actual_current::integer AS charger_actual_current,
                     ideal_battery_range_km::float8 AS ideal_battery_range_km,
                     rated_battery_range_km::float8 AS rated_battery_range_km,
                     outside_temp::float8 AS outside_temp,
-                    fast_charger_present, fast_charger_type
+                    fast_charger_present, fast_charger_type::text AS fast_charger_type
              FROM charges WHERE id > $1 ORDER BY id LIMIT $2",
         )
         .bind(cursor)
@@ -797,49 +883,95 @@ async fn copy_charge_samples(
             break;
         }
         let last = rows.last().map_or(cursor, |row| row.id);
-        let mut tx = dest.begin().await?;
+        let mut prepared = Vec::with_capacity(rows.len());
+        // First DC sample wins, matching the previous per-row COALESCE.
+        let mut dc_type: HashMap<i64, Option<String>> = HashMap::new();
         for row in &rows {
             let Some(charge_id) = charges.get(&row.charging_process_id).copied() else {
                 continue;
             };
-            sqlx::query(
+            if row.fast_charger_present == Some(true) {
+                dc_type
+                    .entry(charge_id)
+                    .or_insert_with(|| row.fast_charger_type.clone());
+            }
+            prepared.push(SampleInsert {
+                charge_id,
+                recorded_at: row.date,
+                battery_level: row.battery_level.map(f64::from),
+                usable_battery_level: row.usable_battery_level.map(f64::from),
+                charger_power_kw: row.charger_power.map(f64::from),
+                charger_voltage: row.charger_voltage.map(f64::from),
+                charger_current: row.charger_actual_current.map(f64::from),
+                charge_energy_added_kwh: row.charge_energy_added,
+                ideal_range_km: row.ideal_battery_range_km,
+                rated_range_km: row.rated_battery_range_km,
+                outside_temp_c: row.outside_temp,
+                external_id: row.id.to_string(),
+            });
+        }
+        let mut tx = dest.begin().await?;
+        if !prepared.is_empty() {
+            let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
                 "INSERT INTO charge_samples (
                     charge_id, recorded_at, battery_level, usable_battery_level, charger_power_kw,
                     charger_voltage, charger_current, charge_energy_added_kwh, ideal_range_km,
                     rated_range_km, outside_temp_c, source, external_id
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                 ON CONFLICT (source, external_id) WHERE external_id IS NOT NULL DO NOTHING",
-            )
-            .bind(charge_id)
-            .bind(row.date)
-            .bind(row.battery_level.map(f64::from))
-            .bind(row.usable_battery_level.map(f64::from))
-            .bind(row.charger_power.map(f64::from))
-            .bind(row.charger_voltage.map(f64::from))
-            .bind(row.charger_actual_current.map(f64::from))
-            .bind(row.charge_energy_added)
-            .bind(row.ideal_battery_range_km)
-            .bind(row.rated_battery_range_km)
-            .bind(row.outside_temp)
-            .bind(SOURCE)
-            .bind(row.id.to_string())
-            .execute(&mut *tx)
-            .await?;
-            if row.fast_charger_present == Some(true) {
-                sqlx::query(
-                    "UPDATE charges SET is_dc = TRUE, charger_type = COALESCE(charger_type, $2) WHERE id = $1",
-                )
-                .bind(charge_id)
-                .bind(&row.fast_charger_type)
-                .execute(&mut *tx)
-                .await?;
-            }
-            copied += 1;
+                ) ",
+            );
+            builder.push_values(prepared.iter(), |mut row, item| {
+                row.push_bind(item.charge_id)
+                    .push_bind(item.recorded_at)
+                    .push_bind(item.battery_level)
+                    .push_bind(item.usable_battery_level)
+                    .push_bind(item.charger_power_kw)
+                    .push_bind(item.charger_voltage)
+                    .push_bind(item.charger_current)
+                    .push_bind(item.charge_energy_added_kwh)
+                    .push_bind(item.ideal_range_km)
+                    .push_bind(item.rated_range_km)
+                    .push_bind(item.outside_temp_c)
+                    .push_bind(SOURCE)
+                    .push_bind(&item.external_id);
+            });
+            builder.push(
+                " ON CONFLICT (source, external_id) WHERE external_id IS NOT NULL DO NOTHING",
+            );
+            builder.build().execute(&mut *tx).await?;
+        }
+        if !dc_type.is_empty() {
+            let pairs: Vec<(i64, Option<String>)> = dc_type.into_iter().collect();
+            let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
+                "UPDATE charges AS c SET is_dc = TRUE, charger_type = COALESCE(c.charger_type, v.ty) FROM (",
+            );
+            builder.push_values(pairs.iter(), |mut row, (id, ty)| {
+                row.push_bind(*id).push_bind(ty);
+            });
+            builder.push(") AS v(id, ty) WHERE c.id = v.id");
+            builder.build().execute(&mut *tx).await?;
         }
         save_cursor(&mut tx, "teslamate.charge_samples", last).await?;
         tx.commit().await?;
+        copied += prepared.len() as u64;
+        progress.advance(rows.len() as u64);
     }
+    progress.finish();
     Ok(copied)
+}
+
+struct SampleInsert {
+    charge_id: i64,
+    recorded_at: DateTime<Utc>,
+    battery_level: Option<f64>,
+    usable_battery_level: Option<f64>,
+    charger_power_kw: Option<f64>,
+    charger_voltage: Option<f64>,
+    charger_current: Option<f64>,
+    charge_energy_added_kwh: Option<f64>,
+    ideal_range_km: Option<f64>,
+    rated_range_km: Option<f64>,
+    outside_temp_c: Option<f64>,
+    external_id: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -888,13 +1020,23 @@ async fn copy_positions(
     drives: &HashMap<i64, i64>,
 ) -> Result<u64, AppError> {
     let mut copied = 0u64;
+    let mut progress = TableProgress::open(
+        source,
+        "positions",
+        cursor(dest, "teslamate.positions").await?,
+    )
+    .await?;
     loop {
         let cursor = cursor(dest, "teslamate.positions").await?;
+        // One page only. The page is dropped at the end of this iteration.
         let rows: Vec<TmPosition> = sqlx::query_as(
-            "SELECT id::bigint AS id, car_id::bigint AS car_id, drive_id::bigint AS drive_id, date,
+            "SELECT id::bigint AS id, car_id::bigint AS car_id, drive_id::bigint AS drive_id,
+                    (date AT TIME ZONE 'UTC') AS date,
                     latitude::float8 AS latitude, longitude::float8 AS longitude,
-                    speed, power, odometer::float8 AS odometer, elevation,
-                    battery_level, usable_battery_level,
+                    speed::integer AS speed, power::integer AS power,
+                    odometer::float8 AS odometer, elevation::integer AS elevation,
+                    battery_level::integer AS battery_level,
+                    usable_battery_level::integer AS usable_battery_level,
                     ideal_battery_range_km::float8 AS ideal_battery_range_km,
                     rated_battery_range_km::float8 AS rated_battery_range_km,
                     est_battery_range_km::float8 AS est_battery_range_km,
@@ -972,7 +1114,9 @@ async fn copy_positions(
         save_cursor(&mut tx, "teslamate.positions", last).await?;
         tx.commit().await?;
         copied += prepared.len() as u64;
+        progress.advance(rows.len() as u64);
     }
+    progress.finish();
     Ok(copied)
 }
 
@@ -1069,6 +1213,99 @@ async fn load_links(pool: &PgPool, entity: &str) -> Result<HashMap<i64, i64>, Ap
         }
     }
     Ok(map)
+}
+
+fn approx_f64(value: u64) -> f64 {
+    u32::try_from(value).map_or(f64::from(u32::MAX), f64::from)
+}
+
+struct TableProgress {
+    label: &'static str,
+    total: u64,
+    done: u64,
+    copied: u64,
+    started: std::time::Instant,
+    last_log: std::time::Instant,
+}
+
+impl TableProgress {
+    async fn open(source: &PgPool, table: &'static str, cursor: i64) -> Result<Self, AppError> {
+        let sql = match table {
+            "cars" => "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM cars",
+            "addresses" => {
+                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM addresses"
+            }
+            "geofences" => {
+                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM geofences"
+            }
+            "drives" => {
+                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM drives"
+            }
+            "charging_processes" => {
+                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM charging_processes"
+            }
+            "charges" => {
+                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM charges"
+            }
+            "positions" => {
+                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM positions"
+            }
+            other => {
+                return Err(AppError::message(format!(
+                    "internal error: no progress query for {other}"
+                )));
+            }
+        };
+        let (total, already): (i64, i64) =
+            sqlx::query_as(sql).bind(cursor).fetch_one(source).await?;
+        let total = u64::try_from(total).unwrap_or(0);
+        let done = u64::try_from(already).unwrap_or(0);
+        tracing::info!(table, total, already = done, "teslamate import table");
+        let now = std::time::Instant::now();
+        Ok(Self {
+            label: table,
+            total,
+            done,
+            copied: 0,
+            started: now,
+            last_log: now,
+        })
+    }
+
+    fn advance(&mut self, rows: u64) {
+        self.copied += rows;
+        self.done = self.done.saturating_add(rows);
+        if self.last_log.elapsed() >= std::time::Duration::from_secs(5) {
+            self.log();
+        }
+    }
+
+    fn finish(&mut self) {
+        self.log();
+    }
+
+    fn log(&mut self) {
+        self.last_log = std::time::Instant::now();
+        let secs = self.started.elapsed().as_secs_f64();
+        let rows_per_sec = if secs < 0.05 {
+            0.0
+        } else {
+            approx_f64(self.copied) / secs
+        };
+        let percent = if self.total == 0 {
+            100.0
+        } else {
+            (approx_f64(self.done) / approx_f64(self.total) * 100.0).min(100.0)
+        };
+        tracing::info!(
+            table = self.label,
+            done = self.done,
+            total = self.total,
+            percent,
+            rows_per_sec,
+            "teslamate import progress"
+        );
+    }
 }
 
 async fn load_efficiency(pool: &PgPool) -> Result<HashMap<i64, Option<f64>>, AppError> {

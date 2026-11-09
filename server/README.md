@@ -52,12 +52,14 @@ docker compose -f server/docker-compose.yml up -d --build
 
 The image runs as uid 10001, uses `postgres:17`, and healthchecks `/healthz`. Point the existing reverse proxy at port 4000 and serve the public key from this process instead of nginx.
 
-Import an existing TeslaMate database (read-only role):
+Import an existing TeslaMate database (read-only role). `import-tesla-mate` is accepted as an alias.
 
 ```bash
 docker compose -f server/docker-compose.yml run --rm tesla-logger \
   import-teslamate --source 'postgres://readonly:secret@teslamate-host:5432/teslamate'
 ```
+
+Positions are copied in pages of at most 2000 rows, and each page commits a cursor, so stopping and rerunning resumes. Only one page is kept in memory. A same-host Postgres 16 imported about 24,000 position rows per second, so 9.3 million positions is about 7 minutes. A NAS disk or a remote database is slower; half that rate is a fair planning figure. The log line `teslamate import progress` reports rows/s and percent complete about every 5 seconds. Charge samples are multi-row inserts too, so a few hundred thousand of them stay in the same order of time as the drives (a few thousand), not the positions.
 
 Images are published to `ghcr.io/jcollonville/tesla-logger` on `main` and on version tags. The workflow builds the runner architecture (amd64). The Dockerfile itself is not architecture-specific.
 

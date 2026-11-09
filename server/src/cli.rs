@@ -59,6 +59,7 @@ enum Command {
     /// Run the HTTP server, Fleet API poller, and optional telemetry and MQTT tasks.
     Serve,
     /// Import cars, drives, positions, charges, addresses, and geofences from TeslaMate.
+    #[command(name = "import-teslamate", visible_alias = "import-tesla-mate")]
     ImportTeslaMate {
         /// Read-only TeslaMate Postgres URL.
         #[arg(long, env = "TESLAMATE_DATABASE_URL")]
@@ -103,5 +104,33 @@ async fn healthcheck(url: &str) -> Result<(), AppError> {
             "healthcheck status {}",
             response.status()
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn import_accepts_the_readme_name_and_the_clap_alias() {
+        for name in ["import-teslamate", "import-tesla-mate"] {
+            let cli = Cli::try_parse_from([
+                "tesla-logger",
+                name,
+                "--source",
+                "postgres://localhost/teslamate",
+            ])
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+            match cli.command.unwrap() {
+                Command::ImportTeslaMate { source, batch_size } => {
+                    assert_eq!(source, "postgres://localhost/teslamate");
+                    assert_eq!(batch_size, 1000);
+                }
+                Command::Serve | Command::Healthcheck { .. } => {
+                    panic!("{name} parsed as a different command");
+                }
+            }
+        }
     }
 }

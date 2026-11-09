@@ -229,6 +229,73 @@ async fn teslamate_import_is_idempotent_and_resumable() {
             .await
             .unwrap();
     assert!((energy.0 - 1.5).abs() < 1e-9);
+    let priority: (i32,) =
+        sqlx::query_as("SELECT display_priority FROM vehicles WHERE vin = '5YJ3E1EA7KF000001'")
+            .fetch_one(&dest.pool)
+            .await
+            .unwrap();
+    assert_eq!(priority.0, 3);
+    let drive: (chrono::DateTime<Utc>, i32, f64, f64, f64) = sqlx::query_as(
+        "SELECT start_at, duration_s, max_speed_kmh, max_power_kw, inside_temp_avg_c
+         FROM drives WHERE external_id = '1'",
+    )
+    .fetch_one(&dest.pool)
+    .await
+    .unwrap();
+    assert_eq!(drive.0, Utc.with_ymd_and_hms(2024, 6, 1, 10, 0, 0).unwrap());
+    assert_eq!(drive.1, 1800);
+    assert!((drive.2 - 110.0).abs() < 1e-9);
+    assert!((drive.3 - 80.0).abs() < 1e-9);
+    assert!((drive.4 - 21.5).abs() < 1e-9);
+    let position: (chrono::DateTime<Utc>, f64, f64, f64) = sqlx::query_as(
+        "SELECT recorded_at, speed_kmh, elevation_m, battery_level
+         FROM positions WHERE external_id = '2'",
+    )
+    .fetch_one(&dest.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        position.0,
+        Utc.with_ymd_and_hms(2024, 6, 1, 10, 30, 0).unwrap()
+    );
+    assert!((position.1 - 80.0).abs() < 1e-9);
+    assert!((position.2 - 55.0).abs() < 1e-9);
+    assert!((position.3 - 74.0).abs() < 1e-9);
+    let missing_power: (Option<f64>,) =
+        sqlx::query_as("SELECT power_kw FROM positions WHERE external_id = '4'")
+            .fetch_one(&dest.pool)
+            .await
+            .unwrap();
+    assert_eq!(missing_power.0, None);
+    let sample: (f64, f64, f64) = sqlx::query_as(
+        "SELECT battery_level, charger_power_kw, charger_voltage
+         FROM charge_samples WHERE external_id = '1'",
+    )
+    .fetch_one(&dest.pool)
+    .await
+    .unwrap();
+    assert!((sample.0 - 45.0).abs() < 1e-9);
+    assert!((sample.1 - 50.0).abs() < 1e-9);
+    assert!((sample.2 - 400.0).abs() < 1e-9);
+    let radius: (f64,) = sqlx::query_as("SELECT radius_m FROM geofences WHERE external_id = '1'")
+        .fetch_one(&dest.pool)
+        .await
+        .unwrap();
+    assert!((radius.0 - 100.0).abs() < 1e-9);
+    let address: (Option<String>, f64) =
+        sqlx::query_as("SELECT city, latitude FROM addresses WHERE external_id = '1'")
+            .fetch_one(&dest.pool)
+            .await
+            .unwrap();
+    assert_eq!(address.0.as_deref(), Some("Paris"));
+    assert!((address.1 - 48.8566).abs() < 1e-6);
+    let level: (f64, f64) =
+        sqlx::query_as("SELECT start_battery_level, cost FROM charges WHERE external_id = '1'")
+            .fetch_one(&dest.pool)
+            .await
+            .unwrap();
+    assert!((level.0 - 40.0).abs() < 1e-9);
+    assert!((level.1 - 4.5).abs() < 1e-9);
     let dc: (Option<bool>,) = sqlx::query_as("SELECT is_dc FROM charges WHERE external_id = '1'")
         .fetch_one(&dest.pool)
         .await
