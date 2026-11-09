@@ -754,6 +754,11 @@ pub struct TelemetryConfig {
     /// Expiry as a unix timestamp in seconds. Absent means Tesla keeps the config indefinitely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exp: Option<u64>,
+    /// When `latest`, the vehicle resends every unacknowledged message.
+    ///
+    /// Requires Fleet Telemetry client 1.0.0 or later. Omit the field for the vehicle default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_policy: Option<String>,
 }
 
 /// One streamed field.
@@ -764,6 +769,16 @@ pub struct TelemetryField {
     /// Optional numeric deadband. Tesla recommends this to cut streaming cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimum_delta: Option<f64>,
+    /// Resend the field after this many seconds even when the value did not change.
+    ///
+    /// Requires firmware 2024.44.32 or later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resend_interval_seconds: Option<u32>,
+    /// Extra fields published in the same payload when this field is sent.
+    ///
+    /// Requires Fleet Telemetry client 1.3.0 or later.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_fields: Vec<String>,
 }
 
 /// Response from creating or deleting a fleet telemetry config.

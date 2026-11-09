@@ -687,6 +687,26 @@ fn validate_telemetry_config(config: &TelemetryConfig) -> Result<(), FleetError>
             "fleet telemetry interval_seconds must be non-zero",
         ));
     }
+    if config.fields.values().any(|field| {
+        field.resend_interval_seconds == Some(0)
+            || field
+                .include_fields
+                .iter()
+                .any(|name| name.is_empty() || name.chars().any(char::is_whitespace))
+    }) {
+        return Err(FleetError::InvalidRequest(
+            "fleet telemetry field options are invalid",
+        ));
+    }
+    if config
+        .delivery_policy
+        .as_ref()
+        .is_some_and(|policy| policy.is_empty() || policy.chars().any(char::is_whitespace))
+    {
+        return Err(FleetError::InvalidRequest(
+            "fleet telemetry delivery_policy is invalid",
+        ));
+    }
     Ok(())
 }
 

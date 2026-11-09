@@ -1,0 +1,64 @@
+[package]
+name = "tesla-fleet-telemetry"
+description = "Decode Tesla Fleet Telemetry and receive it over mutual-TLS websockets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tesla", "fleet-telemetry", "protobuf", "websocket"]
+categories = ["encoding", "network-programming"]
+include = [
+    "src/**",
+    "protos/**",
+    "certs/**",
+    "build.rs",
+    "README.md",
+    "NOTICE",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "Cargo.toml",
+]
+
+[features]
+default = ["server"]
+server = [
+    "dep:futures-util",
+    "dep:rustls",
+    "dep:tokio",
+    "dep:tokio-rustls",
+    "dep:tokio-tungstenite",
+    "tokio/io-util",
+    "tokio/net",
+    "tokio/rt",
+    "tokio/sync",
+    "tokio/time",
+]
+
+[dependencies]
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink", "std"] }
+prost = "0.13"
+prost-types = "0.13"
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = { version = "0.26", optional = true, default-features = false, features = ["handshake"] }
+x509-parser = "0.16"
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+rcgen = "0.13"
+tesla-fleet-api.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+
+[lints]
+workspace = true

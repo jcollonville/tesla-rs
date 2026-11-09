@@ -1,0 +1,30 @@
+tesla-fleet-telemetry
+Copyright 2026 Jean Collonvillé
+
+This crate is dual-licensed under the MIT License or the Apache License,
+Version 2.0. See LICENSE-MIT and LICENSE-APACHE.
+
+Third-party protocol assets
+---------------------------
+
+The files under protos/ are copied without modification from
+https://github.com/teslamotors/fleet-telemetry
+commit bb7c8a931e46da3b3eb6d20a67541c8f755f1ee6
+(2026-11-03, "Add SelfDrivingSoftwareVersion and SemiTrailerLatched fields").
+
+Those files are licensed under the Apache License, Version 2.0.
+Copyright Tesla Motors, Inc. and the contributors of that repository.
+The Apache License text ships with this crate as LICENSE-APACHE and in the
+upstream repository.
+
+The PEM bundles certs/prod_ca.crt and certs/eng_ca.crt are copied from
+config/files/ in the same commit. They are the client-certificate CA chains
+the reference server loads in ExtractServiceTLSConfig (config/config.go).
+They are public certificates, not private keys.
+
+The FlatBuffers envelope in src/envelope.rs is reconstructed from the
+generated Go under messages/tesla/ in that same commit
+(FlatbuffersEnvelope.go, FlatbuffersStream.go, FlatbuffersStreamAck.go,
+Message.go, and flatbuffers_extension.go). The upstream repository does not
+publish the .fbs source. The module documentation on `envelope` records the
+reconstructed schema, including the ack-encoding quirk.

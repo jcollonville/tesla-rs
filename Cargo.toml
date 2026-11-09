@@ -3,9 +3,15 @@ resolver = "3"
 members = [
     "crates/tesla-auth",
     "crates/tesla-fleet-api",
+    "crates/tesla-fleet-telemetry",
     "examples/list-vehicles",
+    "examples/telemetry-receiver",
 ]
-default-members = ["crates/tesla-auth", "crates/tesla-fleet-api"]
+default-members = [
+    "crates/tesla-auth",
+    "crates/tesla-fleet-api",
+    "crates/tesla-fleet-telemetry",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,6 +33,7 @@ serde_json = "1"
 sha2 = "0.10"
 tesla-auth = { version = "0.1.0", path = "crates/tesla-auth" }
 tesla-fleet-api = { version = "0.1.0", path = "crates/tesla-fleet-api" }
+tesla-fleet-telemetry = { version = "0.1.0", path = "crates/tesla-fleet-telemetry" }
 thiserror = "2"
 tokio = { version = "1.44", default-features = false }
 url = "2"
