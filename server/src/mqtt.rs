@@ -93,27 +93,20 @@ async fn publish_current(client: &AsyncClient, config: &Config, db: &PgPool) -> 
     .await
     .map_err(|err| redact_secrets(&err.to_string()))?;
     for row in rows {
-        let event = LiveEvent {
-            kind: "state",
-            vehicle_id: 0,
-            vin: row.vin,
-            name: row.name,
-            model: row.model,
-            activity: "offline",
-            battery_level: row.battery_level,
-            rated_range_km: row.rated_range_km,
-            odometer_km: row.odometer_km,
-            speed_kmh: row.speed_kmh,
-            power_kw: row.power_kw,
-            charger_power_kw: row.charger_power_kw,
-            inside_temp_c: row.inside_temp_c,
-            outside_temp_c: row.outside_temp_c,
-            latitude: row.latitude,
-            longitude: row.longitude,
-            at: chrono::Utc::now(),
-        };
+        let mut event = LiveEvent::skeleton(row.vin, "offline");
+        event.name = row.name;
+        event.model = row.model;
+        event.battery_level = row.battery_level;
+        event.rated_range_km = row.rated_range_km;
+        event.odometer_km = row.odometer_km;
+        event.speed_kmh = row.speed_kmh;
+        event.power_kw = row.power_kw;
+        event.charger_power_kw = row.charger_power_kw;
+        event.inside_temp_c = row.inside_temp_c;
+        event.outside_temp_c = row.outside_temp_c;
+        event.latitude = row.latitude;
+        event.longitude = row.longitude;
         // Activity text comes from the row when present.
-        let mut event = event;
         if let Some(activity) = row.activity {
             // LiveEvent::activity is &'static. Map known values.
             event.activity = crate::state::Activity::parse(&activity).as_str();
@@ -336,7 +329,6 @@ async fn publish(
 mod tests {
     use super::{device_payload, sensors, topic_id};
     use crate::persist::LiveEvent;
-    use chrono::Utc;
 
     #[test]
     fn discovery_payloads_do_not_include_secrets() {
@@ -351,25 +343,9 @@ mod tests {
         assert!(!battery.config.to_lowercase().contains("password"));
         assert!(!battery.config.to_lowercase().contains("token"));
         assert_eq!(topic_id("ab c/.."), "abc");
-        let event = LiveEvent {
-            kind: "state",
-            vehicle_id: 1,
-            vin: "5YJ3".to_owned(),
-            name: None,
-            model: None,
-            activity: "driving",
-            battery_level: Some(70.0),
-            rated_range_km: None,
-            odometer_km: None,
-            speed_kmh: None,
-            power_kw: None,
-            charger_power_kw: None,
-            inside_temp_c: None,
-            outside_temp_c: None,
-            latitude: None,
-            longitude: None,
-            at: Utc::now(),
-        };
+        let mut event = LiveEvent::skeleton("5YJ3", "driving");
+        event.vehicle_id = 1;
+        event.battery_level = Some(70.0);
         assert_eq!((battery.value)(&event).as_deref(), Some("70"));
     }
 }

@@ -13,7 +13,10 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tesla_fleet_telemetry::proto::vehicle_connectivity::ConnectivityEvent;
-use tesla_fleet_telemetry::proto::vehicle_data::{ChargingState, DistanceUnit, Field, ShiftState};
+use tesla_fleet_telemetry::proto::vehicle_data::{
+    CableType, ChargePortLatchValue, ChargingState, DistanceUnit, Field, HvacPowerState,
+    ShiftState, WindowState,
+};
 use tesla_fleet_telemetry::{
     ClientCa, DatumValue, Decoded, FieldKey, IncomingRecord, ServerConfig, TelemetryServer,
     TypedEnum, VehicleData,
@@ -24,7 +27,7 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::ingest::{Archive, apply_for_vin};
 use crate::persist::{VehicleIdentity, resting_observation};
-use crate::state::{Observation, Presence};
+use crate::state::{Observation, Presence, refresh_plugged_in};
 use crate::units::{miles_to_km, speed_to_kmh};
 
 pub(crate) async fn run(
@@ -169,6 +172,7 @@ pub(crate) fn fold_vehicle_data(obs: &mut Observation, data: &VehicleData) {
     for datum in data.iter() {
         apply_field(obs, datum.field, &datum.value, metric);
     }
+    refresh_plugged_in(obs);
 }
 
 fn apply_field(obs: &mut Observation, field: FieldKey, value: &DatumValue, metric: bool) {
@@ -219,7 +223,7 @@ fn apply_field(obs: &mut Observation, field: FieldKey, value: &DatumValue, metri
         }
         Field::ChargeLimitSoc => obs.charge_limit_soc = number(value),
         Field::ChargeAmps => obs.charger_current = number(value),
-        Field::PackVoltage => obs.charger_voltage = number(value),
+        Field::PackVoltage | Field::ChargerVoltage => obs.charger_voltage = number(value),
         Field::InsideTemp => obs.inside_temp_c = number(value),
         Field::OutsideTemp => obs.outside_temp_c = number(value),
         Field::Locked => obs.locked = boolean(value),
@@ -229,7 +233,128 @@ fn apply_field(obs: &mut Observation, field: FieldKey, value: &DatumValue, metri
         Field::Trim => obs.trim_badging = text(value),
         Field::ExteriorColor => obs.exterior_color = text(value),
         Field::FastChargerPresent => obs.fast_charger = boolean(value),
+        Field::ChargeCurrentRequest => obs.charge_current_request = number(value),
+        Field::ChargePortDoorOpen => obs.charge_port_door_open = boolean(value),
+        Field::ChargePortLatch => {
+            if let Some(label) = latch_label(value) {
+                obs.charge_port_latch = Some(label);
+            }
+        }
+        Field::ChargingCableType => {
+            if let Some(label) = cable_label(value) {
+                obs.conn_charge_cable = Some(label);
+            }
+        }
+        Field::TimeToFullCharge => obs.time_to_full_charge_h = nonneg(number(value)),
+        Field::ScheduledChargingStartTime => {
+            if let Some(minutes) = scheduled_minutes(value) {
+                obs.scheduled_charging_start_time = Some(minutes);
+            }
+        }
+        Field::TpmsPressureFl => obs.tpms_pressure_fl = nonneg(number(value)),
+        Field::TpmsPressureFr => obs.tpms_pressure_fr = nonneg(number(value)),
+        Field::TpmsPressureRl => obs.tpms_pressure_rl = nonneg(number(value)),
+        Field::TpmsPressureRr => obs.tpms_pressure_rr = nonneg(number(value)),
+        Field::DoorState => apply_doors(obs, value),
+        Field::FdWindow => obs.fd_window = window_code(value).or(obs.fd_window),
+        Field::FpWindow => obs.fp_window = window_code(value).or(obs.fp_window),
+        Field::RdWindow => obs.rd_window = window_code(value).or(obs.rd_window),
+        Field::RpWindow => obs.rp_window = window_code(value).or(obs.rp_window),
+        Field::BatteryHeaterOn => obs.battery_heater_on = boolean(value),
+        Field::PreconditioningEnabled => obs.is_preconditioning = boolean(value),
+        Field::HvacPower => apply_hvac(obs, value),
         _ => {}
+    }
+}
+
+fn nonneg(value: Option<f64>) -> Option<f64> {
+    value.filter(|number| number.is_finite() && *number >= 0.0)
+}
+
+fn apply_doors(obs: &mut Observation, value: &DatumValue) {
+    let DatumValue::Doors(doors) = value else {
+        return;
+    };
+    obs.df = Some(i32::from(doors.driver_front));
+    obs.dr = Some(i32::from(doors.driver_rear));
+    obs.pf = Some(i32::from(doors.passenger_front));
+    obs.pr = Some(i32::from(doors.passenger_rear));
+    obs.ft = Some(i32::from(doors.trunk_front));
+    obs.rt = Some(i32::from(doors.trunk_rear));
+}
+
+fn window_code(value: &DatumValue) -> Option<i32> {
+    match value {
+        DatumValue::WindowState(TypedEnum::Known(state)) => match state {
+            WindowState::Closed => Some(0),
+            WindowState::PartiallyOpen => Some(1),
+            WindowState::Opened => Some(2),
+            WindowState::Unknown => None,
+        },
+        DatumValue::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "closed" | "close" | "windowstateclosed" => Some(0),
+            "partiallyopen" | "partial" | "windowstatepartiallyopen" => Some(1),
+            "opened" | "open" | "windowstateopened" => Some(2),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn latch_label(value: &DatumValue) -> Option<String> {
+    match value {
+        DatumValue::ChargePortLatch(TypedEnum::Known(state)) => match state {
+            ChargePortLatchValue::ChargePortLatchEngaged => Some("Engaged".to_owned()),
+            ChargePortLatchValue::ChargePortLatchDisengaged => Some("Disengaged".to_owned()),
+            ChargePortLatchValue::ChargePortLatchBlocking => Some("Blocking".to_owned()),
+            _ => None,
+        },
+        DatumValue::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "engaged" => Some("Engaged".to_owned()),
+            "disengaged" => Some("Disengaged".to_owned()),
+            "blocking" => Some("Blocking".to_owned()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn cable_label(value: &DatumValue) -> Option<String> {
+    match value {
+        DatumValue::CableType(TypedEnum::Known(kind)) => match kind {
+            CableType::Iec => Some("IEC".to_owned()),
+            CableType::Sae => Some("SAE".to_owned()),
+            CableType::GbAc => Some("GB_AC".to_owned()),
+            CableType::GbDc => Some("GB_DC".to_owned()),
+            _ => None,
+        },
+        DatumValue::String(text) if !text.trim().is_empty() => Some(text.trim().to_owned()),
+        _ => None,
+    }
+}
+
+fn scheduled_minutes(value: &DatumValue) -> Option<i32> {
+    if let DatumValue::Time(time) = value {
+        if (0..24).contains(&time.hour) && (0..60).contains(&time.minute) {
+            return Some(time.hour * 60 + time.minute);
+        }
+        return None;
+    }
+    crate::units::minutes_after_midnight(number(value)?)
+}
+
+fn apply_hvac(obs: &mut Observation, value: &DatumValue) {
+    let DatumValue::HvacPower(TypedEnum::Known(state)) = value else {
+        return;
+    };
+    match state {
+        HvacPowerState::Off => obs.climate_on = Some(false),
+        HvacPowerState::On | HvacPowerState::OverheatProtect => obs.climate_on = Some(true),
+        HvacPowerState::Precondition => {
+            obs.climate_on = Some(true);
+            obs.is_preconditioning = Some(true);
+        }
+        HvacPowerState::Unknown => {}
     }
 }
 
@@ -330,5 +455,91 @@ mod tests {
         fold_vehicle_data(&mut obs, &data);
         assert_eq!(obs.shift_state, shift);
         assert_eq!(obs.battery_level, Some(81.5));
+    }
+
+    #[test]
+    fn folds_charge_closures_and_tire_pressure() {
+        use super::{apply_field, refresh_plugged_in};
+        use tesla_fleet_telemetry::proto::vehicle_data::{
+            ChargePortLatchValue, Doors, Field, HvacPowerState, WindowState,
+        };
+        use tesla_fleet_telemetry::{DatumValue, FieldKey, TypedEnum};
+
+        let mut obs = Observation::at(Utc::now(), Presence::Online);
+        let known = FieldKey::Known;
+        apply_field(
+            &mut obs,
+            known(Field::TpmsPressureFl),
+            &DatumValue::Double(2.9),
+            true,
+        );
+        apply_field(
+            &mut obs,
+            known(Field::DoorState),
+            &DatumValue::Doors(Doors {
+                driver_front: true,
+                trunk_rear: true,
+                ..Doors::default()
+            }),
+            true,
+        );
+        apply_field(
+            &mut obs,
+            known(Field::FdWindow),
+            &DatumValue::WindowState(TypedEnum::Known(WindowState::Closed)),
+            true,
+        );
+        apply_field(
+            &mut obs,
+            known(Field::ChargerVoltage),
+            &DatumValue::Double(240.0),
+            true,
+        );
+        apply_field(
+            &mut obs,
+            known(Field::ChargePortLatch),
+            &DatumValue::ChargePortLatch(TypedEnum::Known(
+                ChargePortLatchValue::ChargePortLatchEngaged,
+            )),
+            true,
+        );
+        apply_field(
+            &mut obs,
+            known(Field::TimeToFullCharge),
+            &DatumValue::Double(1.25),
+            true,
+        );
+        apply_field(
+            &mut obs,
+            known(Field::BatteryHeaterOn),
+            &DatumValue::Boolean(true),
+            true,
+        );
+        apply_field(
+            &mut obs,
+            known(Field::HvacPower),
+            &DatumValue::HvacPower(TypedEnum::Known(HvacPowerState::Precondition)),
+            true,
+        );
+        apply_field(
+            &mut obs,
+            known(Field::ScheduledChargingStartTime),
+            &DatumValue::Int(1320),
+            true,
+        );
+        refresh_plugged_in(&mut obs);
+        assert_eq!(obs.tpms_pressure_fl, Some(2.9));
+        assert_eq!(obs.df, Some(1));
+        assert_eq!(obs.dr, Some(0));
+        assert_eq!(obs.rt, Some(1));
+        assert_eq!(obs.fd_window, Some(0));
+        assert_eq!(obs.charger_voltage, Some(240.0));
+        assert_eq!(obs.charge_port_latch.as_deref(), Some("Engaged"));
+        assert_eq!(obs.plugged_in, Some(true));
+        assert_eq!(obs.time_to_full_charge_h, Some(1.25));
+        assert_eq!(obs.battery_heater_on, Some(true));
+        assert_eq!(obs.climate_on, Some(true));
+        assert_eq!(obs.is_preconditioning, Some(true));
+        assert_eq!(obs.scheduled_charging_start_time, Some(1320));
     }
 }

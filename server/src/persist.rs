@@ -9,8 +9,8 @@ use crate::error::{AppError, redact_secrets};
 use crate::geocode::{Geocoder, cache_key};
 use crate::geofence::{Fence, matching_geofence};
 use crate::state::{
-    Activity, DriveSummary, Observation, Presence, Sample, Tracker, Transition, summarize_charge,
-    summarize_drive,
+    Activity, DriveSummary, Observation, Presence, Sample, Tracker, Transition, soc_level,
+    summarize_charge, summarize_drive,
 };
 
 /// Identity fields learned from a vehicle list response.
@@ -57,7 +57,141 @@ pub(crate) struct LiveEvent {
     pub outside_temp_c: Option<f64>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    pub usable_battery_level: Option<f64>,
+    pub ideal_range_km: Option<f64>,
+    pub est_range_km: Option<f64>,
+    pub heading_deg: Option<f64>,
+    pub climate_on: Option<bool>,
+    pub locked: Option<bool>,
+    pub sentry_mode: Option<bool>,
+    pub charging_state: Option<String>,
+    pub charge_energy_added_kwh: Option<f64>,
+    pub charge_limit_soc: Option<f64>,
+    pub shift_state: Option<String>,
+    pub is_dc: Option<bool>,
+    pub software_version: Option<String>,
+    pub update_status: Option<String>,
+    pub last_poll_at: Option<DateTime<Utc>>,
+    pub last_data_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub charger_voltage: Option<f64>,
+    pub charger_current: Option<f64>,
+    pub charge_current_request: Option<f64>,
+    pub charge_port_door_open: Option<bool>,
+    pub charge_port_latch: Option<String>,
+    pub plugged_in: Option<bool>,
+    pub time_to_full_charge_h: Option<f64>,
+    pub scheduled_charging_start_time: Option<i32>,
+    pub tpms_pressure_fl: Option<f64>,
+    pub tpms_pressure_fr: Option<f64>,
+    pub tpms_pressure_rl: Option<f64>,
+    pub tpms_pressure_rr: Option<f64>,
+    pub df: Option<i32>,
+    pub dr: Option<i32>,
+    pub pf: Option<i32>,
+    pub pr: Option<i32>,
+    pub fd_window: Option<i32>,
+    pub fp_window: Option<i32>,
+    pub rd_window: Option<i32>,
+    pub rp_window: Option<i32>,
+    pub ft: Option<i32>,
+    pub rt: Option<i32>,
+    pub is_user_present: Option<bool>,
+    pub elevation_m: Option<f64>,
+    pub battery_heater_on: Option<bool>,
+    pub is_preconditioning: Option<bool>,
     pub at: DateTime<Utc>,
+}
+
+impl LiveEvent {
+    /// A state frame with no measurements. Callers fill the fields they have.
+    pub(crate) fn skeleton(vin: impl Into<String>, activity: &'static str) -> Self {
+        let at = Utc::now();
+        Self::from_observation(
+            0,
+            vin.into(),
+            None,
+            None,
+            activity,
+            &Observation::at(at, Presence::Offline),
+            at,
+        )
+    }
+
+    fn from_observation(
+        vehicle_id: i64,
+        vin: String,
+        name: Option<String>,
+        model: Option<String>,
+        activity: &'static str,
+        obs: &Observation,
+        at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            kind: "state",
+            vehicle_id,
+            vin,
+            name,
+            model,
+            activity,
+            battery_level: obs.battery_level,
+            rated_range_km: obs.rated_range_km,
+            odometer_km: obs.odometer_km,
+            speed_kmh: obs.speed_kmh,
+            power_kw: obs.power_kw,
+            charger_power_kw: obs.charger_power_kw,
+            inside_temp_c: obs.inside_temp_c,
+            outside_temp_c: obs.outside_temp_c,
+            latitude: obs.latitude,
+            longitude: obs.longitude,
+            usable_battery_level: obs.usable_battery_level,
+            ideal_range_km: obs.ideal_range_km,
+            est_range_km: obs.est_range_km,
+            heading_deg: obs.heading_deg,
+            climate_on: obs.climate_on,
+            locked: obs.locked,
+            sentry_mode: obs.sentry_mode,
+            charging_state: obs.charging_state.clone(),
+            charge_energy_added_kwh: obs.charge_energy_added_kwh,
+            charge_limit_soc: obs.charge_limit_soc,
+            shift_state: obs.shift_state.clone(),
+            is_dc: obs.fast_charger,
+            software_version: obs.software_version.clone(),
+            update_status: obs.update_status.clone(),
+            last_poll_at: Some(at),
+            last_data_at: Some(at),
+            last_error: None,
+            updated_at: Some(at),
+            charger_voltage: obs.charger_voltage,
+            charger_current: obs.charger_current,
+            charge_current_request: obs.charge_current_request,
+            charge_port_door_open: obs.charge_port_door_open,
+            charge_port_latch: obs.charge_port_latch.clone(),
+            plugged_in: obs.plugged_in,
+            time_to_full_charge_h: obs.time_to_full_charge_h,
+            scheduled_charging_start_time: obs.scheduled_charging_start_time,
+            tpms_pressure_fl: obs.tpms_pressure_fl,
+            tpms_pressure_fr: obs.tpms_pressure_fr,
+            tpms_pressure_rl: obs.tpms_pressure_rl,
+            tpms_pressure_rr: obs.tpms_pressure_rr,
+            df: obs.df,
+            dr: obs.dr,
+            pf: obs.pf,
+            pr: obs.pr,
+            fd_window: obs.fd_window,
+            fp_window: obs.fp_window,
+            rd_window: obs.rd_window,
+            rp_window: obs.rp_window,
+            ft: obs.ft,
+            rt: obs.rt,
+            is_user_present: obs.is_user_present,
+            elevation_m: obs.elevation_m,
+            battery_heater_on: obs.battery_heater_on,
+            is_preconditioning: obs.is_preconditioning,
+            at,
+        }
+    }
 }
 
 pub(crate) async fn upsert_vehicle(
@@ -217,6 +351,17 @@ pub(crate) async fn apply_observation(
         )
         .await?;
     }
+    if let Some(drive_id) = attach_drive
+        && let Some(level) = soc_level(obs.battery_level, obs.usable_battery_level)
+    {
+        sqlx::query(
+            "UPDATE drives SET start_battery_level = COALESCE(start_battery_level, $2) WHERE id = $1",
+        )
+        .bind(drive_id)
+        .bind(level)
+        .execute(&mut *tx)
+        .await?;
+    }
     if (previous.charge_open || starting_charge)
         && live
         && obs.charging_state.is_some()
@@ -333,7 +478,12 @@ async fn insert_drive(
             vehicle_id, start_at, start_latitude, start_longitude, start_odometer_km,
             start_battery_level, start_rated_range_km, start_ideal_range_km,
             start_geofence_id, source
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'poll')
+         )
+         SELECT $1, $2, $3, $4, $5,
+                COALESCE($6, s.battery_level, s.usable_battery_level),
+                $7, $8, $9, 'poll'
+         FROM (SELECT 1) AS seed
+         LEFT JOIN vehicle_state s ON s.vehicle_id = $1
          RETURNING id",
     )
     .bind(vehicle_id)
@@ -341,7 +491,7 @@ async fn insert_drive(
     .bind(obs.latitude)
     .bind(obs.longitude)
     .bind(obs.odometer_km)
-    .bind(obs.battery_level)
+    .bind(soc_level(obs.battery_level, obs.usable_battery_level))
     .bind(obs.rated_range_km)
     .bind(obs.ideal_range_km)
     .bind(geofence_id)
@@ -473,13 +623,17 @@ async fn close_drive(
             .await?;
         return Ok(());
     };
-    update_drive(tx, drive_id, &summary, geofence_id).await
+    let end_battery = summary
+        .end_battery_level
+        .or(soc_level(obs.battery_level, obs.usable_battery_level));
+    update_drive(tx, drive_id, &summary, end_battery, geofence_id).await
 }
 
 async fn update_drive(
     tx: &mut Transaction<'_, Postgres>,
     drive_id: i64,
     summary: &DriveSummary,
+    end_battery: Option<f64>,
     geofence_id: Option<i64>,
 ) -> Result<(), AppError> {
     sqlx::query(
@@ -494,8 +648,8 @@ async fn update_drive(
             end_odometer_km = $9,
             distance_km = $10,
             duration_s = $11,
-            start_battery_level = $12,
-            end_battery_level = $13,
+            start_battery_level = COALESCE(start_battery_level, $12),
+            end_battery_level = COALESCE($13, end_battery_level),
             start_rated_range_km = $14,
             end_rated_range_km = $15,
             start_ideal_range_km = $16,
@@ -524,7 +678,7 @@ async fn update_drive(
     .bind(summary.distance_km)
     .bind(summary.duration_s)
     .bind(summary.start_battery_level)
-    .bind(summary.end_battery_level)
+    .bind(end_battery)
     .bind(summary.start_rated_range_km)
     .bind(summary.end_rated_range_km)
     .bind(summary.start_ideal_range_km)
@@ -668,10 +822,17 @@ async fn save_state(
                 speed_kmh, power_kw, inside_temp_c, outside_temp_c, climate_on, locked,
                 sentry_mode, charging_state, charger_power_kw, charge_energy_added_kwh,
                 charge_limit_soc, shift_state, is_dc, software_version, update_status,
-                last_poll_at, last_data_at, last_error, updated_at
+                last_poll_at, last_data_at, last_error, updated_at,
+                charger_voltage, charger_current, charge_current_request, charge_port_door_open,
+                charge_port_latch, plugged_in, time_to_full_charge_h, scheduled_charging_start_time,
+                tpms_pressure_fl, tpms_pressure_fr, tpms_pressure_rl, tpms_pressure_rr,
+                df, dr, pf, pr, fd_window, fp_window, rd_window, rp_window, ft, rt,
+                is_user_present, elevation_m, battery_heater_on, is_preconditioning
              ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $27, NULL, now()
+                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $27, NULL, now(),
+                $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39,
+                $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53
              )
              ON CONFLICT (vehicle_id) DO UPDATE SET
                 activity = EXCLUDED.activity,
@@ -702,7 +863,33 @@ async fn save_state(
                 last_poll_at = EXCLUDED.last_poll_at,
                 last_data_at = EXCLUDED.last_data_at,
                 last_error = NULL,
-                updated_at = now()",
+                updated_at = now(),
+                charger_voltage = COALESCE(EXCLUDED.charger_voltage, vehicle_state.charger_voltage),
+                charger_current = COALESCE(EXCLUDED.charger_current, vehicle_state.charger_current),
+                charge_current_request = COALESCE(EXCLUDED.charge_current_request, vehicle_state.charge_current_request),
+                charge_port_door_open = COALESCE(EXCLUDED.charge_port_door_open, vehicle_state.charge_port_door_open),
+                charge_port_latch = COALESCE(EXCLUDED.charge_port_latch, vehicle_state.charge_port_latch),
+                plugged_in = COALESCE(EXCLUDED.plugged_in, vehicle_state.plugged_in),
+                time_to_full_charge_h = COALESCE(EXCLUDED.time_to_full_charge_h, vehicle_state.time_to_full_charge_h),
+                scheduled_charging_start_time = COALESCE(EXCLUDED.scheduled_charging_start_time, vehicle_state.scheduled_charging_start_time),
+                tpms_pressure_fl = COALESCE(EXCLUDED.tpms_pressure_fl, vehicle_state.tpms_pressure_fl),
+                tpms_pressure_fr = COALESCE(EXCLUDED.tpms_pressure_fr, vehicle_state.tpms_pressure_fr),
+                tpms_pressure_rl = COALESCE(EXCLUDED.tpms_pressure_rl, vehicle_state.tpms_pressure_rl),
+                tpms_pressure_rr = COALESCE(EXCLUDED.tpms_pressure_rr, vehicle_state.tpms_pressure_rr),
+                df = COALESCE(EXCLUDED.df, vehicle_state.df),
+                dr = COALESCE(EXCLUDED.dr, vehicle_state.dr),
+                pf = COALESCE(EXCLUDED.pf, vehicle_state.pf),
+                pr = COALESCE(EXCLUDED.pr, vehicle_state.pr),
+                fd_window = COALESCE(EXCLUDED.fd_window, vehicle_state.fd_window),
+                fp_window = COALESCE(EXCLUDED.fp_window, vehicle_state.fp_window),
+                rd_window = COALESCE(EXCLUDED.rd_window, vehicle_state.rd_window),
+                rp_window = COALESCE(EXCLUDED.rp_window, vehicle_state.rp_window),
+                ft = COALESCE(EXCLUDED.ft, vehicle_state.ft),
+                rt = COALESCE(EXCLUDED.rt, vehicle_state.rt),
+                is_user_present = COALESCE(EXCLUDED.is_user_present, vehicle_state.is_user_present),
+                elevation_m = COALESCE(EXCLUDED.elevation_m, vehicle_state.elevation_m),
+                battery_heater_on = COALESCE(EXCLUDED.battery_heater_on, vehicle_state.battery_heater_on),
+                is_preconditioning = COALESCE(EXCLUDED.is_preconditioning, vehicle_state.is_preconditioning)",
         )
         .bind(vehicle_id)
         .bind(tracker.activity.as_str())
@@ -731,6 +918,32 @@ async fn save_state(
         .bind(&obs.software_version)
         .bind(&obs.update_status)
         .bind(obs.at)
+        .bind(obs.charger_voltage)
+        .bind(obs.charger_current)
+        .bind(obs.charge_current_request)
+        .bind(obs.charge_port_door_open)
+        .bind(&obs.charge_port_latch)
+        .bind(obs.plugged_in)
+        .bind(obs.time_to_full_charge_h)
+        .bind(obs.scheduled_charging_start_time)
+        .bind(obs.tpms_pressure_fl)
+        .bind(obs.tpms_pressure_fr)
+        .bind(obs.tpms_pressure_rl)
+        .bind(obs.tpms_pressure_rr)
+        .bind(obs.df)
+        .bind(obs.dr)
+        .bind(obs.pf)
+        .bind(obs.pr)
+        .bind(obs.fd_window)
+        .bind(obs.fp_window)
+        .bind(obs.rd_window)
+        .bind(obs.rp_window)
+        .bind(obs.ft)
+        .bind(obs.rt)
+        .bind(obs.is_user_present)
+        .bind(obs.elevation_m)
+        .bind(obs.battery_heater_on)
+        .bind(obs.is_preconditioning)
         .execute(&mut **tx)
         .await?;
     } else {
@@ -835,25 +1048,15 @@ async fn lookup_or_geocode(
 }
 
 fn live_event(runtime: &Runtime, obs: &Observation) -> LiveEvent {
-    LiveEvent {
-        kind: "state",
-        vehicle_id: runtime.vehicle_id,
-        vin: runtime.vin.clone(),
-        name: runtime.name.clone(),
-        model: runtime.model.clone(),
-        activity: runtime.tracker.activity.as_str(),
-        battery_level: obs.battery_level,
-        rated_range_km: obs.rated_range_km,
-        odometer_km: obs.odometer_km,
-        speed_kmh: obs.speed_kmh,
-        power_kw: obs.power_kw,
-        charger_power_kw: obs.charger_power_kw,
-        inside_temp_c: obs.inside_temp_c,
-        outside_temp_c: obs.outside_temp_c,
-        latitude: obs.latitude,
-        longitude: obs.longitude,
-        at: obs.at,
-    }
+    LiveEvent::from_observation(
+        runtime.vehicle_id,
+        runtime.vin.clone(),
+        runtime.name.clone(),
+        runtime.model.clone(),
+        runtime.tracker.activity.as_str(),
+        obs,
+        obs.at,
+    )
 }
 
 fn clip_error(text: &str) -> String {

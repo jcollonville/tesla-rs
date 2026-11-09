@@ -91,6 +91,32 @@ pub(crate) struct Observation {
     pub locked: Option<bool>,
     pub sentry_mode: Option<bool>,
     pub climate_on: Option<bool>,
+    pub charge_current_request: Option<f64>,
+    pub charge_port_door_open: Option<bool>,
+    pub charge_port_latch: Option<String>,
+    pub conn_charge_cable: Option<String>,
+    pub plugged_in: Option<bool>,
+    pub time_to_full_charge_h: Option<f64>,
+    /// Minutes after midnight. This is the Fleet API unit.
+    pub scheduled_charging_start_time: Option<i32>,
+    pub tpms_pressure_fl: Option<f64>,
+    pub tpms_pressure_fr: Option<f64>,
+    pub tpms_pressure_rl: Option<f64>,
+    pub tpms_pressure_rr: Option<f64>,
+    /// Driver front door. `0` closed, nonzero open.
+    pub df: Option<i32>,
+    pub dr: Option<i32>,
+    pub pf: Option<i32>,
+    pub pr: Option<i32>,
+    pub fd_window: Option<i32>,
+    pub fp_window: Option<i32>,
+    pub rd_window: Option<i32>,
+    pub rp_window: Option<i32>,
+    pub ft: Option<i32>,
+    pub rt: Option<i32>,
+    pub is_user_present: Option<bool>,
+    pub battery_heater_on: Option<bool>,
+    pub is_preconditioning: Option<bool>,
     pub model: Option<String>,
     pub trim_badging: Option<String>,
     pub exterior_color: Option<String>,
@@ -132,6 +158,30 @@ impl Observation {
             locked: None,
             sentry_mode: None,
             climate_on: None,
+            charge_current_request: None,
+            charge_port_door_open: None,
+            charge_port_latch: None,
+            conn_charge_cable: None,
+            plugged_in: None,
+            time_to_full_charge_h: None,
+            scheduled_charging_start_time: None,
+            tpms_pressure_fl: None,
+            tpms_pressure_fr: None,
+            tpms_pressure_rl: None,
+            tpms_pressure_rr: None,
+            df: None,
+            dr: None,
+            pf: None,
+            pr: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
+            ft: None,
+            rt: None,
+            is_user_present: None,
+            battery_heater_on: None,
+            is_preconditioning: None,
             model: None,
             trim_badging: None,
             exterior_color: None,
@@ -169,6 +219,79 @@ impl Observation {
             fast_charger_type: self.fast_charger_type.clone(),
         }
     }
+}
+
+/// State of charge to store for a drive boundary.
+///
+/// `battery_level` is the displayed percent. `usable_battery_level` fills in when
+/// the car omits it.
+pub(crate) fn soc_level(battery: Option<f64>, usable: Option<f64>) -> Option<f64> {
+    finite_soc(battery).or_else(|| finite_soc(usable))
+}
+
+fn finite_soc(value: Option<f64>) -> Option<f64> {
+    value.filter(|level| level.is_finite())
+}
+
+/// Whether a charge cable is connected.
+///
+/// Latch `Engaged` or `Blocking` wins, then a real `conn_charge_cable`, then
+/// `charging_state`. `Disconnected` means unplugged. An explicit `Disengaged`
+/// latch with no other signal is unplugged. Missing inputs stay unknown.
+pub(crate) fn derive_plugged_in(
+    charge_port_latch: Option<&str>,
+    charging_state: Option<&str>,
+    conn_charge_cable: Option<&str>,
+) -> Option<bool> {
+    if latch_is(charge_port_latch, &["engaged", "blocking"]) {
+        return Some(true);
+    }
+    if cable_is_connected(conn_charge_cable) {
+        return Some(true);
+    }
+    if let Some(state) = nonempty(charging_state) {
+        return Some(!is_disconnected(state));
+    }
+    if latch_is(charge_port_latch, &["disengaged"]) {
+        return Some(false);
+    }
+    None
+}
+
+pub(crate) fn refresh_plugged_in(obs: &mut Observation) {
+    obs.plugged_in = derive_plugged_in(
+        obs.charge_port_latch.as_deref(),
+        obs.charging_state.as_deref(),
+        obs.conn_charge_cable.as_deref(),
+    );
+}
+
+fn latch_is(latch: Option<&str>, names: &[&str]) -> bool {
+    let Some(latch) = nonempty(latch) else {
+        return false;
+    };
+    names.iter().any(|name| latch.eq_ignore_ascii_case(name))
+}
+
+fn cable_is_connected(cable: Option<&str>) -> bool {
+    let Some(cable) = nonempty(cable) else {
+        return false;
+    };
+    !matches!(
+        cable.to_ascii_lowercase().as_str(),
+        "<invalid>" | "none" | "null" | "disconnected"
+    )
+}
+
+fn is_disconnected(state: &str) -> bool {
+    matches!(
+        state.to_ascii_lowercase().as_str(),
+        "disconnected" | "none" | "null"
+    )
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|text| !text.is_empty())
 }
 
 /// Open-session memory. Aggregates are recomputed from stored samples when a session closes.
@@ -693,6 +816,30 @@ mod tests {
         assert!((summary.elevation_gain_m.unwrap() - 30.0).abs() < 1e-6);
         assert_eq!(summary.start_battery_level, Some(78.0));
         assert_eq!(summary.end_battery_level, Some(74.0));
+
+        assert_eq!(
+            super::derive_plugged_in(Some("Engaged"), Some("Disconnected"), Some("<invalid>")),
+            Some(true)
+        );
+        assert_eq!(
+            super::derive_plugged_in(Some("Disengaged"), Some("Disconnected"), Some("SAE")),
+            Some(true)
+        );
+        assert_eq!(
+            super::derive_plugged_in(None, Some("Charging"), None),
+            Some(true)
+        );
+        assert_eq!(
+            super::derive_plugged_in(Some("Disengaged"), Some("Disconnected"), Some("<invalid>")),
+            Some(false)
+        );
+        assert_eq!(
+            super::derive_plugged_in(Some("Disengaged"), None, None),
+            Some(false)
+        );
+        assert_eq!(super::derive_plugged_in(None, None, None), None);
+        assert_eq!(super::soc_level(None, Some(70.0)), Some(70.0));
+        assert_eq!(super::soc_level(Some(80.0), Some(79.0)), Some(80.0));
 
         let mut charging = online(23);
         charging.charging_state = Some("Charging".to_owned());

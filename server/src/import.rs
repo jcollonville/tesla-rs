@@ -16,7 +16,13 @@
 //! `AT TIME ZONE 'UTC'`. TeslaMate stores UTC in `timestamp(6)`, not
 //! `timestamptz` (the positions BRIN index uses `timestamp_minmax_multi_ops`).
 //! `drives.ascent` / `drives.descent` are optional smallints added by migration
-//! `20250613133700`.
+//! `20250613133700`. Drive state of charge is not a drives column in TeslaMate.
+//! It is copied from `positions.battery_level`, falling back to
+//! `usable_battery_level`, through `drives.start_position_id` and
+//! `drives.end_position_id`. [`backfill_drive_battery`] runs at the end of every
+//! import, after positions are copied, and only fills levels that are still
+//! null. A resume that finishes the positions therefore fills drives whose
+//! rows arrived after migration `0003_backfill_drive_battery` already ran.
 //!
 //! Each table is read with a keyset on its primary key. TeslaMate 4.1.1 stores
 //! `cars.id` as `smallint` and every other imported id as `integer`. The
@@ -119,6 +125,9 @@ pub(crate) async fn import_pools(
     let charges = load_links(dest, "charge").await?;
     stats.charge_samples = copy_charge_samples(dest, source, batch, &charges).await?;
     stats.positions = copy_positions(dest, source, &cars, &drives).await?;
+    // Runs after positions, including a resume that only copies the tail.
+    // Migration 0003 already ran at startup, before those rows existed.
+    backfill_drive_battery(dest).await?;
     tracing::info!(
         cars = stats.cars,
         addresses = stats.addresses,
@@ -584,6 +593,10 @@ async fn copy_drives(
                 d.end_geofence_id::bigint AS end_geofence_id,
                 sp.latitude::float8 AS start_latitude, sp.longitude::float8 AS start_longitude,
                 ep.latitude::float8 AS end_latitude, ep.longitude::float8 AS end_longitude,
+                sp.battery_level::integer AS start_battery_level,
+                sp.usable_battery_level::integer AS start_usable_battery_level,
+                ep.battery_level::integer AS end_battery_level,
+                ep.usable_battery_level::integer AS end_usable_battery_level,
                 {ascent_sql} AS ascent, {descent_sql} AS descent
          FROM drives d
          LEFT JOIN positions sp ON sp.id = d.start_position_id
@@ -638,10 +651,10 @@ async fn copy_drives(
                     energy_used_kwh, max_speed_kmh, avg_speed_kmh, max_power_kw, min_power_kw,
                     elevation_gain_m, elevation_loss_m, inside_temp_avg_c, outside_temp_avg_c,
                     start_address_id, end_address_id, start_geofence_id, end_geofence_id,
-                    source, external_id
+                    source, external_id, start_battery_level, end_battery_level
                  ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                    $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30
+                    $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
                  )
                  ON CONFLICT (source, external_id) WHERE external_id IS NOT NULL DO UPDATE SET
                     end_at = EXCLUDED.end_at,
@@ -649,7 +662,9 @@ async fn copy_drives(
                     duration_s = EXCLUDED.duration_s,
                     energy_used_kwh = EXCLUDED.energy_used_kwh,
                     elevation_gain_m = EXCLUDED.elevation_gain_m,
-                    elevation_loss_m = EXCLUDED.elevation_loss_m
+                    elevation_loss_m = EXCLUDED.elevation_loss_m,
+                    start_battery_level = COALESCE(drives.start_battery_level, EXCLUDED.start_battery_level),
+                    end_battery_level = COALESCE(drives.end_battery_level, EXCLUDED.end_battery_level)
                  RETURNING id",
             )
             .bind(vehicle_id)
@@ -682,6 +697,14 @@ async fn copy_drives(
             .bind(row.end_geofence_id.and_then(|id| fences.get(&id).copied()))
             .bind(SOURCE)
             .bind(row.id.to_string())
+            .bind(position_soc(
+                row.start_battery_level,
+                row.start_usable_battery_level,
+            ))
+            .bind(position_soc(
+                row.end_battery_level,
+                row.end_usable_battery_level,
+            ))
             .fetch_one(&mut *tx)
             .await?;
             save_link(&mut tx, "drive", &row.id.to_string(), local.0).await?;
@@ -724,6 +747,14 @@ struct TmDrive {
     end_longitude: Option<f64>,
     ascent: Option<i32>,
     descent: Option<i32>,
+    start_battery_level: Option<i32>,
+    start_usable_battery_level: Option<i32>,
+    end_battery_level: Option<i32>,
+    end_usable_battery_level: Option<i32>,
+}
+
+fn position_soc(level: Option<i32>, usable: Option<i32>) -> Option<f64> {
+    level.or(usable).map(f64::from)
 }
 
 async fn copy_charges(
@@ -1184,6 +1215,49 @@ fn duration_s(
         return Some(i32::try_from(seconds).unwrap_or(i32::MAX));
     }
     fallback_min.and_then(|minutes| minutes.checked_mul(60))
+}
+
+/// Fills missing drive battery levels from the earliest and latest stored positions.
+///
+/// Already-set values are left alone. Closed drives get an end level. Open drives
+/// only get a start level.
+pub(crate) async fn backfill_drive_battery(pool: &PgPool) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE drives AS d
+         SET start_battery_level = src.level
+         FROM (
+             SELECT DISTINCT ON (drive_id)
+                 drive_id,
+                 COALESCE(battery_level, usable_battery_level) AS level
+             FROM positions
+             WHERE drive_id IS NOT NULL
+             ORDER BY drive_id, recorded_at ASC, id ASC
+         ) AS src
+         WHERE d.id = src.drive_id
+           AND d.start_battery_level IS NULL
+           AND src.level IS NOT NULL",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE drives AS d
+         SET end_battery_level = src.level
+         FROM (
+             SELECT DISTINCT ON (drive_id)
+                 drive_id,
+                 COALESCE(battery_level, usable_battery_level) AS level
+             FROM positions
+             WHERE drive_id IS NOT NULL
+             ORDER BY drive_id, recorded_at DESC, id DESC
+         ) AS src
+         WHERE d.id = src.drive_id
+           AND d.end_at IS NOT NULL
+           AND d.end_battery_level IS NULL
+           AND src.level IS NOT NULL",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn cursor(pool: &PgPool, key: &str) -> Result<i64, AppError> {

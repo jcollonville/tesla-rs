@@ -76,7 +76,9 @@ Images are published to `ghcr.io/jcollonville/tesla-logger` on `main` and on ver
 * `GET /api/v1/geofences`
 * `GET /api/v1/ws` pushes `{"type":"state",...}` frames
 
-Distances are kilometres. Fleet API miles are converted on ingest. TeslaMate rows are already metric and are copied as stored.
+Distances are kilometres. Fleet API miles are converted on ingest. Temperatures are Celsius, power is kilowatts, tire pressures are bar, charger voltage is volts, and charger current is amperes. `GET /api/v1/vehicles/{id}/state` and each WebSocket `state` frame return every `vehicle_state` column. Door, window, and trunk keys use the Fleet API names (`df`, `dr`, `pf`, `pr`, `fd_window`, `fp_window`, `rd_window`, `rp_window`, `ft`, `rt`). `0` is closed. `plugged_in` is derived from the charge-port latch, the charging state, and the charge cable. `scheduled_charging_start_time` is minutes after midnight.
+
+TeslaMate rows are already metric and are copied as stored. TeslaMate does not store drive battery levels on `drives`. The importer reads them from the start and end positions (`battery_level`, then `usable_battery_level`). Every `import-teslamate` run fills any still-null drive levels from the stored positions after the position copy finishes, including a resume that only imports the remaining positions. Migration `0003_backfill_drive_battery` does the same fill once at startup. Live drives keep the state of charge from the moment the drive opens (or the last stored level) and the last level seen before it closes.
 
 ## Develop
 

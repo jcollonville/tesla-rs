@@ -62,44 +62,16 @@ pub(crate) async fn vehicle_state(
     if exists.is_none() {
         return Err(ApiError::NotFound);
     }
-    let row = sqlx::query_as::<_, StateJson>(
-        "SELECT vehicle_id, activity, battery_level, usable_battery_level, rated_range_km,
-                ideal_range_km, est_range_km, odometer_km, latitude, longitude, heading_deg,
-                speed_kmh, power_kw, inside_temp_c, outside_temp_c, charging_state,
-                charger_power_kw, charge_energy_added_kwh, shift_state, software_version,
-                update_status, last_poll_at, last_data_at, last_error
-         FROM vehicle_state WHERE vehicle_id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&app.inner.db)
-    .await
-    .map_err(internal)?;
-    Ok(Json(row.unwrap_or(StateJson {
-        vehicle_id: id,
-        activity: "offline".to_owned(),
-        battery_level: None,
-        usable_battery_level: None,
-        rated_range_km: None,
-        ideal_range_km: None,
-        est_range_km: None,
-        odometer_km: None,
-        latitude: None,
-        longitude: None,
-        heading_deg: None,
-        speed_kmh: None,
-        power_kw: None,
-        inside_temp_c: None,
-        outside_temp_c: None,
-        charging_state: None,
-        charger_power_kw: None,
-        charge_energy_added_kwh: None,
-        shift_state: None,
-        software_version: None,
-        update_status: None,
-        last_poll_at: None,
-        last_data_at: None,
-        last_error: None,
-    })))
+    let sql = format!(
+        "SELECT vehicle_id, activity, {columns} FROM vehicle_state WHERE vehicle_id = $1",
+        columns = STATE_FIELDS.join(", ")
+    );
+    let row = sqlx::query_as::<_, StateJson>(&sql)
+        .bind(id)
+        .fetch_optional(&app.inner.db)
+        .await
+        .map_err(internal)?;
+    Ok(Json(row.unwrap_or_else(|| StateJson::offline(id))))
 }
 
 pub(crate) async fn list_drives(
@@ -337,21 +309,38 @@ async fn handle_socket(
     db: sqlx::PgPool,
     mut events: tokio::sync::broadcast::Receiver<crate::persist::LiveEvent>,
 ) {
-    if let Ok(rows) = sqlx::query_as::<_, (i64, String, Option<String>)>(
-        "SELECT v.id, v.vin, s.activity FROM vehicles v LEFT JOIN vehicle_state s ON s.vehicle_id = v.id",
-    )
-    .fetch_all(&db)
-    .await
+    let snapshot = format!(
+        "SELECT v.vin, v.name, v.model, v.id AS vehicle_id,
+                COALESCE(s.activity, 'offline') AS activity, {prefixed}
+         FROM vehicles v
+         LEFT JOIN vehicle_state s ON s.vehicle_id = v.id
+         ORDER BY v.id",
+        prefixed = state_columns("s")
+    );
+    if let Ok(rows) = sqlx::query_as::<_, WsSnapshot>(&snapshot)
+        .fetch_all(&db)
+        .await
     {
-        for (id, vin, activity) in rows {
+        for row in rows {
             let payload = serde_json::json!({
                 "type": "state",
-                "vehicle_id": id,
-                "vin": vin,
-                "activity": activity.unwrap_or_else(|| "offline".to_owned()),
+                "vin": row.vin,
+                "name": row.name,
+                "model": row.model,
             });
+            let Ok(mut value) = serde_json::to_value(payload) else {
+                return;
+            };
+            let Ok(state) = serde_json::to_value(&row.state) else {
+                return;
+            };
+            if let (Some(object), Some(state)) = (value.as_object_mut(), state.as_object()) {
+                for (key, item) in state {
+                    object.insert(key.clone(), item.clone());
+                }
+            }
             if socket
-                .send(Message::Text(payload.to_string().into()))
+                .send(Message::Text(value.to_string().into()))
                 .await
                 .is_err()
             {
@@ -495,6 +484,71 @@ pub(crate) struct VehicleJson {
     pub last_error: Option<String>,
 }
 
+const STATE_FIELDS: &[&str] = &[
+    "battery_level",
+    "usable_battery_level",
+    "rated_range_km",
+    "ideal_range_km",
+    "est_range_km",
+    "odometer_km",
+    "latitude",
+    "longitude",
+    "heading_deg",
+    "speed_kmh",
+    "power_kw",
+    "inside_temp_c",
+    "outside_temp_c",
+    "climate_on",
+    "locked",
+    "sentry_mode",
+    "charging_state",
+    "charger_power_kw",
+    "charge_energy_added_kwh",
+    "charge_limit_soc",
+    "shift_state",
+    "is_dc",
+    "software_version",
+    "update_status",
+    "last_poll_at",
+    "last_data_at",
+    "last_error",
+    "updated_at",
+    "charger_voltage",
+    "charger_current",
+    "charge_current_request",
+    "charge_port_door_open",
+    "charge_port_latch",
+    "plugged_in",
+    "time_to_full_charge_h",
+    "scheduled_charging_start_time",
+    "tpms_pressure_fl",
+    "tpms_pressure_fr",
+    "tpms_pressure_rl",
+    "tpms_pressure_rr",
+    "df",
+    "dr",
+    "pf",
+    "pr",
+    "fd_window",
+    "fp_window",
+    "rd_window",
+    "rp_window",
+    "ft",
+    "rt",
+    "is_user_present",
+    "elevation_m",
+    "battery_heater_on",
+    "is_preconditioning",
+];
+
+fn state_columns(prefix: &str) -> String {
+    STATE_FIELDS
+        .iter()
+        .map(|field| format!("{prefix}.{field}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(sqlx::FromRow, Serialize)]
 pub(crate) struct StateJson {
     pub vehicle_id: i64,
@@ -512,15 +566,147 @@ pub(crate) struct StateJson {
     pub power_kw: Option<f64>,
     pub inside_temp_c: Option<f64>,
     pub outside_temp_c: Option<f64>,
+    pub climate_on: Option<bool>,
+    pub locked: Option<bool>,
+    pub sentry_mode: Option<bool>,
     pub charging_state: Option<String>,
     pub charger_power_kw: Option<f64>,
     pub charge_energy_added_kwh: Option<f64>,
+    pub charge_limit_soc: Option<f64>,
     pub shift_state: Option<String>,
+    pub is_dc: Option<bool>,
     pub software_version: Option<String>,
     pub update_status: Option<String>,
     pub last_poll_at: Option<DateTime<Utc>>,
     pub last_data_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub charger_voltage: Option<f64>,
+    pub charger_current: Option<f64>,
+    pub charge_current_request: Option<f64>,
+    pub charge_port_door_open: Option<bool>,
+    pub charge_port_latch: Option<String>,
+    pub plugged_in: Option<bool>,
+    pub time_to_full_charge_h: Option<f64>,
+    pub scheduled_charging_start_time: Option<i32>,
+    pub tpms_pressure_fl: Option<f64>,
+    pub tpms_pressure_fr: Option<f64>,
+    pub tpms_pressure_rl: Option<f64>,
+    pub tpms_pressure_rr: Option<f64>,
+    pub df: Option<i32>,
+    pub dr: Option<i32>,
+    pub pf: Option<i32>,
+    pub pr: Option<i32>,
+    pub fd_window: Option<i32>,
+    pub fp_window: Option<i32>,
+    pub rd_window: Option<i32>,
+    pub rp_window: Option<i32>,
+    pub ft: Option<i32>,
+    pub rt: Option<i32>,
+    pub is_user_present: Option<bool>,
+    pub elevation_m: Option<f64>,
+    pub battery_heater_on: Option<bool>,
+    pub is_preconditioning: Option<bool>,
+}
+
+impl StateJson {
+    fn offline(vehicle_id: i64) -> Self {
+        Self {
+            vehicle_id,
+            activity: "offline".to_owned(),
+            battery_level: None,
+            usable_battery_level: None,
+            rated_range_km: None,
+            ideal_range_km: None,
+            est_range_km: None,
+            odometer_km: None,
+            latitude: None,
+            longitude: None,
+            heading_deg: None,
+            speed_kmh: None,
+            power_kw: None,
+            inside_temp_c: None,
+            outside_temp_c: None,
+            climate_on: None,
+            locked: None,
+            sentry_mode: None,
+            charging_state: None,
+            charger_power_kw: None,
+            charge_energy_added_kwh: None,
+            charge_limit_soc: None,
+            shift_state: None,
+            is_dc: None,
+            software_version: None,
+            update_status: None,
+            last_poll_at: None,
+            last_data_at: None,
+            last_error: None,
+            updated_at: None,
+            charger_voltage: None,
+            charger_current: None,
+            charge_current_request: None,
+            charge_port_door_open: None,
+            charge_port_latch: None,
+            plugged_in: None,
+            time_to_full_charge_h: None,
+            scheduled_charging_start_time: None,
+            tpms_pressure_fl: None,
+            tpms_pressure_fr: None,
+            tpms_pressure_rl: None,
+            tpms_pressure_rr: None,
+            df: None,
+            dr: None,
+            pf: None,
+            pr: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
+            ft: None,
+            rt: None,
+            is_user_present: None,
+            elevation_m: None,
+            battery_heater_on: None,
+            is_preconditioning: None,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn snapshot_rows(
+    db: &sqlx::PgPool,
+) -> Result<Vec<(String, String, Option<f64>, Option<i32>)>, sqlx::Error> {
+    let snapshot = format!(
+        "SELECT v.vin, v.name, v.model, v.id AS vehicle_id,
+                COALESCE(s.activity, 'offline') AS activity, {prefixed}
+         FROM vehicles v
+         LEFT JOIN vehicle_state s ON s.vehicle_id = v.id
+         ORDER BY v.id",
+        prefixed = state_columns("s")
+    );
+    let rows = sqlx::query_as::<_, WsSnapshot>(&snapshot)
+        .fetch_all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.vin,
+                row.state.activity,
+                row.state.battery_level,
+                row.state.df,
+            )
+        })
+        .collect())
+}
+
+#[derive(sqlx::FromRow)]
+struct WsSnapshot {
+    vin: String,
+    name: Option<String>,
+    model: Option<String>,
+    #[sqlx(flatten)]
+    state: StateJson,
 }
 
 #[derive(sqlx::FromRow, Serialize)]
