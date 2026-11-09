@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tesla_logger
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: tesla_logger
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tesla_logger -d tesla_logger"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  tesla-logger:
+    image: ghcr.io/jcollonville/tesla-logger:latest
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://tesla_logger:${POSTGRES_PASSWORD:-change-me}@postgres:5432/tesla_logger
+      TESLA_LISTEN_ADDR: 0.0.0.0:4000
+      TESLA_TOKEN_STORE_PATH: /data/tokens.json
+      TESLA_PRIVATE_KEY_PATH: /keys/private-key.pem
+    volumes:
+      - logger-data:/data
+      - ./private-key.pem:/keys/private-key.pem:ro
+    healthcheck:
+      test: ["CMD", "tesla-logger", "healthcheck", "--url", "http://127.0.0.1:4000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  postgres:
+  logger-data:

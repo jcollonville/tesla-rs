@@ -13,6 +13,12 @@ allow = [
     "ISC",
     "MIT",
     "Unicode-3.0",
+    "Zlib",
+]
+
+# The libraries stay MIT OR Apache-2.0. The server is a separate AGPL program.
+exceptions = [
+    { allow = ["AGPL-3.0-only", "AGPL-3.0"], crate = "tesla-logger" },
 ]
 
 [bans]
