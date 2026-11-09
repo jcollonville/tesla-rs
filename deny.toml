@@ -1,6 +1,19 @@
 [advisories]
 version = 2
 yanked = "warn"
+# sqlx 0.8 records its optional MySQL and SQLite drivers in Cargo.lock even
+# with those features off. Cargo 1.99 puts `rsa` and `libsqlite3-sys` back if
+# they are deleted (`cargo metadata --locked` refuses the trimmed lockfile).
+# Neither crate is in the build graph: `cargo tree -i rsa` and
+# `cargo tree -i libsqlite3-sys` do not match a package. cargo-deny therefore
+# never encounters these advisories; the ignores match .cargo/audit.toml,
+# which is what scans the lockfile. The unused-ignore lint is allowed because
+# that mismatch is permanent, not a stale entry.
+unused-ignored-advisory = "allow"
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa is only an optional sqlx MySQL driver dependency and is not linked" },
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys is only an optional sqlx SQLite driver dependency and is not linked" },
+]
 
 [licenses]
 version = 2

@@ -25,6 +25,8 @@ secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# Postgres only. default-features would also turn on the `any` driver; the MySQL
+# and SQLite drivers stay off the build. Cargo still locks them — see deny.toml.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls", "migrate", "macros", "derive", "chrono", "json"] }
 tesla-auth = { workspace = true }
 tesla-fleet-api = { workspace = true }
