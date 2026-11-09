@@ -11,7 +11,7 @@ The crates are written to be reused by other programs. They do not depend on the
 | `crates/tesla-auth` | OAuth 2.0 authorization code with PKCE, refresh, partner tokens, token storage | implemented | MIT OR Apache-2.0 |
 | `crates/tesla-fleet-api` | Async Fleet API client (vehicles, live and cached data, wake, fleet status, telemetry config, charging history, partner registration) | implemented | MIT OR Apache-2.0 |
 | `crates/tesla-vehicle-command` | Virtual key and signed vehicle commands | not started | MIT OR Apache-2.0 |
-| `crates/tesla-fleet-telemetry` | Fleet Telemetry protobuf decoding | not started | MIT OR Apache-2.0 |
+| `crates/tesla-fleet-telemetry` | Fleet Telemetry protobuf decoding and mutual-TLS websocket receiver | implemented | MIT OR Apache-2.0 |
 | `server/` | `tesla-logger`, a self-hosted drive, charge, and state archive (Docker and Home Assistant) | not started | AGPL-3.0-only |
 
 `tesla-logger` will be a separate license from the libraries. The AGPL text will be added with the server. Empty crates are not published.

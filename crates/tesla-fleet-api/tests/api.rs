@@ -291,6 +291,8 @@ async fn fleet_status_telemetry_charging_and_partner_requests() {
         TelemetryField {
             interval_seconds: 60,
             minimum_delta: None,
+            resend_interval_seconds: None,
+            include_fields: Vec::new(),
         },
     );
     let update = client
@@ -303,6 +305,7 @@ async fn fleet_status_telemetry_charging_and_partner_requests() {
                 fields,
                 alert_types: Vec::new(),
                 exp: None,
+                delivery_policy: None,
             },
         })
         .await
