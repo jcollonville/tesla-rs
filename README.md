@@ -9,6 +9,7 @@ The crates are written to be reused by other programs. They do not depend on the
 | Path | Crate | Status | License |
 | --- | --- | --- | --- |
 | `crates/tesla-auth` | OAuth 2.0 authorization code with PKCE, refresh, partner tokens, token storage | implemented | MIT OR Apache-2.0 |
+| `crates/tesla-owner-api` | Unofficial Owner API login and the legacy streaming websocket | implemented | MIT OR Apache-2.0 |
 | `crates/tesla-fleet-api` | Async Fleet API client (vehicles, live and cached data, wake, fleet status, telemetry config, charging history, partner registration) | implemented | MIT OR Apache-2.0 |
 | `crates/tesla-vehicle-command` | Virtual key, session handshake, and signed vehicle commands | implemented | MIT OR Apache-2.0 |
 | `crates/tesla-fleet-telemetry` | Fleet Telemetry protobuf decoding and mutual-TLS websocket receiver | implemented | MIT OR Apache-2.0 |

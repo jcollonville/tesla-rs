@@ -22,6 +22,11 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/auth/login", get(oauth_start))
         .route("/auth/callback", get(oauth_callback))
         .route("/auth/disconnect", post(disconnect))
+        .route("/auth/owner", get(super::owner::page))
+        .route("/auth/owner/start", post(super::owner::start))
+        .route("/auth/owner/callback", post(super::owner::callback))
+        .route("/auth/owner/refresh", post(super::owner::refresh))
+        .route("/auth/owner/disconnect", post(super::owner::disconnect))
         .route("/tokens", post(create_token))
         .route("/tokens/{id}/revoke", post(revoke_token))
 }
@@ -66,6 +71,7 @@ async fn status(State(app): State<AppState>, headers: HeaderMap) -> Response {
         None
     };
     let global = app.global_error().await;
+    let streaming = app.inner.stream_board.snapshot().await;
     let body = render_status(
         &csrf.0,
         logged_in,
@@ -73,6 +79,7 @@ async fn status(State(app): State<AppState>, headers: HeaderMap) -> Response {
         &tokens,
         revealed.as_deref(),
         global.as_deref(),
+        &streaming,
     );
     let mut response = Html(body).into_response();
     if let Some(cookie) = csrf.1 {
@@ -253,9 +260,9 @@ async fn revoke_token(
     Redirect::to("/").into_response()
 }
 
-struct CsrfIssued(String, Option<HeaderValue>);
+pub(super) struct CsrfIssued(pub(super) String, pub(super) Option<HeaderValue>);
 
-fn ensure_csrf(app: &AppState, headers: &HeaderMap) -> Result<CsrfIssued, StatusCode> {
+pub(super) fn ensure_csrf(app: &AppState, headers: &HeaderMap) -> Result<CsrfIssued, StatusCode> {
     if let Some(existing) = cookie(headers, "tl_csrf") {
         return Ok(CsrfIssued(existing.to_owned(), None));
     }
@@ -309,6 +316,7 @@ fn render_status(
     tokens: &[TokenRow],
     revealed: Option<&str>,
     global: Option<&str>,
+    streaming: &crate::owner_stream::StreamSnapshot,
 ) -> String {
     let connected_text = if connected { "yes" } else { "no" };
     let global = global
@@ -316,18 +324,24 @@ fn render_status(
         .unwrap_or_default();
     let mut rows = String::new();
     if vehicles.is_empty() {
-        rows.push_str("<tr><td colspan=\"6\">No vehicles yet.</td></tr>");
+        rows.push_str("<tr><td colspan=\"7\">No vehicles yet.</td></tr>");
     }
     for vehicle in vehicles {
+        let (stream_status, stream_error) = streaming.for_vehicle(vehicle.id);
+        let stream = match stream_error {
+            Some(error) => format!("{stream_status} ({error})"),
+            None => stream_status,
+        };
         let _ = write!(
             rows,
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             escape(vehicle.name.as_deref().unwrap_or(vehicle.vin.as_str())),
             escape(&vehicle.vin),
             escape(vehicle.activity.as_deref().unwrap_or("unknown")),
             fmt_opt(vehicle.battery_level),
             fmt_time(vehicle.last_poll_at),
-            escape(vehicle.last_error.as_deref().unwrap_or(""))
+            escape(vehicle.last_error.as_deref().unwrap_or("")),
+            escape(&stream)
         );
     }
     let mut token_rows = String::new();
@@ -353,6 +367,7 @@ fn render_status(
             )
         })
         .unwrap_or_default();
+    let stream_summary = streaming.summary();
     let connect = if connected {
         format!(
             "<form class=\"inline\" method=\"post\" action=\"/auth/disconnect\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button type=\"submit\">Disconnect Tesla</button></form>"
@@ -363,14 +378,15 @@ fn render_status(
     page(&format!(
         "<h1>tesla-logger</h1>{global}<p>Tesla account connected: {connected_text}. {connect}</p>\
          <form class=\"inline\" method=\"post\" action=\"/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button type=\"submit\">Sign out</button></form>\
-         <h2>Vehicles</h2><table><thead><tr><th>Name</th><th>VIN</th><th>State</th><th>Battery %</th><th>Last poll</th><th>Error</th></tr></thead><tbody>{rows}</tbody></table>\
+         <h2>Vehicles</h2><p>Owner API stream: {stream_summary}. <a href=\"/auth/owner\">Set up streaming</a></p>\
+         <table><thead><tr><th>Name</th><th>VIN</th><th>State</th><th>Battery %</th><th>Last poll</th><th>Error</th><th>Stream</th></tr></thead><tbody>{rows}</tbody></table>\
          <h2>API tokens</h2>{revealed}<form method=\"post\" action=\"/tokens\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
          <label>Name <input name=\"name\" required maxlength=\"80\"></label> <button type=\"submit\">Create token</button></form>\
          <table><thead><tr><th>Name</th><th>Status</th><th></th></tr></thead><tbody>{token_rows}</tbody></table>"
     ))
 }
 
-fn csrf_ok(headers: &HeaderMap, form: &str) -> bool {
+pub(super) fn csrf_ok(headers: &HeaderMap, form: &str) -> bool {
     cookie(headers, "tl_csrf").is_some_and(|cookie| cookie == form && !form.is_empty())
 }
 
@@ -381,7 +397,7 @@ fn session_cookie(app: &AppState, id: &str) -> String {
     )
 }
 
-fn secure_flag(app: &AppState) -> &'static str {
+pub(super) fn secure_flag(app: &AppState) -> &'static str {
     if app.inner.config.public_base_url.starts_with("https://") {
         "; Secure"
     } else {
@@ -399,7 +415,7 @@ async fn clear_tokens(app: &AppState) -> Result<(), crate::error::AppError> {
 
 async fn vehicle_rows(app: &AppState) -> Result<Vec<VehicleRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT v.vin, COALESCE(v.name, v.vin) AS name, s.activity, s.battery_level, s.last_poll_at, s.last_error
+        "SELECT v.id, v.vin, COALESCE(v.name, v.vin) AS name, s.activity, s.battery_level, s.last_poll_at, s.last_error
          FROM vehicles v
          LEFT JOIN vehicle_state s ON s.vehicle_id = v.id
          ORDER BY v.id",
@@ -416,6 +432,7 @@ async fn token_rows(app: &AppState) -> Result<Vec<TokenRow>, sqlx::Error> {
 
 #[derive(sqlx::FromRow)]
 struct VehicleRow {
+    id: i64,
     vin: String,
     name: Option<String>,
     activity: Option<String>,
@@ -442,7 +459,7 @@ fn fmt_time(value: Option<chrono::DateTime<chrono::Utc>>) -> String {
     )
 }
 
-pub(crate) fn escape(text: &str) -> String {
+pub(super) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -452,7 +469,7 @@ pub(crate) fn escape(text: &str) -> String {
 const HEAD: &str = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>tesla-logger</title><style>:root{color-scheme:light dark}body{font:15px/1.45 system-ui,sans-serif;margin:2rem auto;max-width:52rem;padding:0 1rem}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.35rem .5rem;border-bottom:1px solid #8884;vertical-align:top}code{font-family:ui-monospace,monospace}button,input{font:inherit}.err{color:#a33}form.inline{display:inline}footer{margin-top:2rem;color:#666}</style></head><body>";
 const FOOT: &str = "<footer><p>tesla-logger is free software under the GNU AGPL-3.0-only. <a href=\"https://github.com/jcollonville/tesla-rs\">Source code</a>.</p></footer></body></html>";
 
-fn page(body: &str) -> String {
+pub(super) fn page(body: &str) -> String {
     let mut html = String::with_capacity(HEAD.len() + body.len() + FOOT.len());
     html.push_str(HEAD);
     html.push_str(body);

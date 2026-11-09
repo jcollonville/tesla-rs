@@ -66,12 +66,17 @@ pub(crate) async fn vehicle_state(
         "SELECT vehicle_id, activity, {columns} FROM vehicle_state WHERE vehicle_id = $1",
         columns = STATE_FIELDS.join(", ")
     );
-    let row = sqlx::query_as::<_, StateJson>(&sql)
+    let mut row = sqlx::query_as::<_, StateJson>(&sql)
         .bind(id)
         .fetch_optional(&app.inner.db)
         .await
-        .map_err(internal)?;
-    Ok(Json(row.unwrap_or_else(|| StateJson::offline(id))))
+        .map_err(internal)?
+        .unwrap_or_else(|| StateJson::offline(id));
+    let snapshot = app.inner.stream_board.snapshot().await;
+    let (status, error) = snapshot.for_vehicle(id);
+    row.stream_status = status;
+    row.stream_error = error;
+    Ok(Json(row))
 }
 
 pub(crate) async fn list_drives(
@@ -301,13 +306,15 @@ pub(crate) async fn ws(
 ) -> impl IntoResponse {
     let events = app.inner.events.subscribe();
     let db = app.inner.db.clone();
-    upgrade.on_upgrade(move |socket| handle_socket(socket, db, events))
+    let board = app.inner.stream_board.clone();
+    upgrade.on_upgrade(move |socket| handle_socket(socket, db, events, board))
 }
 
 async fn handle_socket(
     mut socket: WebSocket,
     db: sqlx::PgPool,
     mut events: tokio::sync::broadcast::Receiver<crate::persist::LiveEvent>,
+    board: crate::owner_stream::StreamBoard,
 ) {
     let snapshot = format!(
         "SELECT v.vin, v.name, v.model, v.id AS vehicle_id,
@@ -321,7 +328,11 @@ async fn handle_socket(
         .fetch_all(&db)
         .await
     {
-        for row in rows {
+        for mut row in rows {
+            let snapshot = board.snapshot().await;
+            let (status, error) = snapshot.for_vehicle(row.state.vehicle_id);
+            row.state.stream_status = status;
+            row.state.stream_error = error;
             let payload = serde_json::json!({
                 "type": "state",
                 "vin": row.vin,
@@ -364,8 +375,28 @@ async fn handle_socket(
             event = events.recv() => {
                 match event {
                     Ok(event) => {
-                        if let Ok(text) = serde_json::to_string(&event)
-                            && socket.send(Message::Text(text.into())).await.is_err()
+                        let Ok(mut value) = serde_json::to_value(&event) else {
+                            continue;
+                        };
+                        let snapshot = board.snapshot().await;
+                        let (status, error) = snapshot.for_vehicle(event.vehicle_id);
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert(
+                                "stream_status".to_owned(),
+                                serde_json::Value::String(status),
+                            );
+                            object.insert(
+                                "stream_error".to_owned(),
+                                match error {
+                                    Some(text) => serde_json::Value::String(text),
+                                    None => serde_json::Value::Null,
+                                },
+                            );
+                        }
+                        if socket
+                            .send(Message::Text(value.to_string().into()))
+                            .await
+                            .is_err()
                         {
                             break;
                         }
@@ -607,6 +638,17 @@ pub(crate) struct StateJson {
     pub elevation_m: Option<f64>,
     pub battery_heater_on: Option<bool>,
     pub is_preconditioning: Option<bool>,
+    /// Owner API streaming socket: `connected`, `disabled`, or `error`.
+    #[sqlx(default)]
+    #[serde(default = "default_stream_status")]
+    pub stream_status: String,
+    /// Short error class when [`Self::stream_status`] is `error`. Never a token.
+    #[sqlx(default)]
+    pub stream_error: Option<String>,
+}
+
+fn default_stream_status() -> String {
+    "disabled".to_owned()
 }
 
 impl StateJson {
@@ -668,6 +710,8 @@ impl StateJson {
             elevation_m: None,
             battery_heater_on: None,
             is_preconditioning: None,
+            stream_status: default_stream_status(),
+            stream_error: None,
         }
     }
 }

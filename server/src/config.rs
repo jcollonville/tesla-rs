@@ -46,6 +46,8 @@ pub(crate) struct Config {
     pub telemetry_bind: SocketAddr,
     pub telemetry_cert_path: Option<PathBuf>,
     pub telemetry_key_path: Option<PathBuf>,
+    pub owner_stream_enabled: bool,
+    pub owner_token_store_path: PathBuf,
 }
 
 impl std::fmt::Debug for Config {
@@ -104,6 +106,10 @@ impl Config {
             None => format!("https://{domain}"),
         };
         validate_public_base(&public_base_url)?;
+        let token_store_path = PathBuf::from(required(map, "TESLA_TOKEN_STORE_PATH")?);
+        let owner_stream_enabled = optional_bool(map, "OWNER_STREAM_ENABLED")?.unwrap_or(true);
+        let owner_token_store_path = optional(map, "TESLA_OWNER_TOKEN_STORE_PATH")
+            .map_or_else(|| owner_token_path(&token_store_path), PathBuf::from);
         let listen_addr = optional(map, "TESLA_LISTEN_ADDR")
             .unwrap_or_else(|| "0.0.0.0:4000".to_owned())
             .parse::<SocketAddr>()
@@ -125,7 +131,7 @@ impl Config {
             client_id: required(map, "TESLA_CLIENT_ID")?,
             client_secret: SecretString::from(required(map, "TESLA_CLIENT_SECRET")?),
             private_key_path: PathBuf::from(required(map, "TESLA_PRIVATE_KEY_PATH")?),
-            token_store_path: PathBuf::from(required(map, "TESLA_TOKEN_STORE_PATH")?),
+            token_store_path,
             token_encryption_key: optional(map, "TESLA_TOKEN_ENCRYPTION_KEY"),
             ui_password: SecretString::from(required(map, "TESLA_LOGGER_UI_PASSWORD")?),
             drive_poll: Duration::from_secs(optional_u64(map, "POLL_DRIVE_SECS", 15)?),
@@ -156,7 +162,16 @@ impl Config {
             telemetry_bind,
             telemetry_cert_path: optional(map, "TELEMETRY_CERT_PATH").map(PathBuf::from),
             telemetry_key_path: optional(map, "TELEMETRY_KEY_PATH").map(PathBuf::from),
+            owner_stream_enabled,
+            owner_token_store_path,
         })
+    }
+}
+
+fn owner_token_path(fleet_tokens: &std::path::Path) -> PathBuf {
+    match fleet_tokens.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join("owner-tokens.json"),
+        _ => PathBuf::from("owner-tokens.json"),
     }
 }
 
@@ -326,5 +341,10 @@ mod tests {
         assert!(!rendered.contains("encrypt-secret"));
         assert_eq!(config.redirect_uri, "https://tsl.b-612.fr/auth/callback");
         assert_eq!(config.region, tesla_auth::Region::Europe);
+        assert!(config.owner_stream_enabled);
+        assert_eq!(
+            config.owner_token_store_path,
+            std::path::PathBuf::from("/data/owner-tokens.json")
+        );
     }
 }

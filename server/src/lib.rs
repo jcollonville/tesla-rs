@@ -21,6 +21,7 @@ mod http;
 mod import;
 mod ingest;
 mod mqtt;
+mod owner_stream;
 mod persist;
 mod rdp;
 mod state;

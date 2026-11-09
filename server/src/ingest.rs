@@ -145,6 +145,8 @@ pub(crate) struct Archive {
     pub geocoder: Geocoder,
     pub events: broadcast::Sender<LiveEvent>,
     pub runtimes: Arc<Mutex<HashMap<String, Runtime>>>,
+    /// Wakes a backing-off Owner API stream when this VIN is seen online.
+    pub stream_kick: broadcast::Sender<String>,
 }
 
 pub(crate) async fn apply_for_vin(
@@ -172,6 +174,30 @@ pub(crate) async fn apply_for_vin(
         &archive.geocoder,
         &archive.events,
         live,
+    )
+    .await
+}
+
+/// Writes one Owner API streaming sample onto the current drive.
+pub(crate) async fn apply_stream_for_vin(
+    archive: &Archive,
+    vin: &str,
+    identity: VehicleIdentity<'_>,
+    sample: &crate::persist::StreamFix,
+) -> Result<(), AppError> {
+    let vehicle_id = upsert_vehicle(&archive.db, identity).await?;
+    let mut guard = archive.runtimes.lock().await;
+    if !guard.contains_key(vin) {
+        let runtime = load_runtime(&archive.db, vehicle_id, vin).await?;
+        guard.insert(vin.to_owned(), runtime);
+    }
+    let runtime = guard.get_mut(vin).expect("runtime inserted");
+    crate::persist::apply_stream_sample(
+        &archive.db,
+        runtime,
+        sample,
+        &archive.geocoder,
+        &archive.events,
     )
     .await
 }
@@ -485,6 +511,9 @@ async fn handle_summary(
     policy: &PollPolicy,
     summary: &Summary,
 ) -> Result<CycleControl, AppError> {
+    if summary.presence == Presence::Online {
+        let _ = archive.stream_kick.send(summary.vin.clone());
+    }
     let vehicle_id = upsert_vehicle(
         &archive.db,
         VehicleIdentity {

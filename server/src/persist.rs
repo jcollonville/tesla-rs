@@ -227,7 +227,7 @@ pub(crate) async fn load_runtime(
                 d.id AS drive_id, c.id AS charge_id
          FROM vehicles v
          LEFT JOIN vehicle_state s ON s.vehicle_id = v.id
-         LEFT JOIN drives d ON d.vehicle_id = v.id AND d.end_at IS NULL AND d.source = 'poll'
+         LEFT JOIN drives d ON d.vehicle_id = v.id AND d.end_at IS NULL AND d.source IN ('poll', 'stream')
          LEFT JOIN charges c ON c.vehicle_id = v.id AND c.end_at IS NULL AND c.source = 'poll'
          WHERE v.id = $1",
     )
@@ -324,7 +324,7 @@ pub(crate) async fn apply_observation(
 
     if starting_drive {
         runtime.open_drive_id =
-            Some(insert_drive(&mut tx, runtime.vehicle_id, obs, fence_id).await?);
+            Some(insert_drive(&mut tx, runtime.vehicle_id, obs, fence_id, "poll").await?);
     }
     if starting_charge {
         runtime.open_charge_id =
@@ -421,6 +421,245 @@ pub(crate) async fn apply_observation(
     Ok(())
 }
 
+/// One Owner API streaming fix, already converted to kilometres and metres.
+pub(crate) struct StreamFix {
+    pub at: DateTime<Utc>,
+    pub shift_state: Option<String>,
+    pub speed_kmh: Option<f64>,
+    pub power_kw: Option<f64>,
+    pub odometer_km: Option<f64>,
+    pub battery_level: Option<f64>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub elevation_m: Option<f64>,
+    pub heading_deg: Option<f64>,
+    pub rated_range_km: Option<f64>,
+    pub est_range_km: Option<f64>,
+}
+
+/// Records a streaming sample on the open drive without disturbing a charge.
+pub(crate) async fn apply_stream_sample(
+    pool: &PgPool,
+    runtime: &mut Runtime,
+    sample: &StreamFix,
+    geocoder: &Geocoder,
+    events: &broadcast::Sender<LiveEvent>,
+) -> Result<(), AppError> {
+    let decision = crate::state::stream_drive_decision(
+        &runtime.tracker,
+        sample.shift_state.as_deref(),
+        sample.speed_kmh,
+    );
+    let store = crate::state::should_store_stream_position(
+        decision.driving,
+        decision.end_drive,
+        sample.latitude,
+        sample.longitude,
+    );
+    let measured = sample.speed_kmh.is_some()
+        || sample.power_kw.is_some()
+        || sample.odometer_km.is_some()
+        || sample.battery_level.is_some()
+        || sample.latitude.is_some()
+        || sample.shift_state.is_some();
+    let changed = decision.start_drive
+        || decision.end_drive
+        || decision.end_charge
+        || decision.activity != runtime.tracker.activity;
+    if !changed && !store && !measured {
+        return Ok(());
+    }
+
+    let obs = observation_from_stream(sample);
+    let mut tx = pool.begin().await?;
+    let fences = load_fences(&mut tx).await?;
+    let fence_id = obs
+        .latitude
+        .zip(obs.longitude)
+        .and_then(|(latitude, longitude)| matching_geofence(latitude, longitude, &fences));
+    let mut open_charge_id = runtime.open_charge_id;
+    let mut open_drive_id = runtime.open_drive_id;
+    let mut drive_open = runtime.tracker.drive_open;
+    let mut charge_open = runtime.tracker.charge_open;
+    let mut address_jobs = Vec::new();
+
+    if decision.end_charge
+        && let Some(charge_id) = open_charge_id
+    {
+        close_charge(&mut tx, charge_id, &obs, fence_id).await?;
+        push_address(&mut address_jobs, None, Some(charge_id), "end", &obs);
+        open_charge_id = None;
+        charge_open = false;
+    }
+    if decision.start_drive {
+        open_drive_id =
+            Some(insert_drive(&mut tx, runtime.vehicle_id, &obs, fence_id, "stream").await?);
+        drive_open = true;
+        push_address(&mut address_jobs, open_drive_id, None, "start", &obs);
+    }
+    let attach_drive = if drive_open { open_drive_id } else { None };
+    if store {
+        let external_id = format!("{}:{}", runtime.vehicle_id, obs.at.timestamp_millis());
+        insert_stream_position(
+            &mut tx,
+            runtime.vehicle_id,
+            &obs,
+            attach_drive,
+            &external_id,
+        )
+        .await?;
+    }
+    if let Some(drive_id) = attach_drive
+        && let Some(level) = soc_level(obs.battery_level, obs.usable_battery_level)
+    {
+        sqlx::query(
+            "UPDATE drives SET start_battery_level = COALESCE(start_battery_level, $2) WHERE id = $1",
+        )
+        .bind(drive_id)
+        .bind(level)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if decision.end_drive
+        && let Some(drive_id) = open_drive_id
+    {
+        close_drive(
+            &mut tx,
+            drive_id,
+            &obs,
+            runtime.efficiency_kwh_per_km,
+            fence_id,
+        )
+        .await?;
+        push_address(&mut address_jobs, Some(drive_id), None, "end", &obs);
+        open_drive_id = None;
+        drive_open = false;
+    }
+    save_stream_state(&mut tx, runtime.vehicle_id, decision.activity, &obs).await?;
+    tx.commit().await?;
+
+    runtime.open_drive_id = open_drive_id;
+    runtime.open_charge_id = open_charge_id;
+    runtime.tracker.drive_open = drive_open;
+    runtime.tracker.charge_open = charge_open;
+    runtime.tracker.activity = decision.activity;
+    for job in address_jobs {
+        if let Err(err) = attach_address(pool, geocoder, &job).await {
+            tracing::warn!(error = %err, "reverse geocode failed");
+        }
+    }
+    let _ = events.send(live_event(runtime, &obs));
+    Ok(())
+}
+
+fn observation_from_stream(sample: &StreamFix) -> Observation {
+    let mut obs = Observation::at(sample.at, crate::state::Presence::Online);
+    obs.shift_state.clone_from(&sample.shift_state);
+    obs.speed_kmh = sample.speed_kmh;
+    obs.power_kw = sample.power_kw;
+    obs.odometer_km = sample.odometer_km;
+    obs.battery_level = sample.battery_level;
+    obs.latitude = sample.latitude;
+    obs.longitude = sample.longitude;
+    obs.elevation_m = sample.elevation_m;
+    obs.heading_deg = sample.heading_deg;
+    obs.rated_range_km = sample.rated_range_km;
+    obs.est_range_km = sample.est_range_km;
+    obs
+}
+
+async fn insert_stream_position(
+    tx: &mut Transaction<'_, Postgres>,
+    vehicle_id: i64,
+    obs: &Observation,
+    drive_id: Option<i64>,
+    external_id: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO positions (
+            vehicle_id, recorded_at, latitude, longitude, speed_kmh, power_kw, odometer_km,
+            elevation_m, battery_level, usable_battery_level, ideal_range_km, rated_range_km,
+            est_range_km, inside_temp_c, outside_temp_c, heading_deg, drive_id, charge_id,
+            source, external_id
+         )
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, $10, $11, NULL, NULL, $12, $13,
+                NULL, 'stream', $14
+         WHERE NOT EXISTS (
+            SELECT 1 FROM positions
+            WHERE vehicle_id = $1
+              AND source = 'poll'
+              AND recorded_at BETWEEN $2 - interval '2 seconds' AND $2 + interval '2 seconds'
+         )
+         ON CONFLICT (source, external_id, recorded_at) WHERE external_id IS NOT NULL DO NOTHING",
+    )
+    .bind(vehicle_id)
+    .bind(obs.at)
+    .bind(obs.latitude)
+    .bind(obs.longitude)
+    .bind(obs.speed_kmh)
+    .bind(obs.power_kw)
+    .bind(obs.odometer_km)
+    .bind(obs.elevation_m)
+    .bind(obs.battery_level)
+    .bind(obs.rated_range_km)
+    .bind(obs.est_range_km)
+    .bind(obs.heading_deg)
+    .bind(drive_id)
+    .bind(external_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn save_stream_state(
+    tx: &mut Transaction<'_, Postgres>,
+    vehicle_id: i64,
+    activity: crate::state::Activity,
+    obs: &Observation,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO vehicle_state (
+            vehicle_id, activity, battery_level, rated_range_km, est_range_km, odometer_km,
+            latitude, longitude, heading_deg, speed_kmh, power_kw, shift_state, elevation_m,
+            last_data_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now()
+         )
+         ON CONFLICT (vehicle_id) DO UPDATE SET
+            activity = EXCLUDED.activity,
+            battery_level = COALESCE(EXCLUDED.battery_level, vehicle_state.battery_level),
+            rated_range_km = COALESCE(EXCLUDED.rated_range_km, vehicle_state.rated_range_km),
+            est_range_km = COALESCE(EXCLUDED.est_range_km, vehicle_state.est_range_km),
+            odometer_km = COALESCE(EXCLUDED.odometer_km, vehicle_state.odometer_km),
+            latitude = COALESCE(EXCLUDED.latitude, vehicle_state.latitude),
+            longitude = COALESCE(EXCLUDED.longitude, vehicle_state.longitude),
+            heading_deg = COALESCE(EXCLUDED.heading_deg, vehicle_state.heading_deg),
+            speed_kmh = COALESCE(EXCLUDED.speed_kmh, vehicle_state.speed_kmh),
+            power_kw = COALESCE(EXCLUDED.power_kw, vehicle_state.power_kw),
+            shift_state = COALESCE(EXCLUDED.shift_state, vehicle_state.shift_state),
+            elevation_m = COALESCE(EXCLUDED.elevation_m, vehicle_state.elevation_m),
+            last_data_at = EXCLUDED.last_data_at,
+            updated_at = now()",
+    )
+    .bind(vehicle_id)
+    .bind(activity.as_str())
+    .bind(obs.battery_level)
+    .bind(obs.rated_range_km)
+    .bind(obs.est_range_km)
+    .bind(obs.odometer_km)
+    .bind(obs.latitude)
+    .bind(obs.longitude)
+    .bind(obs.heading_deg)
+    .bind(obs.speed_kmh)
+    .bind(obs.power_kw)
+    .bind(&obs.shift_state)
+    .bind(obs.elevation_m)
+    .bind(obs.at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 struct AddressJob {
     drive_id: Option<i64>,
     charge_id: Option<i64>,
@@ -472,6 +711,7 @@ async fn insert_drive(
     vehicle_id: i64,
     obs: &Observation,
     geofence_id: Option<i64>,
+    source: &str,
 ) -> Result<i64, AppError> {
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO drives (
@@ -481,7 +721,7 @@ async fn insert_drive(
          )
          SELECT $1, $2, $3, $4, $5,
                 COALESCE($6, s.battery_level, s.usable_battery_level),
-                $7, $8, $9, 'poll'
+                $7, $8, $9, $10
          FROM (SELECT 1) AS seed
          LEFT JOIN vehicle_state s ON s.vehicle_id = $1
          RETURNING id",
@@ -495,6 +735,7 @@ async fn insert_drive(
     .bind(obs.rated_range_km)
     .bind(obs.ideal_range_km)
     .bind(geofence_id)
+    .bind(source)
     .fetch_one(&mut **tx)
     .await?;
     Ok(row.0)
@@ -563,6 +804,19 @@ async fn insert_position(
     .bind(obs.heading_deg)
     .bind(drive_id)
     .bind(charge_id)
+    .execute(&mut **tx)
+    .await?;
+    // The poll row is the richer sample. Drop streamed fixes from the same moment
+    // so a drive does not keep two points for one poll. The window matches
+    // `stream_collides_with_poll` (two seconds).
+    sqlx::query(
+        "DELETE FROM positions
+         WHERE vehicle_id = $1
+           AND source = 'stream'
+           AND recorded_at BETWEEN $2 - interval '2 seconds' AND $2 + interval '2 seconds'",
+    )
+    .bind(vehicle_id)
+    .bind(obs.at)
     .execute(&mut **tx)
     .await?;
     Ok(())

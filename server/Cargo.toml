@@ -29,6 +29,7 @@ sha2 = { workspace = true }
 # and SQLite drivers stay off the build. Cargo still locks them — see deny.toml.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls", "migrate", "macros", "derive", "chrono", "json"] }
 tesla-auth = { workspace = true }
+tesla-owner-api = { workspace = true }
 tesla-fleet-api = { workspace = true }
 tesla-fleet-telemetry = { workspace = true }
 thiserror = { workspace = true }
