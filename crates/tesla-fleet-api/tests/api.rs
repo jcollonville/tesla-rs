@@ -412,3 +412,23 @@ async fn incorrect_region_and_payment_required_are_distinct() {
         tesla_fleet_api::FleetError::PaymentRequired
     ));
 }
+
+#[tokio::test]
+async fn signed_command_posts_base64_routable_message() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/1/vehicles/TEST00000000VIN01/signed_command"))
+        .and(body_string_contains("\"routable_message\":\"AQID/w==\""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"response":"b2s="}"#))
+        .mount(&server)
+        .await;
+    let tag = VehicleTag::new("TEST00000000VIN01").unwrap();
+    let response = client(&server)
+        .signed_command(&tag, &[1, 2, 3, 255])
+        .await
+        .unwrap();
+    assert_eq!(response, b"ok");
+    let body = server.received_requests().await.unwrap()[0].body.clone();
+    let text = String::from_utf8_lossy(&body);
+    assert!(!text.contains("test-token"));
+}

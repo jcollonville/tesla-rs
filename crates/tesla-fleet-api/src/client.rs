@@ -2,6 +2,8 @@
 
 use std::time::{Duration, SystemTime};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use secrecy::ExposeSecret;
 use serde::Serialize;
@@ -286,6 +288,40 @@ impl<T: AccessTokenProvider> FleetClient<T> {
             .send(reqwest::Method::POST, &path, &[], None, CallClass::Mutation)
             .await?;
         Ok(decoded.value)
+    }
+
+    /// `POST /api/1/vehicles/{vehicle_tag}/signed_command`.
+    ///
+    /// Sends one Vehicle Command protocol `RoutableMessage`. The JSON body is
+    /// `{"routable_message": "<standard-base64>"}`. A successful HTTP response is
+    /// `{"response": "<standard-base64>"}` and does not mean the vehicle accepted the command.
+    /// This method does not log the message. It does not call [`Self::wake_up`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FleetError::Decode`] when the response is not a base64 `RoutableMessage`, and the
+    /// Fleet API status mapped by [`FleetError`] otherwise.
+    pub async fn signed_command(
+        &self,
+        tag: &VehicleTag,
+        routable_message: &[u8],
+    ) -> Result<Vec<u8>, FleetError> {
+        let encoded = STANDARD.encode(routable_message);
+        let body = serde_json::json!({ "routable_message": encoded });
+        let path = format!("api/1/vehicles/{tag}/signed_command");
+        let decoded: String = self
+            .send(
+                reqwest::Method::POST,
+                &path,
+                &[],
+                Some(body),
+                CallClass::Mutation,
+            )
+            .await?
+            .value;
+        STANDARD
+            .decode(decoded.trim().as_bytes())
+            .map_err(|_| FleetError::Decode)
     }
 
     /// `POST /api/1/vehicles/fleet_status`.

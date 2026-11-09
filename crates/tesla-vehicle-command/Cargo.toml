@@ -1,0 +1,54 @@
+[package]
+name = "tesla-vehicle-command"
+description = "Tesla vehicle-command protocol: virtual key, session handshake, and signed commands"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tesla", "vehicle-command", "virtual-key", "fleet-api"]
+categories = ["cryptography", "api-bindings"]
+include = [
+    "src/**",
+    "proto/**",
+    "build.rs",
+    "README.md",
+    "NOTICE",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "Cargo.toml",
+]
+
+[dependencies]
+aes-gcm = "0.10"
+base64.workspace = true
+getrandom.workspace = true
+hmac = "0.12"
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh", "pem", "std"] }
+prost = "0.14"
+prost-types = "0.14"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+secrecy.workspace = true
+serde_json.workspace = true
+sha1 = "0.10"
+sha2.workspace = true
+subtle = "2.6"
+tesla-fleet-api.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+tesla-auth.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock.workspace = true
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+[lints]
+workspace = true

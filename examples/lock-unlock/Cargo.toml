@@ -1,0 +1,22 @@
+[package]
+name = "lock-unlock"
+description = "Wake a vehicle and lock or unlock it with a virtual key"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "lock-unlock"
+path = "src/main.rs"
+
+[dependencies]
+tesla-auth.workspace = true
+tesla-fleet-api.workspace = true
+tesla-vehicle-command.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

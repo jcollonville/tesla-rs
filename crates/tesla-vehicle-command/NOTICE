@@ -1,0 +1,19 @@
+tesla-vehicle-command
+Copyright 2026 Jean Collonvillé
+
+This crate is dual-licensed under the MIT license and the Apache License 2.0.
+See LICENSE-MIT and LICENSE-APACHE.
+
+The Protocol Buffer definitions under proto/, except proto/google/protobuf/timestamp.proto,
+are vendored without modification from the Tesla Motors vehicle-command repository:
+
+  https://github.com/teslamotors/vehicle-command
+  path: pkg/protocol/protobuf
+  commit: 0a582da430c4aca6d397fb6cbed5b4d6bb380125
+
+Those files are licensed under the Apache License 2.0 by their authors.
+The Apache license text is in LICENSE-APACHE.
+
+proto/google/protobuf/timestamp.proto is the well-known Timestamp message from
+the Protocol Buffers project and is licensed under the BSD 3-Clause License.
+The license text is in that file's header.
