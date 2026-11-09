@@ -1,0 +1,47 @@
+[package]
+name = "tesla-logger"
+description = "Self-hosted archive of Tesla drives, charges, and vehicle state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "AGPL-3.0-only"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+aes-gcm = "0.10"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "form", "ws", "tokio", "macros"] }
+base64 = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+getrandom = { workspace = true }
+hex = "0.4"
+p256 = { version = "0.14", default-features = false, features = ["arithmetic", "pem", "std"] }
+reqwest = { workspace = true }
+rumqttc = { version = "0.25", default-features = false }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+# Postgres only. default-features would also turn on the `any` driver; the MySQL
+# and SQLite drivers stay off the build. Cargo still locks them — see deny.toml.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls", "migrate", "macros", "derive", "chrono", "json"] }
+tesla-auth = { workspace = true }
+tesla-fleet-api = { workspace = true }
+tesla-fleet-telemetry = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "io-util", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+wiremock = { workspace = true }
+
+[lints]
+workspace = true

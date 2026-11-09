@@ -8,6 +8,7 @@ members = [
     "examples/list-vehicles",
     "examples/lock-unlock",
     "examples/telemetry-receiver",
+    "server",
 ]
 default-members = [
     "crates/tesla-auth",

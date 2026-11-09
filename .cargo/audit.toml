@@ -1,0 +1,18 @@
+# cargo-audit scans every package in Cargo.lock, including optional
+# dependencies Cargo records but does not compile.
+#
+# sqlx 0.8 with `default-features = false` and only the postgres / runtime-tokio
+# / tls-rustls / migrate / macros / derive / chrono / json features does not
+# enable `mysql` or `sqlite`. `cargo tree -i rsa` and
+# `cargo tree -i libsqlite3-sys` do not match a package. Deleting the two
+# crates from Cargo.lock fails `cargo metadata --locked`; the next resolve
+# adds sqlx-mysql, sqlx-sqlite, rsa, and libsqlite3-sys again. They are not
+# linked into tesla-logger.
+
+[advisories]
+ignore = [
+    # Marvin timing attack. Only reachable through the unused sqlx-mysql driver.
+    "RUSTSEC-2023-0071",
+    # SQLite CVE-2026-119375 via libsqlite3-sys. Only reachable through the unused sqlx-sqlite driver.
+    "RUSTSEC-2026-0459",
+]

@@ -12,9 +12,9 @@ The crates are written to be reused by other programs. They do not depend on the
 | `crates/tesla-fleet-api` | Async Fleet API client (vehicles, live and cached data, wake, fleet status, telemetry config, charging history, partner registration) | implemented | MIT OR Apache-2.0 |
 | `crates/tesla-vehicle-command` | Virtual key, session handshake, and signed vehicle commands | implemented | MIT OR Apache-2.0 |
 | `crates/tesla-fleet-telemetry` | Fleet Telemetry protobuf decoding and mutual-TLS websocket receiver | implemented | MIT OR Apache-2.0 |
-| `server/` | `tesla-logger`, a self-hosted drive, charge, and state archive (Docker and Home Assistant) | not started | AGPL-3.0-only |
+| `server/` | `tesla-logger`, a self-hosted drive, charge, and state archive (Docker and Home Assistant) | implemented | AGPL-3.0-only |
 
-`tesla-logger` will be a separate license from the libraries. The AGPL text will be added with the server. Empty crates are not published.
+`tesla-logger` is licensed separately from the libraries. See `server/README.md` and `server/LICENSE`. Empty crates are not published.
 
 ## Security
 
@@ -65,4 +65,4 @@ Tests use a local mock server and do not call Tesla.
 
 Library crates are dual-licensed under `MIT OR Apache-2.0`. Copyright 2026 Jean Collonvillé.
 
-The future `tesla-logger` server will be `AGPL-3.0-only`.
+`tesla-logger` is `AGPL-3.0-only`.

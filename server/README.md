@@ -1,5 +1,86 @@
 # tesla-logger
 
-Planned self-hosted server that archives drives, charges, and vehicle state. It is intended to be packaged as a container image and as a Home Assistant app.
+Self-hosted archive of Tesla drives, charges, and vehicle state. It is a clean-room program: TeslaMate is a behavioural reference only, and this project is not affiliated with Tesla, Inc.
 
-Not implemented yet. When it lands it will be licensed `AGPL-3.0-only`, separate from the MIT OR Apache-2.0 libraries in `crates/`. The AGPL license file will be added with the server.
+The server is licensed `AGPL-3.0-only`. The library crates in `crates/` stay `MIT OR Apache-2.0`.
+
+## What works
+
+* Tesla OAuth (authorization code + PKCE) through `tesla-auth`, with the redirect `https://<TESLA_DOMAIN>/auth/callback`.
+* Public key at `/.well-known/appspecific/com.tesla.3p.public-key.pem`, derived from the mounted P-256 private key.
+* Sleep-aware Fleet API polling. The poller never calls `wake_up`. It uses the vehicle list to see `online` / `asleep` / `offline`, calls `vehicle_data` only while the car is already online, polls faster while driving or charging, and backs off when parked.
+* Drive and charge detection, positions partitioned by month, Nominatim reverse geocoding (cached, rate limited, disable-able), and geofences.
+* Read API for Home Assistant: REST plus a WebSocket, described by `openapi.yaml`.
+* Optional MQTT Home Assistant discovery (`MQTT_ENABLED=false` by default). The client speaks plain MQTT, which is the usual setup for a broker on the same NAS.
+* Optional Fleet Telemetry ingest (`TELEMETRY_ENABLED=false` by default) through `tesla-fleet-telemetry`. A fresh stream suppresses billable live polls for that car.
+* TeslaMate 4.x importer (`import-teslamate`), read-only, batched, idempotent, and resumable.
+
+Vehicle commands are not part of this server. Use `tesla-vehicle-command` separately.
+
+## Configure
+
+Copy `server/.env.example` to `server/.env`.
+
+| Variable | Purpose |
+| --- | --- |
+| `TESLA_CLIENT_ID` / `TESLA_CLIENT_SECRET` | Fleet API application |
+| `TESLA_FLEET_AUDIENCE` | `https://fleet-api.prd.eu.vn.cloud.tesla.com` for Europe |
+| `TESLA_DOMAIN` | Hostname behind the reverse proxy, for example `tsl.b-612.fr` |
+| `TESLA_PUBLIC_BASE_URL` | Public `https://` origin. Defaults to `https://<TESLA_DOMAIN>` |
+| `DATABASE_URL` | Postgres URL |
+| `TESLA_PRIVATE_KEY_PATH` | P-256 PEM, mounted read-only |
+| `TESLA_TOKEN_STORE_PATH` | OAuth token file. Mode `0600` |
+| `TESLA_TOKEN_ENCRYPTION_KEY` | Optional. 64 hex chars, or a passphrase hashed with SHA-256, encrypts the token file with AES-256-GCM |
+| `TESLA_LISTEN_ADDR` | Default `0.0.0.0:4000` |
+| `TESLA_LOGGER_UI_PASSWORD` | Password for the status page |
+| `NOMINATIM_*` | Reverse geocoding. Set `NOMINATIM_ENABLED=false` to disable |
+| `MQTT_*` | Home Assistant discovery. Off by default |
+| `TELEMETRY_*` | Mutual-TLS Fleet Telemetry receiver. Off by default |
+| `POLL_*` | Poll intervals |
+
+The UI password protects the status page and the OAuth start button. API calls use a bearer token created on that page (`Authorization: Bearer tl_...`). The WebSocket also accepts `access_token` in the query string; prefer the header so proxy logs do not store it.
+
+Do not enable `sqlx=trace` in production. Query logs can include bound values. Tokens, the client secret, and the private key are not written to logs.
+
+## Docker on a Synology NAS (amd64)
+
+From the repository root, with `server/.env` filled in and `server/private-key.pem` readable by uid `10001`:
+
+```bash
+docker compose -f server/docker-compose.yml up -d --build
+```
+
+The image runs as uid 10001, uses `postgres:17`, and healthchecks `/healthz`. Point the existing reverse proxy at port 4000 and serve the public key from this process instead of nginx.
+
+Import an existing TeslaMate database (read-only role):
+
+```bash
+docker compose -f server/docker-compose.yml run --rm tesla-logger \
+  import-teslamate --source 'postgres://readonly:secret@teslamate-host:5432/teslamate'
+```
+
+Images are published to `ghcr.io/jcollonville/tesla-logger` on `main` and on version tags. The workflow builds the runner architecture (amd64). The Dockerfile itself is not architecture-specific.
+
+## API
+
+`GET /api/openapi.yaml` is the contract. Authenticated routes:
+
+* `GET /api/v1/vehicles` and `GET /api/v1/vehicles/{id}`
+* `GET /api/v1/vehicles/{id}/state`
+* `GET /api/v1/drives?vehicle_id&from&to&page&per_page`
+* `GET /api/v1/drives/{id}?max_points=300` returns an RDP route and a stride time series
+* `GET /api/v1/charges` and `GET /api/v1/charges/{id}`
+* `GET /api/v1/stats?vehicle_id&from&to`
+* `GET /api/v1/geofences`
+* `GET /api/v1/ws` pushes `{"type":"state",...}` frames
+
+Distances are kilometres. Fleet API miles are converted on ingest. TeslaMate rows are already metric and are copied as stored.
+
+## Develop
+
+```bash
+export DATABASE_URL=postgres://tesla:tesla@127.0.0.1:5432/tesla_logger
+cargo test -p tesla-logger
+```
+
+Database tests create throwaway databases and skip when `DATABASE_URL` is unset outside CI.
