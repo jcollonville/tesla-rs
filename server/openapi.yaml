@@ -9,7 +9,8 @@ info:
     Read API for a self-hosted Tesla drive, charge, and state archive.
     Authenticate with `Authorization: Bearer tl_...`. The token is created in the
     web UI. Distances are kilometres, speeds are km/h, temperatures are Celsius,
-    and energy is kilowatt-hours.
+    energy is kilowatt-hours, power is kilowatts, tire pressure is bar, charger
+    voltage is volts, and charger current is amperes.
 servers:
   - url: /
 paths:
@@ -163,7 +164,9 @@ paths:
       summary: WebSocket push of live state
       description: |
         Send `Authorization: Bearer` or `access_token` query parameter.
-        Each text frame is a state object with `type` equal to `state`.
+        Each text frame is a `VehicleState` plus `type` (`state`), `vin`, and,
+        on live updates, `name`, `model`, and `at`. `at` is the observation time.
+        The first frames after connect are the stored state of every vehicle.
       security: [{ bearer: [] }]
       responses:
         "101": { description: Switching protocols }
@@ -248,17 +251,72 @@ components:
         activity:
           type: string
           enum: [online, asleep, offline, driving, charging, updating]
-        battery_level: { type: number, nullable: true }
-        rated_range_km: { type: number, nullable: true }
-        odometer_km: { type: number, nullable: true }
+        battery_level: { type: number, nullable: true, description: Percent }
+        usable_battery_level: { type: number, nullable: true, description: Percent }
+        rated_range_km: { type: number, nullable: true, description: Kilometres }
+        ideal_range_km: { type: number, nullable: true, description: Kilometres }
+        est_range_km: { type: number, nullable: true, description: Kilometres }
+        odometer_km: { type: number, nullable: true, description: Kilometres }
         latitude: { type: number, nullable: true }
         longitude: { type: number, nullable: true }
-        speed_kmh: { type: number, nullable: true }
-        charger_power_kw: { type: number, nullable: true }
+        heading_deg: { type: number, nullable: true }
+        speed_kmh: { type: number, nullable: true, description: Kilometres per hour }
+        power_kw: { type: number, nullable: true, description: Kilowatts }
+        inside_temp_c: { type: number, nullable: true, description: Celsius }
+        outside_temp_c: { type: number, nullable: true, description: Celsius }
+        climate_on: { type: boolean, nullable: true }
+        locked: { type: boolean, nullable: true }
+        sentry_mode: { type: boolean, nullable: true }
+        charger_power_kw: { type: number, nullable: true, description: Kilowatts }
         charging_state: { type: string, nullable: true }
+        charge_energy_added_kwh: { type: number, nullable: true, description: Kilowatt-hours }
+        charge_limit_soc: { type: number, nullable: true, description: Percent }
         shift_state: { type: string, nullable: true }
+        is_dc: { type: boolean, nullable: true }
+        software_version: { type: string, nullable: true }
+        update_status: { type: string, nullable: true }
         last_poll_at: { type: string, format: date-time, nullable: true }
+        last_data_at: { type: string, format: date-time, nullable: true }
         last_error: { type: string, nullable: true }
+        updated_at: { type: string, format: date-time, nullable: true }
+        charger_voltage: { type: number, nullable: true, description: Volts }
+        charger_current:
+          type: number
+          nullable: true
+          description: Amperes. Fleet API charger_actual_current.
+        charge_current_request: { type: number, nullable: true, description: Amperes }
+        charge_port_door_open: { type: boolean, nullable: true }
+        charge_port_latch:
+          type: string
+          nullable: true
+          description: Engaged, Disengaged, or Blocking
+        plugged_in:
+          type: boolean
+          nullable: true
+          description: Derived from charge_port_latch, charging_state, and conn_charge_cable
+        time_to_full_charge_h: { type: number, nullable: true, description: Hours }
+        scheduled_charging_start_time:
+          type: integer
+          nullable: true
+          description: Minutes after midnight, as reported by the vehicle
+        tpms_pressure_fl: { type: number, nullable: true, description: Bar }
+        tpms_pressure_fr: { type: number, nullable: true, description: Bar }
+        tpms_pressure_rl: { type: number, nullable: true, description: Bar }
+        tpms_pressure_rr: { type: number, nullable: true, description: Bar }
+        df: { type: integer, nullable: true, description: Driver front door. 0 is closed, nonzero is open }
+        dr: { type: integer, nullable: true, description: Driver rear door. 0 is closed, nonzero is open }
+        pf: { type: integer, nullable: true, description: Passenger front door. 0 is closed, nonzero is open }
+        pr: { type: integer, nullable: true, description: Passenger rear door. 0 is closed, nonzero is open }
+        fd_window: { type: integer, nullable: true, description: Driver front window. 0 is closed, nonzero is open }
+        fp_window: { type: integer, nullable: true, description: Passenger front window. 0 is closed, nonzero is open }
+        rd_window: { type: integer, nullable: true, description: Driver rear window. 0 is closed, nonzero is open }
+        rp_window: { type: integer, nullable: true, description: Passenger rear window. 0 is closed, nonzero is open }
+        ft: { type: integer, nullable: true, description: Front trunk. 0 is closed, nonzero is open }
+        rt: { type: integer, nullable: true, description: Rear trunk. 0 is closed, nonzero is open }
+        is_user_present: { type: boolean, nullable: true }
+        elevation_m: { type: number, nullable: true, description: Metres }
+        battery_heater_on: { type: boolean, nullable: true }
+        is_preconditioning: { type: boolean, nullable: true }
     Drive:
       type: object
       required: [id, vehicle_id, start_at]

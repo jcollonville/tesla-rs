@@ -443,6 +443,12 @@ pub struct ChargeState {
     /// Minutes until the charge limit.
     #[serde(default)]
     pub minutes_to_full_charge: Option<f64>,
+    /// Requested charge current, amperes.
+    #[serde(default)]
+    pub charge_current_request: Option<f64>,
+    /// Scheduled charging start, minutes after midnight. Null when unset.
+    #[serde(default)]
+    pub scheduled_charging_start_time: Option<f64>,
     /// Charge port door.
     #[serde(default)]
     pub charge_port_door_open: Option<bool>,
@@ -487,6 +493,9 @@ pub struct ClimateState {
     /// Whether preconditioning is active.
     #[serde(default)]
     pub is_preconditioning: Option<bool>,
+    /// Battery heater. Tesla also sends this as `battery_heater_on` on some cars.
+    #[serde(default)]
+    pub battery_heater: Option<bool>,
     /// Climate keeper mode.
     #[serde(default)]
     pub climate_keeper_mode: Option<String>,
@@ -633,16 +642,28 @@ pub struct VehicleState {
     /// Rear trunk.
     #[serde(default)]
     pub rt: Option<i64>,
-    /// Front-left tire pressure.
+    /// Driver front window. `0` is closed. A nonzero value is open.
+    #[serde(default)]
+    pub fd_window: Option<i64>,
+    /// Passenger front window. `0` is closed. A nonzero value is open.
+    #[serde(default)]
+    pub fp_window: Option<i64>,
+    /// Driver rear window. `0` is closed. A nonzero value is open.
+    #[serde(default)]
+    pub rd_window: Option<i64>,
+    /// Passenger rear window. `0` is closed. A nonzero value is open.
+    #[serde(default)]
+    pub rp_window: Option<i64>,
+    /// Front-left tire pressure, bar.
     #[serde(default)]
     pub tpms_pressure_fl: Option<f64>,
-    /// Front-right tire pressure.
+    /// Front-right tire pressure, bar.
     #[serde(default)]
     pub tpms_pressure_fr: Option<f64>,
-    /// Rear-left tire pressure.
+    /// Rear-left tire pressure, bar.
     #[serde(default)]
     pub tpms_pressure_rl: Option<f64>,
-    /// Rear-right tire pressure.
+    /// Rear-right tire pressure, bar.
     #[serde(default)]
     pub tpms_pressure_rr: Option<f64>,
     /// Center display state.
@@ -1074,4 +1095,42 @@ where
 {
     let value = Option::<Vec<T>>::deserialize(deserializer)?;
     Ok(value.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VehicleData;
+
+    #[test]
+    fn vehicle_data_decodes_charge_closure_and_climate_fields() {
+        let data: VehicleData = serde_json::from_str(
+            r#"{
+                "id": 1,
+                "vin": "TEST00000000VIN01",
+                "charge_state": {
+                    "charge_current_request": 16,
+                    "scheduled_charging_start_time": 1320,
+                    "time_to_full_charge": 1.5
+                },
+                "climate_state": {"battery_heater": true, "is_preconditioning": false},
+                "vehicle_state": {
+                    "fd_window": 0,
+                    "df": 1,
+                    "tpms_pressure_fl": 2.9
+                }
+            }"#,
+        )
+        .unwrap();
+        let charge = data.charge_state.unwrap();
+        assert_eq!(charge.charge_current_request, Some(16.0));
+        assert_eq!(charge.scheduled_charging_start_time, Some(1320.0));
+        assert!(charge.additional.is_empty());
+        let climate = data.climate_state.unwrap();
+        assert_eq!(climate.battery_heater, Some(true));
+        assert_eq!(climate.is_preconditioning, Some(false));
+        let state = data.vehicle_state.unwrap();
+        assert_eq!(state.fd_window, Some(0));
+        assert_eq!(state.df, Some(1));
+        assert_eq!(state.tpms_pressure_fl, Some(2.9));
+    }
 }

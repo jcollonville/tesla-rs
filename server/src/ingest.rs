@@ -27,7 +27,7 @@ use crate::persist::{
     LiveEvent, Runtime, VehicleIdentity, apply_observation, load_runtime, record_error,
     resting_observation, upsert_vehicle,
 };
-use crate::state::{Activity, Observation, Presence};
+use crate::state::{Activity, Observation, Presence, refresh_plugged_in};
 
 const LIVE_ENDPOINTS: &[VehicleDataEndpoint] = &[
     VehicleDataEndpoint::ChargeState,
@@ -288,16 +288,30 @@ pub(crate) fn observation_from_vehicle_data(data: VehicleData) -> Observation {
         obs.charging_state = charge.charging_state;
         obs.charge_energy_added_kwh = charge.charge_energy_added;
         obs.charger_power_kw = charge.charger_power;
-        obs.charger_voltage = charge.charger_voltage;
-        obs.charger_current = charge.charger_actual_current;
+        obs.charger_voltage = finite(charge.charger_voltage);
+        obs.charger_current = finite(charge.charger_actual_current);
+        obs.charge_current_request = finite(charge.charge_current_request);
         obs.fast_charger = charge.fast_charger_present;
         obs.fast_charger_type = charge.fast_charger_type;
         obs.charge_limit_soc = charge.charge_limit_soc;
+        obs.charge_port_door_open = charge.charge_port_door_open;
+        obs.charge_port_latch = charge.charge_port_latch;
+        obs.conn_charge_cable = charge.conn_charge_cable;
+        obs.time_to_full_charge_h = finite(charge.time_to_full_charge)
+            .or_else(|| finite(charge.minutes_to_full_charge).map(|minutes| minutes / 60.0));
+        obs.scheduled_charging_start_time =
+            minutes_after_midnight(charge.scheduled_charging_start_time);
+        obs.battery_heater_on = json_bool(charge.additional.get("battery_heater_on"));
     }
     if let Some(climate) = data.climate_state {
         obs.inside_temp_c = climate.inside_temp;
         obs.outside_temp_c = climate.outside_temp;
         obs.climate_on = climate.is_climate_on;
+        obs.is_preconditioning = climate.is_preconditioning;
+        obs.battery_heater_on = climate
+            .battery_heater
+            .or(obs.battery_heater_on)
+            .or_else(|| json_bool(climate.additional.get("battery_heater_on")));
     }
     if let Some(drive) = data.drive_state {
         obs.latitude = drive.latitude;
@@ -316,6 +330,21 @@ pub(crate) fn observation_from_vehicle_data(data: VehicleData) -> Observation {
         obs.locked = state.locked;
         obs.sentry_mode = state.sentry_mode;
         obs.software_version = state.car_version;
+        obs.is_user_present = state.is_user_present;
+        obs.df = closure_code(state.df);
+        obs.dr = closure_code(state.dr);
+        obs.pf = closure_code(state.pf);
+        obs.pr = closure_code(state.pr);
+        obs.ft = closure_code(state.ft);
+        obs.rt = closure_code(state.rt);
+        obs.fd_window = closure_code(state.fd_window);
+        obs.fp_window = closure_code(state.fp_window);
+        obs.rd_window = closure_code(state.rd_window);
+        obs.rp_window = closure_code(state.rp_window);
+        obs.tpms_pressure_fl = bar(state.tpms_pressure_fl);
+        obs.tpms_pressure_fr = bar(state.tpms_pressure_fr);
+        obs.tpms_pressure_rl = bar(state.tpms_pressure_rl);
+        obs.tpms_pressure_rr = bar(state.tpms_pressure_rr);
         if let Some(update) = state.software_update {
             obs.update_status = update.status;
         }
@@ -326,7 +355,38 @@ pub(crate) fn observation_from_vehicle_data(data: VehicleData) -> Observation {
         obs.exterior_color = config.exterior_color;
         obs.wheel_type = config.wheel_type;
     }
+    refresh_plugged_in(&mut obs);
     obs
+}
+
+fn finite(value: Option<f64>) -> Option<f64> {
+    value.filter(|number| number.is_finite())
+}
+
+fn bar(value: Option<f64>) -> Option<f64> {
+    finite(value).filter(|pressure| *pressure >= 0.0)
+}
+
+fn closure_code(value: Option<i64>) -> Option<i32> {
+    i32::try_from(value?).ok()
+}
+
+fn minutes_after_midnight(value: Option<f64>) -> Option<i32> {
+    let value = finite(value)?;
+    crate::units::minutes_after_midnight(value)
+}
+
+fn json_bool(value: Option<&serde_json::Value>) -> Option<bool> {
+    match value? {
+        serde_json::Value::Bool(flag) => Some(*flag),
+        serde_json::Value::Number(number) => number.as_i64().map(|number| number != 0),
+        serde_json::Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "on" | "yes" => Some(true),
+            "false" | "0" | "off" | "no" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn json_number(value: Option<&serde_json::Value>) -> Option<f64> {
@@ -614,5 +674,105 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert!(!requests[0].url.path().contains("wake_up"));
         assert!(!requests[0].url.path().contains("vehicle_data"));
+    }
+
+    #[test]
+    fn vehicle_data_maps_home_assistant_fields_in_metric_units() {
+        let data: tesla_fleet_api::VehicleData = serde_json::from_str(
+            r#"{
+                "id": 1,
+                "vin": "TEST00000000VIN01",
+                "gui_settings": {"gui_distance_units": "mi/hr"},
+                "charge_state": {
+                    "battery_level": 80,
+                    "battery_range": 100,
+                    "charger_voltage": 240,
+                    "charger_actual_current": 32,
+                    "charge_current_request": 16,
+                    "charging_state": "Charging",
+                    "charge_port_door_open": true,
+                    "charge_port_latch": "Engaged",
+                    "conn_charge_cable": "IEC",
+                    "time_to_full_charge": 1.5,
+                    "scheduled_charging_start_time": 1320,
+                    "charger_power": 7.6
+                },
+                "climate_state": {
+                    "inside_temp": 21.5,
+                    "outside_temp": 9,
+                    "is_climate_on": true,
+                    "is_preconditioning": true,
+                    "battery_heater": true
+                },
+                "drive_state": {
+                    "latitude": 48.85,
+                    "longitude": 2.35,
+                    "heading": 90,
+                    "speed": 10,
+                    "power": -5,
+                    "shift_state": "D",
+                    "elevation": 35
+                },
+                "vehicle_state": {
+                    "odometer": 10,
+                    "locked": false,
+                    "sentry_mode": true,
+                    "is_user_present": true,
+                    "car_version": "2026.4",
+                    "df": 1,
+                    "dr": 0,
+                    "pf": 0,
+                    "pr": 0,
+                    "ft": 0,
+                    "rt": 1,
+                    "fd_window": 0,
+                    "fp_window": 1,
+                    "rd_window": 0,
+                    "rp_window": 0,
+                    "tpms_pressure_fl": 2.9,
+                    "tpms_pressure_fr": 2.8,
+                    "tpms_pressure_rl": 2.7,
+                    "tpms_pressure_rr": 2.6
+                }
+            }"#,
+        )
+        .unwrap();
+        let obs = super::observation_from_vehicle_data(data);
+        assert!((obs.rated_range_km.unwrap() - 160.9344).abs() < 1e-3);
+        assert!((obs.odometer_km.unwrap() - 16.09344).abs() < 1e-3);
+        assert!((obs.speed_kmh.unwrap() - 16.09344).abs() < 1e-3);
+        assert_eq!(obs.charger_voltage, Some(240.0));
+        assert_eq!(obs.charger_current, Some(32.0));
+        assert_eq!(obs.charge_current_request, Some(16.0));
+        assert_eq!(obs.time_to_full_charge_h, Some(1.5));
+        assert_eq!(obs.scheduled_charging_start_time, Some(1320));
+        assert_eq!(obs.plugged_in, Some(true));
+        assert_eq!(obs.charge_port_door_open, Some(true));
+        assert_eq!(obs.charge_port_latch.as_deref(), Some("Engaged"));
+        assert_eq!(obs.inside_temp_c, Some(21.5));
+        assert_eq!(obs.battery_heater_on, Some(true));
+        assert_eq!(obs.is_preconditioning, Some(true));
+        assert_eq!(obs.elevation_m, Some(35.0));
+        assert_eq!(obs.power_kw, Some(-5.0));
+        assert_eq!(obs.df, Some(1));
+        assert_eq!(obs.dr, Some(0));
+        assert_eq!(obs.rt, Some(1));
+        assert_eq!(obs.fd_window, Some(0));
+        assert_eq!(obs.fp_window, Some(1));
+        assert_eq!(obs.tpms_pressure_fl, Some(2.9));
+        assert_eq!(obs.is_user_present, Some(true));
+        assert_eq!(obs.locked, Some(false));
+        assert_eq!(obs.software_version.as_deref(), Some("2026.4"));
+    }
+
+    #[test]
+    fn minutes_to_full_charge_becomes_hours() {
+        let data: tesla_fleet_api::VehicleData = serde_json::from_str(
+            r#"{"id":1,"vin":"V","charge_state":{"minutes_to_full_charge":90,"charging_state":"Disconnected","charge_port_latch":"Disengaged","conn_charge_cable":"<invalid>"}}"#,
+        )
+        .unwrap();
+        let obs = super::observation_from_vehicle_data(data);
+        assert_eq!(obs.time_to_full_charge_h, Some(1.5));
+        assert_eq!(obs.plugged_in, Some(false));
     }
 }

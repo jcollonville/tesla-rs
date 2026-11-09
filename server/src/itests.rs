@@ -31,6 +31,25 @@ fn openapi_lists_the_read_api() {
     ] {
         assert!(OPENAPI.contains(path), "{path}");
     }
+    for field in [
+        "usable_battery_level",
+        "climate_on",
+        "locked",
+        "sentry_mode",
+        "charge_limit_soc",
+        "is_dc",
+        "charger_voltage",
+        "charger_current",
+        "plugged_in",
+        "tpms_pressure_fl",
+        "fd_window",
+        "df:",
+        "ft:",
+        "is_preconditioning",
+        "scheduled_charging_start_time",
+    ] {
+        assert!(OPENAPI.contains(field), "{field}");
+    }
 }
 
 #[tokio::test]
@@ -90,6 +109,45 @@ async fn api_requires_a_token_and_returns_drives() {
         .unwrap();
     }
 
+    sqlx::query(
+        "INSERT INTO vehicle_state (
+            vehicle_id, activity, battery_level, usable_battery_level, climate_on, locked,
+            sentry_mode, charge_limit_soc, is_dc, charger_voltage, charger_current, plugged_in,
+            tpms_pressure_fl, df, fd_window, ft, is_preconditioning, scheduled_charging_start_time,
+            inside_temp_c, elevation_m
+         ) VALUES (
+            $1, 'charging', 80, 79, true, false, true, 90, false, 240, 32, true,
+            2.9, 1, 0, 0, true, 1320, 21.5, 35
+         )",
+    )
+    .bind(vehicle_id.0)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let state_body = authed(
+        &state,
+        "GET",
+        &format!("/api/v1/vehicles/{}/state", vehicle_id.0),
+        token,
+    )
+    .await;
+    assert!(state_body.contains("\"usable_battery_level\":79"));
+    assert!(state_body.contains("\"climate_on\":true"));
+    assert!(state_body.contains("\"locked\":false"));
+    assert!(state_body.contains("\"plugged_in\":true"));
+    assert!(state_body.contains("\"tpms_pressure_fl\":2.9"));
+    assert!(state_body.contains("\"df\":1"));
+    assert!(state_body.contains("\"fd_window\":0"));
+    assert!(state_body.contains("\"ft\":0"));
+    assert!(state_body.contains("\"scheduled_charging_start_time\":1320"));
+    assert!(state_body.contains("\"is_preconditioning\":true"));
+    assert!(state_body.contains("\"elevation_m\":35"));
+    let snaps = crate::http::api::snapshot_rows(&db.pool).await.unwrap();
+    assert_eq!(snaps.len(), 1);
+    assert_eq!(snaps[0].0, "5YJ3E1EA7KF000001");
+    assert_eq!(snaps[0].1, "charging");
+    assert_eq!(snaps[0].2, Some(80.0));
+    assert_eq!(snaps[0].3, Some(1));
     let body = authed(&state, "GET", "/api/v1/vehicles", token).await;
     assert!(body.contains("5YJ3E1EA7KF000001"));
     let drives = authed(
@@ -191,6 +249,74 @@ async fn polling_sequence_opens_and_closes_one_drive() {
             .unwrap();
     assert_eq!(count, 1);
     assert!((distance.unwrap() - 12.0).abs() < 1e-6);
+    let battery: (f64, f64) = sqlx::query_as(
+        "SELECT start_battery_level, end_battery_level FROM drives WHERE end_at IS NOT NULL",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!((battery.0 - 80.0).abs() < 1e-9);
+    assert!((battery.1 - 80.0).abs() < 1e-9);
+
+    let mut parked = Observation::at(
+        Utc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap(),
+        Presence::Online,
+    );
+    parked.shift_state = Some("P".to_owned());
+    parked.odometer_km = Some(200.0);
+    parked.speed_kmh = Some(0.0);
+    parked.battery_level = Some(82.0);
+    parked.latitude = Some(48.85);
+    parked.longitude = Some(2.35);
+    apply_for_vin(&archive, vin, identity(), parked, true, false)
+        .await
+        .unwrap();
+    let mut depart = Observation::at(
+        Utc.with_ymd_and_hms(2024, 6, 1, 12, 5, 0).unwrap(),
+        Presence::Online,
+    );
+    depart.shift_state = Some("D".to_owned());
+    depart.odometer_km = Some(200.0);
+    depart.speed_kmh = Some(30.0);
+    depart.latitude = Some(48.86);
+    depart.longitude = Some(2.36);
+    apply_for_vin(&archive, vin, identity(), depart, true, false)
+        .await
+        .unwrap();
+    let mut cruise = Observation::at(
+        Utc.with_ymd_and_hms(2024, 6, 1, 12, 15, 0).unwrap(),
+        Presence::Online,
+    );
+    cruise.shift_state = Some("D".to_owned());
+    cruise.odometer_km = Some(210.0);
+    cruise.speed_kmh = Some(80.0);
+    cruise.battery_level = Some(76.0);
+    cruise.latitude = Some(48.87);
+    cruise.longitude = Some(2.37);
+    apply_for_vin(&archive, vin, identity(), cruise, true, false)
+        .await
+        .unwrap();
+    let mut arrive = Observation::at(
+        Utc.with_ymd_and_hms(2024, 6, 1, 12, 25, 0).unwrap(),
+        Presence::Online,
+    );
+    arrive.shift_state = Some("P".to_owned());
+    arrive.odometer_km = Some(212.0);
+    arrive.speed_kmh = Some(0.0);
+    arrive.latitude = Some(48.88);
+    arrive.longitude = Some(2.38);
+    apply_for_vin(&archive, vin, identity(), arrive, true, false)
+        .await
+        .unwrap();
+    let carried: (f64, f64) = sqlx::query_as(
+        "SELECT start_battery_level, end_battery_level
+         FROM drives WHERE end_at IS NOT NULL ORDER BY start_at DESC LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!((carried.0 - 82.0).abs() < 1e-9, "start {}", carried.0);
+    assert!((carried.1 - 76.0).abs() < 1e-9, "end {}", carried.1);
 }
 
 #[tokio::test]
@@ -296,6 +422,37 @@ async fn teslamate_import_is_idempotent_and_resumable() {
             .unwrap();
     assert!((level.0 - 40.0).abs() < 1e-9);
     assert!((level.1 - 4.5).abs() < 1e-9);
+    let drive_soc: (f64, f64) = sqlx::query_as(
+        "SELECT start_battery_level, end_battery_level FROM drives WHERE external_id = '1'",
+    )
+    .fetch_one(&dest.pool)
+    .await
+    .unwrap();
+    assert!((drive_soc.0 - 80.0).abs() < 1e-9);
+    assert!((drive_soc.1 - 74.0).abs() < 1e-9);
+    let second_soc: (f64, f64) = sqlx::query_as(
+        "SELECT start_battery_level, end_battery_level FROM drives WHERE external_id = '2'",
+    )
+    .fetch_one(&dest.pool)
+    .await
+    .unwrap();
+    assert!((second_soc.0 - 70.0).abs() < 1e-9);
+    assert!((second_soc.1 - 69.0).abs() < 1e-9);
+    sqlx::query("UPDATE drives SET start_battery_level = NULL, end_battery_level = NULL")
+        .execute(&dest.pool)
+        .await
+        .unwrap();
+    crate::import::backfill_drive_battery(&dest.pool)
+        .await
+        .unwrap();
+    let restored: (f64, f64) = sqlx::query_as(
+        "SELECT start_battery_level, end_battery_level FROM drives WHERE external_id = '1'",
+    )
+    .fetch_one(&dest.pool)
+    .await
+    .unwrap();
+    assert!((restored.0 - 80.0).abs() < 1e-9);
+    assert!((restored.1 - 74.0).abs() < 1e-9);
     let dc: (Option<bool>,) = sqlx::query_as("SELECT is_dc FROM charges WHERE external_id = '1'")
         .fetch_one(&dest.pool)
         .await

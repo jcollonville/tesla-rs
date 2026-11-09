@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Jean Collonvillé
 // SPDX-License-Identifier: AGPL-3.0-only
 
-mod api;
+pub(crate) mod api;
 mod ui;
 
 use std::time::Instant;

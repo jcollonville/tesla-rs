@@ -22,6 +22,14 @@ pub(crate) fn speed_to_kmh(speed: f64, gui_distance_units: Option<&str>) -> Opti
     }
 }
 
+/// Fleet API `scheduled_charging_start_time` is minutes after midnight, at most 1440.
+pub(crate) fn minutes_after_midnight(value: f64) -> Option<i32> {
+    if !value.is_finite() || !(0.0..=1_440.0).contains(&value) {
+        return None;
+    }
+    format!("{value:.0}").parse().ok()
+}
+
 pub(crate) fn units_are_metric(gui_distance_units: Option<&str>) -> bool {
     gui_distance_units
         .unwrap_or("")
