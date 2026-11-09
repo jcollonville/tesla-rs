@@ -1,0 +1,32 @@
+[package]
+name = "tesla-fleet-api"
+description = "Async typed client for the Tesla Fleet API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tesla", "fleet-api", "vehicle", "async"]
+categories = ["api-bindings"]
+include = ["src/**", "README.md", "LICENSE-MIT", "LICENSE-APACHE", "Cargo.toml"]
+
+[dependencies]
+httpdate.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tesla-auth.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+wiremock.workspace = true
+
+[lints]
+workspace = true
