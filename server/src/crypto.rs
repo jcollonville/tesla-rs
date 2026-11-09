@@ -357,8 +357,9 @@ mod tests {
 
     #[test]
     fn derives_a_public_pem_without_the_private_header() {
+        use p256::elliptic_curve::Generate;
         use p256::pkcs8::{EncodePrivateKey, LineEnding};
-        let secret = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let secret = p256::SecretKey::generate();
         let private_pem = secret.to_pkcs8_pem(LineEnding::LF).unwrap();
         let public_pem = public_key_pem(private_pem.as_str()).unwrap();
         assert!(public_pem.contains("BEGIN PUBLIC KEY"));

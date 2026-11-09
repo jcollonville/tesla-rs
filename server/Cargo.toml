@@ -18,9 +18,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 clap = { version = "4", features = ["derive", "env"] }
 getrandom = { workspace = true }
 hex = "0.4"
-p256 = { version = "0.13", features = ["pem", "ecdsa"] }
+p256 = { version = "0.14", default-features = false, features = ["arithmetic", "pem", "std"] }
 reqwest = { workspace = true }
-rumqttc = "0.24"
+rumqttc = { version = "0.25", default-features = false }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

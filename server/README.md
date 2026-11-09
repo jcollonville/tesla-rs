@@ -11,7 +11,7 @@ The server is licensed `AGPL-3.0-only`. The library crates in `crates/` stay `MI
 * Sleep-aware Fleet API polling. The poller never calls `wake_up`. It uses the vehicle list to see `online` / `asleep` / `offline`, calls `vehicle_data` only while the car is already online, polls faster while driving or charging, and backs off when parked.
 * Drive and charge detection, positions partitioned by month, Nominatim reverse geocoding (cached, rate limited, disable-able), and geofences.
 * Read API for Home Assistant: REST plus a WebSocket, described by `openapi.yaml`.
-* Optional MQTT Home Assistant discovery (`MQTT_ENABLED=false` by default).
+* Optional MQTT Home Assistant discovery (`MQTT_ENABLED=false` by default). The client speaks plain MQTT, which is the usual setup for a broker on the same NAS.
 * Optional Fleet Telemetry ingest (`TELEMETRY_ENABLED=false` by default) through `tesla-fleet-telemetry`. A fresh stream suppresses billable live polls for that car.
 * TeslaMate 4.x importer (`import-teslamate`), read-only, batched, idempotent, and resumable.
 

@@ -205,14 +205,14 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
     use std::collections::BTreeMap;
 
     use p256::SecretKey;
-    use p256::elliptic_curve::rand_core::OsRng;
+    use p256::elliptic_curve::Generate;
     use p256::pkcs8::{EncodePrivateKey, LineEnding};
 
     let dir =
         std::env::temp_dir().join(format!("tl-app-{}", crate::crypto::random_token().unwrap()));
     std::fs::create_dir_all(&dir).unwrap();
     let key_path = dir.join("key.pem");
-    let secret = SecretKey::random(&mut OsRng);
+    let secret = SecretKey::generate();
     let pem = secret.to_pkcs8_pem(LineEnding::LF).unwrap();
     std::fs::write(&key_path, pem.as_str()).unwrap();
     let mut map = BTreeMap::new();
