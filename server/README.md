@@ -59,7 +59,7 @@ docker compose -f server/docker-compose.yml run --rm tesla-logger \
   import-teslamate --source 'postgres://readonly:secret@teslamate-host:5432/teslamate'
 ```
 
-Positions are copied in pages of at most 2000 rows, and each page commits a cursor, so stopping and rerunning resumes. Only one page is kept in memory. A same-host Postgres 16 imported about 24,000 position rows per second, so 9.3 million positions is about 7 minutes. A NAS disk or a remote database is slower; half that rate is a fair planning figure. The log line `teslamate import progress` reports rows/s and percent complete about every 5 seconds. Charge samples are multi-row inserts too, so a few hundred thousand of them stay in the same order of time as the drives (a few thousand), not the positions.
+Positions are copied in pages of 5000 rows. Each page orders by `positions.id` and compares the cursor as `integer`, so Postgres uses the primary key. The page commits a cursor, so stopping and rerunning resumes, including a cursor saved by an older build. Only one page is kept in memory. The log line `teslamate import progress` reports rows/s and percent complete about every 5 seconds. Charge samples are multi-row inserts too, so a few hundred thousand of them stay in the same order of time as the drives (a few thousand), not the positions.
 
 Images are published to `ghcr.io/jcollonville/tesla-logger` on `main` and on version tags. The workflow builds the runner architecture (amd64). The Dockerfile itself is not architecture-specific.
 
@@ -78,7 +78,7 @@ Images are published to `ghcr.io/jcollonville/tesla-logger` on `main` and on ver
 
 Distances are kilometres. Fleet API miles are converted on ingest. Temperatures are Celsius, power is kilowatts, tire pressures are bar, charger voltage is volts, and charger current is amperes. `GET /api/v1/vehicles/{id}/state` and each WebSocket `state` frame return every `vehicle_state` column. Door, window, and trunk keys use the Fleet API names (`df`, `dr`, `pf`, `pr`, `fd_window`, `fp_window`, `rd_window`, `rp_window`, `ft`, `rt`). `0` is closed. `plugged_in` is derived from the charge-port latch, the charging state, and the charge cable. `scheduled_charging_start_time` is minutes after midnight.
 
-TeslaMate rows are already metric and are copied as stored. TeslaMate does not store drive battery levels on `drives`. The importer reads them from the start and end positions (`battery_level`, then `usable_battery_level`). Migration `0003_backfill_drive_battery` fills drives imported before that, from the positions already in this database, and only where the level is still null. Re-running the importer does the same fill after positions are copied. Live drives keep the state of charge from the moment the drive opens (or the last stored level) and the last level seen before it closes.
+TeslaMate rows are already metric and are copied as stored. TeslaMate does not store drive battery levels on `drives`. The importer reads them from the start and end positions (`battery_level`, then `usable_battery_level`). Every `import-teslamate` run fills any still-null drive levels from the stored positions after the position copy finishes, including a resume that only imports the remaining positions. Migration `0003_backfill_drive_battery` does the same fill once at startup. Live drives keep the state of charge from the moment the drive opens (or the last stored level) and the last level seen before it closes.
 
 ## Develop
 

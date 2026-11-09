@@ -6,12 +6,13 @@ use std::sync::Arc;
 use axum::body::Body;
 use chrono::{TimeZone, Utc};
 use http_body_util::BodyExt;
+use sqlx::Row;
 use tower::ServiceExt;
 
 use crate::app::test_state;
 use crate::crypto::sha256_hex;
 use crate::http::{OPENAPI, router};
-use crate::import::import_pools;
+use crate::import::{POSITIONS_PAGE, POSITIONS_PAGE_SQL, import_pools};
 use crate::ingest::{Archive, apply_for_vin};
 use crate::persist::VehicleIdentity;
 use crate::state::{Observation, Presence};
@@ -468,6 +469,103 @@ async fn teslamate_import_is_idempotent_and_resumable() {
         .unwrap();
     let resumed = import_pools(&dest.pool, &source.pool, 1).await.unwrap();
     assert_eq!(resumed.positions, 2);
+}
+
+/// The positions keyset must be an index scan on `positions_pkey` with no Sort
+/// above that scan. `enable_seqscan` stays at its default.
+#[tokio::test]
+async fn positions_page_uses_primary_key_index() {
+    let Some(source) = TestDb::create("plan").await else {
+        return;
+    };
+    sqlx::raw_sql(FIXTURE).execute(&source.pool).await.unwrap();
+    // Enough rows that the default planner prefers the primary key for a
+    // keyset page. A production cursor of 17000 sits inside this range.
+    sqlx::query("TRUNCATE positions")
+        .execute(&source.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO positions (id, date, latitude, longitude, car_id)
+         SELECT g, timestamp '2024-01-01 00:00:00', 48.856600, 2.352200, 1
+         FROM generate_series(1, 40000) AS g",
+    )
+    .execute(&source.pool)
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE positions")
+        .execute(&source.pool)
+        .await
+        .unwrap();
+
+    assert_eq!(POSITIONS_PAGE, 5_000);
+    let explain = format!("EXPLAIN (FORMAT JSON) {POSITIONS_PAGE_SQL}");
+    let row = sqlx::query(&explain)
+        .bind(17_000_i64)
+        .bind(POSITIONS_PAGE)
+        .fetch_one(&source.pool)
+        .await
+        .unwrap();
+    let plan: serde_json::Value = row.try_get("QUERY PLAN").unwrap();
+    assert_positions_pkey_scan(&plan);
+
+    let ids: Vec<i64> = sqlx::query_as(&format!("SELECT id FROM ({POSITIONS_PAGE_SQL}) AS page"))
+        .bind(17_000_i64)
+        .bind(POSITIONS_PAGE)
+        .fetch_all(&source.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(id,): (i64,)| id)
+        .collect();
+    assert_eq!(ids.len(), usize::try_from(POSITIONS_PAGE).unwrap());
+    assert_eq!(ids.first().copied(), Some(17_001));
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+fn assert_positions_pkey_scan(plan: &serde_json::Value) {
+    let mut found = false;
+    let mut sort_above = false;
+    let nodes: Vec<&serde_json::Value> = if let Some(list) = plan.as_array() {
+        list.iter()
+            .map(|entry| entry.get("Plan").unwrap_or(entry))
+            .collect()
+    } else if let Some(node) = plan.get("Plan") {
+        vec![node]
+    } else {
+        vec![plan]
+    };
+    for node in nodes {
+        walk_plan(node, false, &mut found, &mut sort_above);
+    }
+    assert!(
+        found,
+        "expected an Index Scan on positions_pkey, plan was {plan}"
+    );
+    assert!(
+        !sort_above,
+        "Sort node above the positions_pkey scan, plan was {plan}"
+    );
+}
+
+fn walk_plan(node: &serde_json::Value, under_sort: bool, found: &mut bool, sort_above: &mut bool) {
+    let node_type = node
+        .get("Node Type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let under_sort = under_sort || node_type == "Sort";
+    let index = node.get("Index Name").and_then(|value| value.as_str());
+    if matches!(node_type, "Index Scan" | "Index Only Scan") && index == Some("positions_pkey") {
+        *found = true;
+        if under_sort {
+            *sort_above = true;
+        }
+    }
+    if let Some(children) = node.get("Plans").and_then(|value| value.as_array()) {
+        for child in children {
+            walk_plan(child, under_sort, found, sort_above);
+        }
+    }
 }
 
 async fn authed(state: &crate::app::AppState, method: &str, uri: &str, token: &str) -> String {

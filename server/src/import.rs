@@ -19,19 +19,26 @@
 //! `20250613133700`. Drive state of charge is not a drives column in TeslaMate.
 //! It is copied from `positions.battery_level`, falling back to
 //! `usable_battery_level`, through `drives.start_position_id` and
-//! `drives.end_position_id`. A startup migration and [`backfill_drive_battery`]
-//! fill drives that were imported before that join, using the positions already
-//! stored here.
+//! `drives.end_position_id`. [`backfill_drive_battery`] runs at the end of every
+//! import, after positions are copied, and only fills levels that are still
+//! null. A resume that finishes the positions therefore fills drives whose
+//! rows arrived after migration `0003_backfill_drive_battery` already ran.
 //!
-//! Each table is read with `WHERE id > cursor ORDER BY id LIMIT batch`. Positions
-//! and charge samples are inserted as one multi-row statement per page. `batch`
-//! is at most 2000. A position row binds 18 parameters, which stays under
-//! Postgres' 65535-parameter limit, and only that page is resident. A same-host
-//! Postgres 16 imported about 24,000 position rows per second with pages of
-//! 2,000, so 9.3 million positions is about 7 minutes. A NAS disk or a remote
-//! database is slower; half that rate is a fair planning figure. Progress is
-//! logged when a table starts and then about every 5 seconds (`done`, `total`,
-//! `percent`, `rows_per_sec`). Re-running continues from the committed cursor.
+//! Each table is read with a keyset on its primary key. TeslaMate 4.1.1 stores
+//! `cars.id` as `smallint` and every other imported id as `integer`. The
+//! comparison casts the bound cursor (`$1::int2` or `$1::int4`), not the
+//! column, and `ORDER BY` names the table column (`positions.id`, `drives.id`,
+//! and the other imported tables). `ORDER BY id` would sort the `id::bigint`
+//! output alias, and Postgres would sequential-scan and sort. Cursors stay
+//! `bigint` in `import_cursors`, so a positions cursor such as 17000 still
+//! resumes.
+//!
+//! Positions are read 5000 rows at a time. One page is a few megabytes and is
+//! dropped after it is inserted. A position row binds 18 parameters, so each
+//! insert is capped under Postgres' 65535-parameter limit. Other tables use
+//! `batch`, which is at most 2000. Progress is logged when a table starts and
+//! then about every 5 seconds (`done`, `total`, `percent`, `rows_per_sec`).
+//! Re-running continues from the committed cursor.
 
 use std::collections::{HashMap, HashSet};
 
@@ -117,7 +124,9 @@ pub(crate) async fn import_pools(
     let drives = load_links(dest, "drive").await?;
     let charges = load_links(dest, "charge").await?;
     stats.charge_samples = copy_charge_samples(dest, source, batch, &charges).await?;
-    stats.positions = copy_positions(dest, source, batch, &cars, &drives).await?;
+    stats.positions = copy_positions(dest, source, &cars, &drives).await?;
+    // Runs after positions, including a resume that only copies the tail.
+    // Migration 0003 already ran at startup, before those rows existed.
     backfill_drive_battery(dest).await?;
     tracing::info!(
         cars = stats.cars,
@@ -133,7 +142,8 @@ pub(crate) async fn import_pools(
 }
 
 fn normalize_batch(batch: i64) -> Result<i64, AppError> {
-    // 2000 position rows × 18 parameters = 36000, under the 65535 protocol limit.
+    // Charge samples bind 13 parameters per row. 2000 × 13 stays under the
+    // 65535 protocol limit. Positions use [`POSITIONS_PAGE`] and chunk inserts.
     if (1..=2_000).contains(&batch) {
         Ok(batch)
     } else {
@@ -296,7 +306,7 @@ async fn copy_cars(dest: &PgPool, source: &PgPool, batch: i64) -> Result<u64, Ap
                     trim_badging::text AS trim_badging, marketing_name::text AS marketing_name,
                     exterior_color::text AS exterior_color, wheel_type::text AS wheel_type,
                     spoiler_type::text AS spoiler_type, display_priority::integer AS display_priority
-             FROM cars WHERE id > $1 ORDER BY id LIMIT $2",
+             FROM cars WHERE cars.id > $1::int2 ORDER BY cars.id LIMIT $2",
         )
         .bind(cursor)
         .bind(batch)
@@ -391,7 +401,7 @@ async fn copy_addresses(dest: &PgPool, source: &PgPool, batch: i64) -> Result<u6
                     postcode::text AS postcode, country::text AS country,
                     latitude::float8 AS latitude, longitude::float8 AS longitude,
                     osm_id::bigint AS osm_id, osm_type::text AS osm_type, raw::jsonb AS raw
-             FROM addresses WHERE id > $1 ORDER BY id LIMIT $2",
+             FROM addresses WHERE addresses.id > $1::int4 ORDER BY addresses.id LIMIT $2",
         )
         .bind(cursor)
         .bind(batch)
@@ -482,7 +492,7 @@ async fn copy_geofences(dest: &PgPool, source: &PgPool, batch: i64) -> Result<u6
                     longitude::float8 AS longitude, radius::float8 AS radius,
                     cost_per_unit::float8 AS cost_per_unit, session_fee::float8 AS session_fee,
                     billing_type::text AS billing_type
-             FROM geofences WHERE id > $1 ORDER BY id LIMIT $2",
+             FROM geofences WHERE geofences.id > $1::int4 ORDER BY geofences.id LIMIT $2",
         )
         .bind(cursor)
         .bind(batch)
@@ -591,7 +601,7 @@ async fn copy_drives(
          FROM drives d
          LEFT JOIN positions sp ON sp.id = d.start_position_id
          LEFT JOIN positions ep ON ep.id = d.end_position_id
-         WHERE d.id > $1 ORDER BY d.id LIMIT $2"
+         WHERE d.id > $1::int4 ORDER BY d.id LIMIT $2"
     );
     let mut copied = 0u64;
     let mut progress =
@@ -783,7 +793,7 @@ async fn copy_charges(
                     p.latitude::float8 AS latitude, p.longitude::float8 AS longitude
              FROM charging_processes c
              LEFT JOIN positions p ON p.id = c.position_id
-             WHERE c.id > $1 ORDER BY c.id LIMIT $2",
+             WHERE c.id > $1::int4 ORDER BY c.id LIMIT $2",
         )
         .bind(cursor)
         .bind(batch)
@@ -901,7 +911,7 @@ async fn copy_charge_samples(
                     rated_battery_range_km::float8 AS rated_battery_range_km,
                     outside_temp::float8 AS outside_temp,
                     fast_charger_present, fast_charger_type::text AS fast_charger_type
-             FROM charges WHERE id > $1 ORDER BY id LIMIT $2",
+             FROM charges WHERE charges.id > $1::int4 ORDER BY charges.id LIMIT $2",
         )
         .bind(cursor)
         .bind(batch)
@@ -1020,6 +1030,35 @@ struct TmSample {
     fast_charger_type: Option<String>,
 }
 
+/// Rows fetched per positions keyset page. A page is a few megabytes.
+pub(crate) const POSITIONS_PAGE: i64 = 5_000;
+
+/// Bind parameters in one positions `INSERT` row (see [`insert_positions`]).
+const POSITION_INSERT_PARAMS: usize = 18;
+
+/// Postgres rejects a statement with more than 65535 parameters.
+const POSITION_INSERT_CHUNK: usize = 65_535 / POSITION_INSERT_PARAMS;
+
+const _: () = assert!(POSITION_INSERT_CHUNK >= 1);
+const _: () = assert!(POSITION_INSERT_CHUNK * POSITION_INSERT_PARAMS <= 65_535);
+
+/// TeslaMate `positions.id` is `integer` (int4). The cursor is stored as bigint
+/// and compared by casting the parameter, not the column. `ORDER BY` names the
+/// table column so it does not resolve to the `id::bigint` output alias.
+pub(crate) const POSITIONS_PAGE_SQL: &str =
+    "SELECT id::bigint AS id, car_id::bigint AS car_id, drive_id::bigint AS drive_id,
+                    (date AT TIME ZONE 'UTC') AS date,
+                    latitude::float8 AS latitude, longitude::float8 AS longitude,
+                    speed::integer AS speed, power::integer AS power,
+                    odometer::float8 AS odometer, elevation::integer AS elevation,
+                    battery_level::integer AS battery_level,
+                    usable_battery_level::integer AS usable_battery_level,
+                    ideal_battery_range_km::float8 AS ideal_battery_range_km,
+                    rated_battery_range_km::float8 AS rated_battery_range_km,
+                    est_battery_range_km::float8 AS est_battery_range_km,
+                    inside_temp::float8 AS inside_temp, outside_temp::float8 AS outside_temp
+             FROM positions WHERE positions.id > $1::int4 ORDER BY positions.id LIMIT $2";
+
 struct PositionInsert {
     vehicle_id: i64,
     recorded_at: DateTime<Utc>,
@@ -1043,7 +1082,6 @@ struct PositionInsert {
 async fn copy_positions(
     dest: &PgPool,
     source: &PgPool,
-    batch: i64,
     cars: &HashMap<i64, i64>,
     drives: &HashMap<i64, i64>,
 ) -> Result<u64, AppError> {
@@ -1057,24 +1095,11 @@ async fn copy_positions(
     loop {
         let cursor = cursor(dest, "teslamate.positions").await?;
         // One page only. The page is dropped at the end of this iteration.
-        let rows: Vec<TmPosition> = sqlx::query_as(
-            "SELECT id::bigint AS id, car_id::bigint AS car_id, drive_id::bigint AS drive_id,
-                    (date AT TIME ZONE 'UTC') AS date,
-                    latitude::float8 AS latitude, longitude::float8 AS longitude,
-                    speed::integer AS speed, power::integer AS power,
-                    odometer::float8 AS odometer, elevation::integer AS elevation,
-                    battery_level::integer AS battery_level,
-                    usable_battery_level::integer AS usable_battery_level,
-                    ideal_battery_range_km::float8 AS ideal_battery_range_km,
-                    rated_battery_range_km::float8 AS rated_battery_range_km,
-                    est_battery_range_km::float8 AS est_battery_range_km,
-                    inside_temp::float8 AS inside_temp, outside_temp::float8 AS outside_temp
-             FROM positions WHERE id > $1 ORDER BY id LIMIT $2",
-        )
-        .bind(cursor)
-        .bind(batch)
-        .fetch_all(source)
-        .await?;
+        let rows: Vec<TmPosition> = sqlx::query_as(POSITIONS_PAGE_SQL)
+            .bind(cursor)
+            .bind(POSITIONS_PAGE)
+            .fetch_all(source)
+            .await?;
         if rows.is_empty() {
             break;
         }
@@ -1108,6 +1133,21 @@ async fn copy_positions(
             });
         }
         let mut tx = dest.begin().await?;
+        insert_positions(&mut tx, &prepared).await?;
+        save_cursor(&mut tx, "teslamate.positions", last).await?;
+        tx.commit().await?;
+        copied += prepared.len() as u64;
+        progress.advance(rows.len() as u64);
+    }
+    progress.finish();
+    Ok(copied)
+}
+
+async fn insert_positions(
+    tx: &mut Transaction<'_, Postgres>,
+    prepared: &[PositionInsert],
+) -> Result<(), AppError> {
+    for chunk in prepared.chunks(POSITION_INSERT_CHUNK) {
         let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
             "INSERT INTO positions (
                 vehicle_id, recorded_at, latitude, longitude, speed_kmh, power_kw, odometer_km,
@@ -1115,7 +1155,8 @@ async fn copy_positions(
                 est_range_km, inside_temp_c, outside_temp_c, drive_id, source, external_id
             ) ",
         );
-        builder.push_values(prepared.iter(), |mut row, item| {
+        builder.push_values(chunk, |mut row, item| {
+            // POSITION_INSERT_PARAMS must match this bind list.
             row.push_bind(item.vehicle_id)
                 .push_bind(item.recorded_at)
                 .push_bind(item.latitude)
@@ -1138,14 +1179,9 @@ async fn copy_positions(
         builder.push(
             " ON CONFLICT (source, external_id, recorded_at) WHERE external_id IS NOT NULL DO NOTHING",
         );
-        builder.build().execute(&mut *tx).await?;
-        save_cursor(&mut tx, "teslamate.positions", last).await?;
-        tx.commit().await?;
-        copied += prepared.len() as u64;
-        progress.advance(rows.len() as u64);
+        builder.build().execute(pg(tx)).await?;
     }
-    progress.finish();
-    Ok(copied)
+    Ok(())
 }
 
 #[derive(sqlx::FromRow)]
@@ -1302,24 +1338,26 @@ struct TableProgress {
 impl TableProgress {
     async fn open(source: &PgPool, table: &'static str, cursor: i64) -> Result<Self, AppError> {
         let sql = match table {
-            "cars" => "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM cars",
+            "cars" => {
+                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE cars.id <= $1::int2)::bigint FROM cars"
+            }
             "addresses" => {
-                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM addresses"
+                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE addresses.id <= $1::int4)::bigint FROM addresses"
             }
             "geofences" => {
-                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM geofences"
+                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE geofences.id <= $1::int4)::bigint FROM geofences"
             }
             "drives" => {
-                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM drives"
+                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE drives.id <= $1::int4)::bigint FROM drives"
             }
             "charging_processes" => {
-                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM charging_processes"
+                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE charging_processes.id <= $1::int4)::bigint FROM charging_processes"
             }
             "charges" => {
-                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM charges"
+                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE charges.id <= $1::int4)::bigint FROM charges"
             }
             "positions" => {
-                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE id <= $1)::bigint FROM positions"
+                "SELECT COUNT(*)::bigint, COUNT(*) FILTER (WHERE positions.id <= $1::int4)::bigint FROM positions"
             }
             other => {
                 return Err(AppError::message(format!(
