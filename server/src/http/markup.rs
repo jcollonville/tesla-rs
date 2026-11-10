@@ -622,7 +622,7 @@ pub(super) fn debug_page(chrome: &Chrome, frames: u64, logs: u64, console: &str)
     document(true, body)
 }
 
-pub(super) fn missing_page(chrome: &Chrome) -> String {
+pub(crate) fn missing_page(chrome: &Chrome) -> String {
     let body = html! {
         (toolbar(chrome, "Véhicule"))
         section class="card" {
@@ -662,7 +662,7 @@ fn vehicle_field(vehicle_id: Option<i64>) -> Markup {
     }
 }
 
-fn toolbar(chrome: &Chrome, title: &str) -> Markup {
+pub(crate) fn toolbar(chrome: &Chrome, title: &str) -> Markup {
     let current = chrome.vehicles.iter().find(|vehicle| vehicle.current);
     html! {
         header class="toolbar app-bar" {
@@ -744,7 +744,7 @@ fn global_nav(active: GlobalTab) -> Markup {
     }
 }
 
-fn vehicle_tabs(chrome: &Chrome) -> Markup {
+pub(crate) fn vehicle_tabs(chrome: &Chrome) -> Markup {
     let Some(id) = current_id(chrome) else {
         return html! {};
     };
@@ -820,7 +820,7 @@ fn brand_mark() -> Markup {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn document(debug_script: bool, body: Markup) -> String {
+pub(crate) fn document(debug_script: bool, body: Markup) -> String {
     html! {
         (DOCTYPE)
         html lang="fr" {

@@ -28,8 +28,15 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/", get(home).post(login))
         .route("/logout", post(logout))
         .route("/v/{id}", get(overview))
-        .route("/v/{id}/drives", get(drives))
-        .route("/v/{id}/charges", get(charges))
+        .route("/v/{id}/drives", get(super::trips::drives))
+        .route("/v/{id}/drives.csv", get(super::trips::drives_csv))
+        .route("/v/{id}/drives/{drive_id}", get(super::trips::drive_detail))
+        .route("/v/{id}/charges", get(super::trips::charges))
+        .route("/v/{id}/charges.csv", get(super::trips::charges_csv))
+        .route(
+            "/v/{id}/charges/{charge_id}",
+            get(super::trips::charge_detail),
+        )
         .route("/v/{id}/stats", get(stats))
         .route("/v/{id}/connection", get(vehicle_connection))
         .route("/connection", get(account_connection))
@@ -93,8 +100,8 @@ struct TokenForm {
 }
 
 #[derive(Clone, sqlx::FromRow)]
-struct VehicleRow {
-    id: i64,
+pub(crate) struct VehicleRow {
+    pub(crate) id: i64,
     name: String,
     account_id: Option<i64>,
     activity: Option<String>,
@@ -104,14 +111,14 @@ struct VehicleRow {
     last_error: Option<String>,
 }
 
-struct Page {
-    session_id: String,
-    csrf: String,
-    cookie: Option<HeaderValue>,
-    vehicles: Vec<VehicleRow>,
-    remembered: Option<i64>,
-    admin: bool,
-    username: String,
+pub(crate) struct Page {
+    pub(crate) session_id: String,
+    pub(crate) csrf: String,
+    pub(crate) cookie: Option<HeaderValue>,
+    pub(crate) vehicles: Vec<VehicleRow>,
+    pub(crate) remembered: Option<i64>,
+    pub(crate) admin: bool,
+    pub(crate) username: String,
 }
 
 async fn home(State(app): State<AppState>, headers: HeaderMap) -> Response {
@@ -219,38 +226,6 @@ fn fmt_lag(at: Option<DateTime<Utc>>) -> String {
     } else {
         format!("{} h", secs / 3_600)
     }
-}
-
-async fn drives(State(app): State<AppState>, headers: HeaderMap, Path(id): Path<i64>) -> Response {
-    placeholder(
-        &app,
-        &headers,
-        id,
-        Placeholder {
-            tab: VehicleTab::Drives,
-            title: "Trajets",
-            text: "La liste filtrable, le tracé et l'export arrivent dans une phase suivante.",
-            link_label: "Voir le dernier trajet sur l'aperçu",
-            link_href: format!("/v/{id}#dernier-trajet"),
-        },
-    )
-    .await
-}
-
-async fn charges(State(app): State<AppState>, headers: HeaderMap, Path(id): Path<i64>) -> Response {
-    placeholder(
-        &app,
-        &headers,
-        id,
-        Placeholder {
-            tab: VehicleTab::Charges,
-            title: "Charges",
-            text: "La liste des charges arrive dans une phase suivante.",
-            link_label: "Voir la dernière charge sur l'aperçu",
-            link_href: format!("/v/{id}#derniere-charge"),
-        },
-    )
-    .await
 }
 
 async fn stats(State(app): State<AppState>, headers: HeaderMap, Path(id): Path<i64>) -> Response {
@@ -1114,7 +1089,7 @@ pub(super) fn connection_location(vehicle_id: Option<i64>) -> String {
     }
 }
 
-async fn signed_page(app: &AppState, headers: &HeaderMap) -> Option<Page> {
+pub(crate) async fn signed_page(app: &AppState, headers: &HeaderMap) -> Option<Page> {
     let principal = ui_session(app, headers).await?;
     let session_id = principal.raw_id.clone();
     let remembered = principal.last_vehicle;
@@ -1143,11 +1118,11 @@ async fn signed_page(app: &AppState, headers: &HeaderMap) -> Option<Page> {
     })
 }
 
-async fn remember_vehicle(app: &AppState, session_id: &str, id: i64) {
+pub(crate) async fn remember_vehicle(app: &AppState, session_id: &str, id: i64) {
     crate::identity::remember_vehicle(&app.inner.db, session_id, id).await;
 }
 
-fn chrome(
+pub(crate) fn chrome(
     page: &Page,
     current: Option<i64>,
     section: Option<VehicleTab>,
@@ -1164,7 +1139,7 @@ fn chrome(
     }
 }
 
-fn html_page(body: String, set_cookie: Option<HeaderValue>) -> Response {
+pub(crate) fn html_page(body: String, set_cookie: Option<HeaderValue>) -> Response {
     let mut response = Html(body).into_response();
     if let Some(cookie) = set_cookie {
         response.headers_mut().append(header::SET_COOKIE, cookie);
