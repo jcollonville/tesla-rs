@@ -14,8 +14,9 @@ use tesla_auth::{CallbackParams, TokenStore};
 
 use super::markup::{
     AccessLine, AuditLine, Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview,
-    Party, SessionLine, SettingRow, TokenLine, VehicleTab, connection_page, debug_page, fleet_page,
-    login_page, missing_page, overview_page, security_page, settings_page, setup_page, system_page,
+    Party, SessionLine, SettingRow, SetupStep, TokenLine, VehicleTab, connection_page, debug_page,
+    fleet_page, login_page, missing_page, overview_page, security_page, settings_page, setup_page,
+    system_page,
 };
 use super::{cookie, ui_session};
 use crate::accounts::{self, TokenPublic};
@@ -51,6 +52,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/accounts/{id}/disconnect", post(disconnect_account))
         .route("/security", get(security))
         .route("/security/setup", get(security_setup))
+        .route("/security/setup/finish", post(finish_setup))
         .route("/security/password", post(change_password))
         .route("/security/totp", post(enroll_totp))
         .route("/security/totp/confirm", post(confirm_totp))
@@ -74,6 +76,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/static/ui.css", get(ui_css))
         .route("/static/debug.js", get(debug_js))
         .route("/static/tabs.js", get(tabs_js))
+        .route("/static/setup.js", get(setup_js))
 }
 
 #[derive(Deserialize)]
@@ -438,14 +441,65 @@ fn fmt_scopes(scopes: &[String]) -> String {
     }
 }
 
-async fn security_setup(State(app): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(_principal) = ui_session(&app, &headers).await else {
+#[derive(Deserialize)]
+struct SetupQuery {
+    #[serde(default)]
+    step: String,
+}
+
+async fn security_setup(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SetupQuery>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
         return Redirect::to("/").into_response();
     };
     let Some(page) = signed_page(&app, &headers).await else {
         return Redirect::to("/").into_response();
     };
-    html_page(setup_page(&page.csrf, None), page.cookie)
+    if principal.must_change_password {
+        return html_page(
+            setup_page(
+                &page.csrf,
+                None,
+                SetupStep::Password {
+                    require_current: true,
+                },
+            ),
+            page.cookie,
+        );
+    }
+    if principal.totp_enabled {
+        return html_page(
+            setup_page(&page.csrf, None, SetupStep::Finished),
+            page.cookie,
+        );
+    }
+    if query.step == "verify" {
+        return html_page(setup_page(&page.csrf, None, SetupStep::Verify), page.cookie);
+    }
+    let Ok(secret) =
+        crate::identity::ensure_pending_totp(&app, &page.session_id, principal.user_id, false)
+            .await
+    else {
+        return html_page(setup_page(&page.csrf, None, SetupStep::Verify), page.cookie);
+    };
+    let uri = crate::identity::otpauth_uri(&page.username, &secret);
+    let groups = crate::identity::grouped_secret(&secret);
+    let qr = crate::qr::svg(&uri).unwrap_or_default();
+    html_page(
+        setup_page(
+            &page.csrf,
+            None,
+            SetupStep::Authenticator {
+                secret: &secret,
+                groups: &groups,
+                qr: &qr,
+            },
+        ),
+        page.cookie,
+    )
 }
 
 async fn change_password(
@@ -459,15 +513,68 @@ async fn change_password(
     if !csrf_ok(&headers, &form.csrf) {
         return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
     }
+    if let Some(message) = password_form_error(&form) {
+        crate::identity::audit(
+            &app.inner.db,
+            Some(principal.user_id),
+            "password.change",
+            "failure",
+            r#"{"reason":"rejected"}"#,
+        )
+        .await;
+        return setup_error(&app, &headers, message).await;
+    }
+    if !crate::identity::password_matches(&app.inner.db, principal.user_id, &form.current)
+        .await
+        .unwrap_or(false)
+    {
+        crate::identity::audit(
+            &app.inner.db,
+            Some(principal.user_id),
+            "password.change",
+            "failure",
+            r#"{"reason":"current"}"#,
+        )
+        .await;
+        return setup_error(&app, &headers, "Le mot de passe actuel est incorrect.").await;
+    }
     if let Err(err) =
         crate::identity::change_password(&app.inner.db, principal.user_id, &form.password).await
     {
-        let Some(page) = signed_page(&app, &headers).await else {
-            return Redirect::to("/").into_response();
-        };
-        return html_page(setup_page(&page.csrf, Some(&err.to_string())), page.cookie);
+        return setup_error(&app, &headers, &err.to_string()).await;
     }
     Redirect::to("/security/setup").into_response()
+}
+
+fn password_form_error(form: &PasswordForm) -> Option<&'static str> {
+    if form.password != form.confirm {
+        return Some("Les mots de passe ne correspondent pas.");
+    }
+    if form.password.chars().count() < 12 {
+        return Some("Le mot de passe doit contenir au moins 12 caractères.");
+    }
+    if form.current.trim().is_empty() {
+        return Some("Le mot de passe actuel est incorrect.");
+    }
+    None
+}
+
+async fn setup_error(app: &AppState, headers: &HeaderMap, message: &str) -> Response {
+    let Some(page) = signed_page(app, headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    let mut response = html_page(
+        setup_page(
+            &page.csrf,
+            Some(message),
+            SetupStep::Password {
+                require_current: true,
+            },
+        ),
+        page.cookie,
+    );
+    *response.status_mut() = StatusCode::BAD_REQUEST;
+    response
 }
 
 async fn enroll_totp(
@@ -481,22 +588,9 @@ async fn enroll_totp(
     if !csrf_ok(&headers, &form.csrf) {
         return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
     }
-    match crate::identity::enroll_totp(&app, principal.user_id).await {
-        Ok(enrollment) => {
-            let Some(page) = signed_page(&app, &headers).await else {
-                return Redirect::to("/").into_response();
-            };
-            let mut body = setup_page(&page.csrf, None);
-            let extra = format!(
-                "<section class=\"card\"><h2>Secret TOTP</h2><code>{}</code><p>{}</p></section></main>",
-                enrollment.secret,
-                enrollment.recovery.join(" ")
-            );
-            body = body.replacen("</main>", &extra, 1);
-            html_page(body, page.cookie)
-        }
-        Err(_) => Redirect::to("/security/setup").into_response(),
-    }
+    let _ = crate::identity::ensure_pending_totp(&app, &principal.raw_id, principal.user_id, true)
+        .await;
+    Redirect::to("/security/setup").into_response()
 }
 
 async fn confirm_totp(
@@ -510,19 +604,85 @@ async fn confirm_totp(
     if !csrf_ok(&headers, &form.csrf) {
         return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
     }
-    let ok = crate::identity::confirm_totp(&app, principal.user_id, &form.code)
+    let Some(page) = signed_page(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    match crate::identity::confirm_totp(&app, &principal.raw_id, principal.user_id, &form.code)
         .await
-        .unwrap_or(false);
-    if ok {
+    {
+        Ok(crate::identity::TotpConfirm::Accepted(codes)) => html_page(
+            setup_page(&page.csrf, None, SetupStep::Recovery { codes: &codes }),
+            page.cookie,
+        ),
+        Ok(crate::identity::TotpConfirm::Rejected) => {
+            let mut response = html_page(
+                setup_page(
+                    &page.csrf,
+                    Some("Code incorrect. Réessayez avec le même secret."),
+                    SetupStep::Verify,
+                ),
+                page.cookie,
+            );
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            response
+        }
+        _ => {
+            let mut response = html_page(
+                setup_page(
+                    &page.csrf,
+                    Some("Le secret a expiré. Scannez un nouveau code."),
+                    SetupStep::Verify,
+                ),
+                page.cookie,
+            );
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            response
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct FinishForm {
+    csrf: String,
+    #[serde(default)]
+    saved: String,
+}
+
+async fn finish_setup(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<FinishForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) {
+        return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
+    }
+    if form.saved == "yes" {
+        crate::identity::audit(
+            &app.inner.db,
+            Some(principal.user_id),
+            "2fa.recovery_ack",
+            "ok",
+            "{}",
+        )
+        .await;
         Redirect::to("/").into_response()
     } else {
         let Some(page) = signed_page(&app, &headers).await else {
             return Redirect::to("/").into_response();
         };
-        html_page(
-            setup_page(&page.csrf, Some("Code TOTP refusé")),
+        let mut response = html_page(
+            setup_page(
+                &page.csrf,
+                Some("Cochez la case pour confirmer que vous avez sauvegardé les codes."),
+                SetupStep::Finished,
+            ),
             page.cookie,
-        )
+        );
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        response
     }
 }
 
@@ -627,6 +787,9 @@ async fn sudo(
 struct PasswordForm {
     csrf: String,
     password: String,
+    confirm: String,
+    #[serde(default)]
+    current: String,
 }
 
 #[derive(Deserialize)]
@@ -1641,6 +1804,23 @@ async fn debug_js() -> Response {
             ),
         ],
         include_str!("debug.js"),
+    )
+        .into_response()
+}
+
+async fn setup_js() -> Response {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/javascript; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400"),
+            ),
+        ],
+        include_str!("setup.js"),
     )
         .into_response()
 }

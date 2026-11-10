@@ -161,39 +161,143 @@ pub(super) fn login_page(csrf: &str, error: Option<&str>) -> String {
     )
 }
 
-pub(super) fn setup_page(csrf: &str, error: Option<&str>) -> String {
-    document(
-        false,
-        html! {
-            section class="card" {
-                h1 { "Première connexion" }
-                p class="muted" { "Changez le mot de passe, puis activez un code TOTP. Les codes de secours ne sont affichés qu'une fois." }
-                @if let Some(error) = error {
-                    div class="banner bad" role="alert" { p { (error) } }
-                }
-                form class="stack" method="post" action="/security/password" {
-                    input type="hidden" name="csrf" value=(csrf);
-                    label class="field" for="new-password" {
-                        "Nouveau mot de passe"
-                        input id="new-password" type="password" name="password" autocomplete="new-password" minlength="12" required;
+pub(super) enum SetupStep<'a> {
+    Password {
+        require_current: bool,
+    },
+    Authenticator {
+        secret: &'a str,
+        groups: &'a str,
+        qr: &'a str,
+    },
+    Verify,
+    Recovery {
+        codes: &'a [String],
+    },
+    Finished,
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub(super) fn setup_page(csrf: &str, error: Option<&str>, step: SetupStep<'_>) -> String {
+    let current = match step {
+        SetupStep::Password { .. } => 1,
+        SetupStep::Authenticator { .. } => 2,
+        SetupStep::Verify => 3,
+        SetupStep::Recovery { .. } | SetupStep::Finished => 4,
+    };
+    let body = html! {
+        section class="card" {
+            h1 { "Première connexion" }
+            (setup_steps(current))
+            @if let Some(error) = error {
+                div class="banner bad" role="alert" { p { (error) } }
+            }
+            @match step {
+                SetupStep::Password { require_current } => {
+                    form class="stack" method="post" action="/security/password" {
+                        input type="hidden" name="csrf" value=(csrf);
+                        @if require_current {
+                            label class="field" for="current-password" {
+                                "Mot de passe actuel"
+                                input id="current-password" type="password" name="current" autocomplete="current-password" required;
+                            }
+                        }
+                        label class="field" for="new-password" {
+                            "Nouveau mot de passe"
+                            input id="new-password" type="password" name="password" autocomplete="new-password" minlength="12" required;
+                        }
+                        p class="hint" { "12 caractères minimum." }
+                        p id="password-strength" class="hint" aria-live="polite" { "Saisissez un mot de passe pour voir sa solidité." }
+                        button class="tonal" type="button" data-toggle="new-password" aria-pressed="false" { "Afficher" }
+                        label class="field" for="confirm-password" {
+                            "Confirmer le mot de passe"
+                            input id="confirm-password" type="password" name="confirm" autocomplete="new-password" minlength="12" required;
+                        }
+                        button class="tonal" type="button" data-toggle="confirm-password" aria-pressed="false" { "Afficher" }
+                        button type="submit" { "Enregistrer le mot de passe" }
                     }
-                    button type="submit" { "Enregistrer le mot de passe" }
                 }
-                form class="stack" method="post" action="/security/totp" {
-                    input type="hidden" name="csrf" value=(csrf);
-                    button class="tonal" type="submit" { "Générer un secret TOTP" }
-                }
-                form class="stack" method="post" action="/security/totp/confirm" {
-                    input type="hidden" name="csrf" value=(csrf);
-                    label class="field" for="setup-totp" {
-                        "Code de l'application"
-                        input id="setup-totp" name="code" inputmode="numeric" autocomplete="one-time-code" required;
+                SetupStep::Authenticator { secret, groups, qr } => {
+                    h2 { "Application d'authentification" }
+                    p { "Ouvrez votre application (Aegis, 1Password, ou une autre) et ajoutez un compte. Scannez le code, ou saisissez la clé. L'émetteur est Tesla Logger. Ce secret expire dans 15 minutes." }
+                    div class="qr-frame" { (maud::PreEscaped(qr)) }
+                    p class="hint" { "Clé secrète" }
+                    p id="totp-secret" class="secret-groups" data-value=(secret) { (groups) }
+                    button class="tonal" type="button" data-copy-target="totp-secret" { "Copier la clé" }
+                    div class="actions" {
+                        a class="button" href="/security/setup?step=verify" { "Continuer" }
+                        form method="post" action="/security/totp" {
+                            input type="hidden" name="csrf" value=(csrf);
+                            button class="tonal" type="submit" { "Nouveau code" }
+                        }
                     }
-                    button type="submit" { "Activer TOTP" }
+                }
+                SetupStep::Verify => {
+                    h2 { "Vérification" }
+                    p { "Saisissez le code à 6 chiffres affiché par l'application." }
+                    form class="stack" method="post" action="/security/totp/confirm" {
+                        input type="hidden" name="csrf" value=(csrf);
+                        label class="field" for="setup-totp" {
+                            "Code à 6 chiffres"
+                            input id="setup-totp" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" minlength="6" maxlength="6" required;
+                        }
+                        button type="submit" { "Activer" }
+                    }
+                    p { a href="/security/setup" { "Retour au code QR" } }
+                }
+                SetupStep::Recovery { codes } => {
+                    h2 { "Codes de secours" }
+                    div class="banner note" role="alert" {
+                        p { "Ces codes ne sont affichés qu'une seule fois. Conservez-les hors ligne. Sans eux, un téléphone perdu vous bloque." }
+                    }
+                    ul id="recovery-codes" class="recovery-grid" data-value=(codes.join("\n")) {
+                        @for code in codes {
+                            li { code class="recovery-code" { (code) } }
+                        }
+                    }
+                    div class="actions" {
+                        button class="tonal" type="button" data-copy-target="recovery-codes" { "Tout copier" }
+                        button class="tonal" type="button" data-download="recovery-codes" { "Télécharger .txt" }
+                    }
+                    form class="stack" method="post" action="/security/setup/finish" {
+                        input type="hidden" name="csrf" value=(csrf);
+                        label class="check" for="saved-codes" {
+                            input id="saved-codes" type="checkbox" name="saved" value="yes" required;
+                            " J'ai sauvegardé mes codes"
+                        }
+                        button type="submit" { "Terminer" }
+                    }
+                }
+                SetupStep::Finished => {
+                    h2 { "Codes de secours" }
+                    p { "Les codes de secours ne sont plus affichés. L'authentification à deux facteurs est active." }
+                    a class="button" href="/" { "Continuer" }
                 }
             }
-        },
-    )
+        }
+        script src="/static/setup.js" defer {}
+    };
+    document(false, body)
+}
+
+fn setup_steps(current: u8) -> Markup {
+    let labels = [
+        "1 Mot de passe",
+        "2 Application d'authentification",
+        "3 Vérification",
+        "4 Codes de secours",
+    ];
+    html! {
+        ol class="steps" {
+            @for (index, label) in labels.iter().enumerate() {
+                @if u8::try_from(index).unwrap_or(0) + 1 == current {
+                    li aria-current="step" { (label) }
+                } @else {
+                    li { (label) }
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn fleet_page(chrome: &Chrome, cards: &[FleetCard], month_total: &str) -> String {
