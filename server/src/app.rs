@@ -55,6 +55,8 @@ pub(crate) struct Inner {
 
 pub(crate) struct UiSession {
     pub expires: Instant,
+    /// Last vehicle opened in this login. A vehicle id, not a credential.
+    pub last_vehicle: Option<i64>,
 }
 
 pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {

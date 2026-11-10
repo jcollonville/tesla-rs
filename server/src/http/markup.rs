@@ -23,19 +23,22 @@ pub(super) enum VehicleTab {
     Connection,
 }
 
+#[derive(Clone)]
 pub(super) struct NavVehicle {
     pub id: i64,
     pub name: String,
     pub current: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct Chrome {
     pub csrf: String,
     pub vehicles: Vec<NavVehicle>,
     pub section: Option<VehicleTab>,
     pub global: GlobalTab,
-    pub wide: bool,
     pub debug_script: bool,
+    /// Last vehicle this session opened. Ignored when that id is not accessible.
+    pub remembered: Option<i64>,
 }
 
 pub(super) struct FleetCard {
@@ -110,7 +113,6 @@ pub(super) struct TokenLine {
 pub(super) fn login_page(csrf: &str, error: Option<&str>) -> String {
     document(
         false,
-        false,
         html! {
             section class="card auth-card" {
                 p class="kicker" { (brand_mark()) "Tesla Logger" }
@@ -164,7 +166,7 @@ pub(super) fn fleet_page(chrome: &Chrome, cards: &[FleetCard], month_total: &str
             }
         }
     };
-    document(chrome.wide, chrome.debug_script, body)
+    document(chrome.debug_script, body)
 }
 
 pub(super) fn overview_page(chrome: &Chrome, overview: &Overview) -> String {
@@ -201,7 +203,7 @@ pub(super) fn overview_page(chrome: &Chrome, overview: &Overview) -> String {
             }
         }
     };
-    document(chrome.wide, chrome.debug_script, body)
+    document(chrome.debug_script, body)
 }
 
 pub(super) fn placeholder_page(
@@ -223,7 +225,7 @@ pub(super) fn placeholder_page(
             }
         }
     };
-    document(chrome.wide, chrome.debug_script, body)
+    document(chrome.debug_script, body)
 }
 
 pub(super) fn connection_page(chrome: &Chrome, view: &ConnectionView<'_>) -> String {
@@ -258,7 +260,7 @@ pub(super) fn connection_page(chrome: &Chrome, view: &ConnectionView<'_>) -> Str
                     form method="post" action="/auth/refresh" {
                         input type="hidden" name="csrf" value=(view.csrf);
                         (vehicle_field(view.vehicle_id))
-                        button type="submit" { "Rafraîchir" }
+                        button class="tonal" type="submit" { "Rafraîchir" }
                     }
                     form method="post" action="/auth/disconnect" {
                         input type="hidden" name="csrf" value=(view.csrf);
@@ -353,7 +355,7 @@ pub(super) fn connection_page(chrome: &Chrome, view: &ConnectionView<'_>) -> Str
             }
         }
     };
-    document(chrome.wide, chrome.debug_script, body)
+    document(chrome.debug_script, body)
 }
 
 pub(super) fn settings_page(chrome: &Chrome, rows: &[SettingRow]) -> String {
@@ -379,7 +381,7 @@ pub(super) fn settings_page(chrome: &Chrome, rows: &[SettingRow]) -> String {
             }
         }
     };
-    document(chrome.wide, chrome.debug_script, body)
+    document(chrome.debug_script, body)
 }
 
 pub(super) fn system_page(chrome: &Chrome) -> String {
@@ -390,7 +392,7 @@ pub(super) fn system_page(chrome: &Chrome) -> String {
             p { "La taille de la base, les migrations, les tâches de fond et la sauvegarde arrivent dans une phase suivante." }
         }
     };
-    document(chrome.wide, chrome.debug_script, body)
+    document(chrome.debug_script, body)
 }
 
 pub(super) fn security_page(
@@ -437,7 +439,7 @@ pub(super) fn security_page(
             }
         }
     };
-    document(chrome.wide, chrome.debug_script, body)
+    document(chrome.debug_script, body)
 }
 
 pub(super) fn debug_page(chrome: &Chrome, frames: u64, logs: u64, console: &str) -> String {
@@ -457,7 +459,7 @@ pub(super) fn debug_page(chrome: &Chrome, frames: u64, logs: u64, console: &str)
             (PreEscaped(console))
         }
     };
-    document(true, true, body)
+    document(true, body)
 }
 
 pub(super) fn missing_page(chrome: &Chrome) -> String {
@@ -469,7 +471,7 @@ pub(super) fn missing_page(chrome: &Chrome) -> String {
             a href="/" { "Retour à la flotte" }
         }
     };
-    document(chrome.wide, chrome.debug_script, body)
+    document(chrome.debug_script, body)
 }
 
 fn party_card(party: &Party) -> Markup {
@@ -503,8 +505,9 @@ fn vehicle_field(vehicle_id: Option<i64>) -> Markup {
 fn toolbar(chrome: &Chrome, title: &str) -> Markup {
     let current = chrome.vehicles.iter().find(|vehicle| vehicle.current);
     html! {
-        header class="toolbar" {
-            div {
+        header class="toolbar app-bar" {
+            (back_link(chrome))
+            div class="app-bar-title" {
                 p class="kicker" { (brand_mark()) a href="/" { "Tesla Logger" } }
                 h1 { (title) }
                 @if chrome.vehicles.len() >= 2 {
@@ -530,6 +533,35 @@ fn toolbar(chrome: &Chrome, title: &str) -> Markup {
             }
         }
     }
+}
+
+fn back_link(chrome: &Chrome) -> Markup {
+    if chrome.global == GlobalTab::None {
+        return html! {};
+    }
+    let (href, label) = back_target(chrome);
+    html! {
+        a class="back-link" href=(href) { (label) }
+    }
+}
+
+/// Last viewed car when it is still accessible, otherwise the only car.
+/// Several cars and no memory go back to the fleet list.
+fn back_target(chrome: &Chrome) -> (String, &'static str) {
+    let remembered = chrome
+        .remembered
+        .filter(|id| chrome.vehicles.iter().any(|vehicle| vehicle.id == *id));
+    if let Some(id) = remembered {
+        return (format!("/v/{id}"), "← Retour à la voiture");
+    }
+    if let Some(only) = chrome
+        .vehicles
+        .first()
+        .filter(|_| chrome.vehicles.len() == 1)
+    {
+        return (format!("/v/{}", only.id), "← Retour à la voiture");
+    }
+    ("/".to_owned(), "Retour aux voitures")
 }
 
 fn global_nav(active: GlobalTab) -> Markup {
@@ -628,8 +660,7 @@ fn brand_mark() -> Markup {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn document(wide: bool, debug_script: bool, body: Markup) -> String {
-    let class = if wide { "shell wide" } else { "shell" };
+fn document(debug_script: bool, body: Markup) -> String {
     html! {
         (DOCTYPE)
         html lang="fr" {
@@ -637,7 +668,7 @@ fn document(wide: bool, debug_script: bool, body: Markup) -> String {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="robots" content="noindex";
-                meta name="theme-color" content="#2a2a2c";
+                meta name="theme-color" content="#111318";
                 link rel="icon" href="/favicon.ico" sizes="any";
                 link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32";
                 link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192";
@@ -652,7 +683,7 @@ fn document(wide: bool, debug_script: bool, body: Markup) -> String {
                 }
             }
             body {
-                main class=(class) { (body) }
+                main class="shell" { (body) }
                 footer {
                     p {
                         "tesla-logger est un logiciel libre sous licence GNU AGPL-3.0-only. "
@@ -688,7 +719,7 @@ mod tests {
             assert!(head.contains(href), "{href} missing from {head}");
         }
         assert!(head.contains("<title>Tesla Logger</title>"));
-        assert!(head.contains("name=\"theme-color\" content=\"#2a2a2c\""));
+        assert!(head.contains("name=\"theme-color\" content=\"#111318\""));
         assert!(!head.contains("://"));
         assert!(
             html.contains("<p class=\"kicker\"><img class=\"brand-mark\" src=\"/favicon-32.png\"")
@@ -708,9 +739,47 @@ mod tests {
             vehicles: Vec::new(),
             section: None,
             global: GlobalTab::None,
-            wide: false,
             debug_script: false,
+            remembered: None,
         }
+    }
+
+    fn vehicle(id: i64, name: &str) -> NavVehicle {
+        NavVehicle {
+            id,
+            name: name.to_owned(),
+            current: false,
+        }
+    }
+
+    fn global_pages(
+        vehicles: &[NavVehicle],
+        remembered: Option<i64>,
+    ) -> Vec<(&'static str, String)> {
+        use super::{SettingRow, TokenLine, debug_page, security_page, settings_page, system_page};
+        let page = |global| Chrome {
+            vehicles: vehicles.to_vec(),
+            global,
+            remembered,
+            ..chrome()
+        };
+        vec![
+            (
+                "settings",
+                settings_page(&page(GlobalTab::Settings), &[] as &[SettingRow]),
+            ),
+            ("debug", debug_page(&page(GlobalTab::Debug), 0, 0, "")),
+            ("system", system_page(&page(GlobalTab::System))),
+            (
+                "security",
+                security_page(&page(GlobalTab::Security), &[] as &[TokenLine], None),
+            ),
+        ]
+    }
+
+    fn assert_back(name: &str, html: &str, href: &str, label: &str) {
+        let needle = format!("<a class=\"back-link\" href=\"{href}\">{label}</a>");
+        assert!(html.contains(&needle), "{name} missing {needle}");
     }
 
     #[test]
@@ -867,5 +936,248 @@ mod tests {
         assert!(!html.contains("OWNER_STREAM_ENABLED"));
         assert!(html.contains("aria-selected=\"true\""));
         preview("connection.html", &html);
+    }
+
+    #[test]
+    fn global_pages_link_back_to_the_only_vehicle() {
+        for (name, html) in global_pages(&[vehicle(4, "Faucon")], None) {
+            assert_back(name, &html, "/v/4", "← Retour à la voiture");
+        }
+    }
+
+    #[test]
+    fn global_pages_link_back_to_the_remembered_vehicle() {
+        let vehicles = vec![vehicle(4, "Faucon"), vehicle(9, "Millenium")];
+        for (name, html) in global_pages(&vehicles, Some(9)) {
+            assert_back(name, &html, "/v/9", "← Retour à la voiture");
+        }
+    }
+
+    #[test]
+    fn global_pages_fall_back_to_the_fleet_without_a_remembered_vehicle() {
+        let several = vec![vehicle(4, "Faucon"), vehicle(9, "Millenium")];
+        for (name, html) in global_pages(&several, None) {
+            assert_back(name, &html, "/", "Retour aux voitures");
+            assert!(!html.contains("Retour à la voiture"), "{name} named a car");
+        }
+        for (name, html) in global_pages(&[], None) {
+            assert_back(name, &html, "/", "Retour aux voitures");
+        }
+        let stale = vec![vehicle(4, "Faucon"), vehicle(9, "Millenium")];
+        for (name, html) in global_pages(&stale, Some(99)) {
+            assert_back(name, &html, "/", "Retour aux voitures");
+        }
+    }
+
+    #[test]
+    fn vehicle_pages_omit_the_back_link() {
+        let chrome = Chrome {
+            vehicles: vec![vehicle(4, "Faucon")],
+            section: Some(VehicleTab::Overview),
+            remembered: Some(4),
+            ..chrome()
+        };
+        let overview = overview_page(
+            &chrome,
+            &Overview {
+                name: "Faucon".to_owned(),
+                activity: "online".to_owned(),
+                battery: "80%".to_owned(),
+                position_mode: "hybrid".to_owned(),
+                last_poll: "jamais".to_owned(),
+                last_data: "jamais".to_owned(),
+                last_error: "—".to_owned(),
+                stream_lag: "3 s".to_owned(),
+                stream_queue: "0".to_owned(),
+                last_drive: "Aucun trajet".to_owned(),
+                last_charge: "Aucune charge".to_owned(),
+            },
+        );
+        let drives = super::placeholder_page(&chrome, "Trajets", "bientôt", None);
+        let connection = connection_page(
+            &Chrome {
+                section: Some(VehicleTab::Connection),
+                ..chrome
+            },
+            &ConnectionView {
+                fleet: Party {
+                    title: "Compte Fleet".to_owned(),
+                    status: "connecté".to_owned(),
+                    tone: "ok",
+                    expires: "—".to_owned(),
+                    scopes: "—".to_owned(),
+                    last_refresh: "—".to_owned(),
+                    last_error: None,
+                    connected: false,
+                },
+                owner_status: "déconnecté".to_owned(),
+                owner_tone: "neutral",
+                owner_expires: "—".to_owned(),
+                owner_scopes: "—".to_owned(),
+                owner_last_refresh: "—".to_owned(),
+                owner_last_error: None,
+                owner_connected: false,
+                fingerprint: "sha256:abcd".to_owned(),
+                shared_names: Vec::new(),
+                shared_ok: true,
+                csrf: "csrf-token",
+                vehicle_id: Some(4),
+                error: None,
+                notice: None,
+                stream_status: "disabled",
+                streaming_enabled: false,
+                authorize_url: None,
+            },
+        );
+        for (name, html) in [
+            ("overview", overview),
+            ("drives", drives),
+            ("connection", connection),
+        ] {
+            assert!(!html.contains("back-link"), "{name}");
+            assert!(!html.contains("Retour à la voiture"), "{name}");
+            assert!(!html.contains("Retour aux voitures"), "{name}");
+        }
+    }
+
+    #[test]
+    fn every_page_uses_the_same_content_column() {
+        use super::{
+            debug_page, missing_page, placeholder_page, security_page, settings_page, system_page,
+        };
+        let vehicle_chrome = Chrome {
+            vehicles: vec![vehicle(4, "Faucon")],
+            section: Some(VehicleTab::Overview),
+            ..chrome()
+        };
+        let connection_chrome = Chrome {
+            section: Some(VehicleTab::Connection),
+            ..vehicle_chrome.clone()
+        };
+        let pages = [
+            ("login", login_page("csrf-token", None)),
+            ("fleet", fleet_page(&chrome(), &[], "0")),
+            (
+                "overview",
+                overview_page(
+                    &vehicle_chrome,
+                    &Overview {
+                        name: "Faucon".to_owned(),
+                        activity: "online".to_owned(),
+                        battery: "80%".to_owned(),
+                        position_mode: "hybrid".to_owned(),
+                        last_poll: "—".to_owned(),
+                        last_data: "—".to_owned(),
+                        last_error: "—".to_owned(),
+                        stream_lag: "—".to_owned(),
+                        stream_queue: "0".to_owned(),
+                        last_drive: "—".to_owned(),
+                        last_charge: "—".to_owned(),
+                    },
+                ),
+            ),
+            (
+                "drives",
+                placeholder_page(&vehicle_chrome, "Trajets", "bientôt", None),
+            ),
+            (
+                "connection",
+                connection_page(
+                    &connection_chrome,
+                    &ConnectionView {
+                        fleet: Party {
+                            title: "Fleet".to_owned(),
+                            status: "connecté".to_owned(),
+                            tone: "ok",
+                            expires: "—".to_owned(),
+                            scopes: "—".to_owned(),
+                            last_refresh: "—".to_owned(),
+                            last_error: None,
+                            connected: false,
+                        },
+                        owner_status: "déconnecté".to_owned(),
+                        owner_tone: "neutral",
+                        owner_expires: "—".to_owned(),
+                        owner_scopes: "—".to_owned(),
+                        owner_last_refresh: "—".to_owned(),
+                        owner_last_error: None,
+                        owner_connected: false,
+                        fingerprint: "sha256:abcd".to_owned(),
+                        shared_names: Vec::new(),
+                        shared_ok: true,
+                        csrf: "csrf-token",
+                        vehicle_id: Some(4),
+                        error: None,
+                        notice: None,
+                        stream_status: "disabled",
+                        streaming_enabled: false,
+                        authorize_url: None,
+                    },
+                ),
+            ),
+            (
+                "settings",
+                settings_page(
+                    &Chrome {
+                        global: GlobalTab::Settings,
+                        ..chrome()
+                    },
+                    &[],
+                ),
+            ),
+            (
+                "debug",
+                debug_page(
+                    &Chrome {
+                        global: GlobalTab::Debug,
+                        debug_script: true,
+                        ..chrome()
+                    },
+                    1,
+                    1,
+                    "",
+                ),
+            ),
+            (
+                "system",
+                system_page(&Chrome {
+                    global: GlobalTab::System,
+                    ..chrome()
+                }),
+            ),
+            (
+                "security",
+                security_page(
+                    &Chrome {
+                        global: GlobalTab::Security,
+                        ..chrome()
+                    },
+                    &[],
+                    None,
+                ),
+            ),
+            ("missing", missing_page(&chrome())),
+        ];
+        for (name, html) in pages {
+            assert!(
+                html.contains("<main class=\"shell\">"),
+                "{name} is outside the shared column: {html}"
+            );
+            assert!(
+                !html.contains("shell wide"),
+                "{name} overrides the column width"
+            );
+            assert!(!html.contains("max-width"), "{name} sets its own width");
+        }
+        let css = include_str!("ui.css");
+        assert!(!css.contains(".shell.wide"), "CSS still widens one page");
+        assert!(!css.contains("72rem"), "debug column width remains");
+        if let Some(rule) = css.split(".auth-card").nth(1) {
+            let body = rule.split('}').next().unwrap_or(rule);
+            assert!(
+                !body.contains("width"),
+                "sign-in card sets its own width: {body}"
+            );
+        }
     }
 }
