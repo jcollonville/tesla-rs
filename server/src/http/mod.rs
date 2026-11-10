@@ -108,6 +108,23 @@ async fn security_headers(
         request.headers(),
         &app.inner.config.public_base_url,
     ) {
+        let origin = request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        let sec_fetch_site = request
+            .headers()
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        tracing::warn!(
+            method = %request.method(),
+            path = request.uri().path(),
+            origin,
+            sec_fetch_site,
+            "cross-origin request rejected"
+        );
         return (StatusCode::FORBIDDEN, "cross-origin request rejected").into_response();
     }
     let path = request.uri().path().to_owned();
@@ -122,7 +139,7 @@ async fn security_headers(
     );
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     if let Ok(csp) = HeaderValue::from_str(&format!(
@@ -379,6 +396,10 @@ mod tests {
             "no-store"
         );
         assert_eq!(plain.status(), StatusCode::OK);
+        assert_eq!(
+            plain.headers().get(header::REFERRER_POLICY).unwrap(),
+            "same-origin"
+        );
 
         let secure = router(state.clone())
             .oneshot(
@@ -418,5 +439,49 @@ mod tests {
         assert_eq!(cache, "public, max-age=86400");
         let body = css.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&body).contains("color-scheme"));
+    }
+
+    #[tokio::test]
+    async fn null_origin_sign_in_reaches_the_password_check() {
+        let Some(db) = crate::test_util::TestDb::migrated("null-origin").await else {
+            return;
+        };
+        let state = crate::app::test_state(db.pool.clone()).await;
+        let login = router(state.clone())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let csrf = login
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|value| {
+                let text = value.to_str().ok()?;
+                let pair = text.split(';').next()?;
+                let (key, value) = pair.split_once('=')?;
+                (key.trim() == "tl_csrf").then(|| value.trim().to_owned())
+            })
+            .expect("csrf");
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header(header::ORIGIN, "null")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(header::COOKIE, format!("tl_csrf={csrf}"))
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "username=admin&password=wrong-password&csrf={csrf}"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("Mot de passe incorrect"), "{body}");
+        assert!(!body.contains("cross-origin request rejected"));
     }
 }
