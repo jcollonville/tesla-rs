@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -338,6 +338,10 @@ fn read_frame(text: &str) -> Result<Decoded, ParseFault> {
 }
 
 /// JSON subscribe frame. The string contains `access_token`. Do not log it.
+///
+/// Field order matches TeslaMate 4.1.1 (`Jason.encode!` of a small map, which follows Erlang
+/// `maps:to_list` key order): `msg_type`, `tag`, `token`, `value`. `tag` is the streaming
+/// vehicle id as a decimal string. `value` is the same column list TeslaMate joins.
 #[must_use]
 pub fn subscribe_frame(access_token: &str, vehicle_id: i64) -> String {
     serde_json::json!({
@@ -442,11 +446,8 @@ pub async fn pump_stream(
         }
     };
     let (mut write, mut read) = socket.split();
-    let mut frame = subscribe_frame(access_token.expose_secret(), vehicle_id);
-    let send = write.send(Message::Text(frame.clone().into())).await;
-    frame.zeroize();
     let mut live = Live::new();
-    if send.is_err() {
+    if !write_subscribe(&mut write, access_token, vehicle_id).await {
         return live.finish(FailureClass::Transport, "subscribe send failed");
     }
     if !emit(&samples, StreamEvent::Subscribed).await {
@@ -464,59 +465,42 @@ pub async fn pump_stream(
             Ok(Some(Ok(message))) => message,
         };
         match message {
-            Message::Text(text) => match read_frame(text.as_str()) {
-                Ok(decoded) => match decoded.incoming {
-                    Incoming::Update(sample) => {
-                        live.updates = live.updates.saturating_add(1);
-                        live.saw_frame();
-                        if !emit(&samples, StreamEvent::Sample(sample)).await {
-                            return live.finish(FailureClass::Transport, "event channel closed");
-                        }
+            Message::Text(text) => {
+                if let Some(end) = on_payload(
+                    &mut live,
+                    &mut write,
+                    &samples,
+                    text.as_str(),
+                    access_token,
+                    vehicle_id,
+                )
+                .await
+                {
+                    return end;
+                }
+            }
+            Message::Binary(data) => {
+                if let Ok(text) = std::str::from_utf8(&data) {
+                    if let Some(end) = on_payload(
+                        &mut live,
+                        &mut write,
+                        &samples,
+                        text,
+                        access_token,
+                        vehicle_id,
+                    )
+                    .await
+                    {
+                        return end;
                     }
-                    Incoming::Error { error_type, value } => {
-                        let class = classify_stream_error(&error_type, &value);
-                        let value = scrub_error_value(&value);
-                        live.errors = live.errors.saturating_add(1);
-                        live.saw_frame();
-                        let detail = format!("data:error type={error_type} value={value}");
-                        if !emit(
-                            &samples,
-                            StreamEvent::Trace(StreamTrace::Error { error_type, value }),
-                        )
-                        .await
-                        {
-                            return live.finish(FailureClass::Transport, "event channel closed");
-                        }
-                        return live.finish(class, detail);
-                    }
-                    Incoming::Hello => {
-                        live.hello = live.hello.saturating_add(1);
-                        live.saw_frame();
-                        if !emit(&samples, StreamEvent::Trace(StreamTrace::Hello)).await {
-                            return live.finish(FailureClass::Transport, "event channel closed");
-                        }
-                    }
-                    Incoming::Ignore => {
-                        live.saw_frame();
-                        let msg_type = decoded.msg_type.unwrap_or_else(|| "unknown".to_owned());
-                        if !emit(
-                            &samples,
-                            StreamEvent::Trace(StreamTrace::Ignored { msg_type }),
-                        )
-                        .await
-                        {
-                            return live.finish(FailureClass::Transport, "event channel closed");
-                        }
-                    }
-                },
-                Err(fault) => {
+                } else {
                     live.parse_failures = live.parse_failures.saturating_add(1);
                     live.saw_frame();
                     if !emit(
                         &samples,
                         StreamEvent::Trace(StreamTrace::ParseFailed {
-                            reason: fault.reason,
-                            msg_type: fault.msg_type,
+                            reason: "binary frame is not utf-8",
+                            msg_type: None,
                         }),
                     )
                     .await
@@ -524,7 +508,7 @@ pub async fn pump_stream(
                         return live.finish(FailureClass::Transport, "event channel closed");
                     }
                 }
-            },
+            }
             Message::Ping(payload) => {
                 live.ping = live.ping.saturating_add(1);
                 live.saw_frame();
@@ -555,7 +539,7 @@ pub async fn pump_stream(
                     return live.finish(FailureClass::Transport, "event channel closed");
                 }
             }
-            Message::Binary(_) | Message::Frame(_) => live.saw_frame(),
+            Message::Frame(_) => live.saw_frame(),
         }
     }
 }
@@ -568,6 +552,7 @@ struct Live {
     updates: u32,
     errors: u32,
     parse_failures: u32,
+    disconnects: u32,
 }
 
 impl Live {
@@ -580,6 +565,7 @@ impl Live {
             updates: 0,
             errors: 0,
             parse_failures: 0,
+            disconnects: 0,
         }
     }
 
@@ -602,6 +588,135 @@ impl Live {
             },
         })
     }
+}
+
+/// Handles one text or UTF-8 binary payload.
+///
+/// `data:error` / `vehicle_disconnected` stays on the socket and sends `data:subscribe_oauth`
+/// again, which is what TeslaMate does. Auth errors end the session so the caller can refresh.
+///
+/// Returns [`Some`] when the socket should stop.
+async fn on_payload(
+    live: &mut Live,
+    write: &mut (impl Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    samples: &mpsc::Sender<StreamEvent>,
+    text: &str,
+    access_token: &SecretString,
+    vehicle_id: i64,
+) -> Option<PumpEnd> {
+    match read_frame(text) {
+        Ok(decoded) => match decoded.incoming {
+            Incoming::Update(sample) => {
+                live.updates = live.updates.saturating_add(1);
+                live.saw_frame();
+                if !emit(samples, StreamEvent::Sample(sample)).await {
+                    return Some(live.finish(FailureClass::Transport, "event channel closed"));
+                }
+                None
+            }
+            Incoming::Error { error_type, value } => {
+                let class = classify_stream_error(&error_type, &value);
+                let value = scrub_error_value(&value);
+                live.errors = live.errors.saturating_add(1);
+                live.saw_frame();
+                let detail = format!("data:error type={error_type} value={value}");
+                if !emit(
+                    samples,
+                    StreamEvent::Trace(StreamTrace::Error {
+                        error_type: error_type.clone(),
+                        value,
+                    }),
+                )
+                .await
+                {
+                    return Some(live.finish(FailureClass::Transport, "event channel closed"));
+                }
+                if class == FailureClass::VehicleDisconnected {
+                    return resubscribe(live, write, samples, access_token, vehicle_id, detail)
+                        .await;
+                }
+                if matches!(class, FailureClass::Auth) {
+                    return Some(live.finish(class, detail));
+                }
+                None
+            }
+            Incoming::Hello => {
+                live.hello = live.hello.saturating_add(1);
+                live.saw_frame();
+                if !emit(samples, StreamEvent::Trace(StreamTrace::Hello)).await {
+                    return Some(live.finish(FailureClass::Transport, "event channel closed"));
+                }
+                None
+            }
+            Incoming::Ignore => {
+                live.saw_frame();
+                let msg_type = decoded.msg_type.unwrap_or_else(|| "unknown".to_owned());
+                if !emit(
+                    samples,
+                    StreamEvent::Trace(StreamTrace::Ignored { msg_type }),
+                )
+                .await
+                {
+                    return Some(live.finish(FailureClass::Transport, "event channel closed"));
+                }
+                None
+            }
+        },
+        Err(fault) => {
+            live.parse_failures = live.parse_failures.saturating_add(1);
+            live.saw_frame();
+            if !emit(
+                samples,
+                StreamEvent::Trace(StreamTrace::ParseFailed {
+                    reason: fault.reason,
+                    msg_type: fault.msg_type,
+                }),
+            )
+            .await
+            {
+                return Some(live.finish(FailureClass::Transport, "event channel closed"));
+            }
+            None
+        }
+    }
+}
+
+/// TeslaMate answers `vehicle_disconnected` by sending `data:subscribe_oauth` again on the same
+/// socket. The first wait is one second, then it grows to eight seconds. After too many repeats
+/// the socket is closed so the caller can open a new one.
+async fn resubscribe(
+    live: &mut Live,
+    write: &mut (impl Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    samples: &mpsc::Sender<StreamEvent>,
+    access_token: &SecretString,
+    vehicle_id: i64,
+    detail: String,
+) -> Option<PumpEnd> {
+    live.disconnects = live.disconnects.saturating_add(1);
+    if live.disconnects > 12 {
+        return Some(live.finish(FailureClass::VehicleDisconnected, detail));
+    }
+    let shift = live.disconnects.saturating_sub(1).min(3);
+    let secs = 1_u64 << shift;
+    tokio::time::sleep(Duration::from_secs(secs.min(8))).await;
+    if !write_subscribe(write, access_token, vehicle_id).await {
+        return Some(live.finish(FailureClass::Transport, "subscribe send failed"));
+    }
+    if !emit(samples, StreamEvent::Subscribed).await {
+        return Some(live.finish(FailureClass::Transport, "event channel closed"));
+    }
+    None
+}
+
+async fn write_subscribe(
+    write: &mut (impl Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    access_token: &SecretString,
+    vehicle_id: i64,
+) -> bool {
+    let mut frame = subscribe_frame(access_token.expose_secret(), vehicle_id);
+    let sent = write.send(Message::Text(frame.clone().into())).await;
+    frame.zeroize();
+    sent.is_ok()
 }
 
 /// Keepalives are dropped when the channel is full. Samples, errors, and parse failures wait.
@@ -895,6 +1010,10 @@ mod tests {
         assert_eq!(value["tag"], "42");
         assert_eq!(value["value"], STREAM_COLUMNS);
         assert!(!frame.contains("client_secret"));
+        assert_eq!(
+            frame,
+            "{\"msg_type\":\"data:subscribe_oauth\",\"tag\":\"42\",\"token\":\"test-token\",\"value\":\"speed,odometer,soc,elevation,est_heading,est_lat,est_lng,power,shift_state,range,est_range,heading\"}"
+        );
     }
 
     #[tokio::test]
@@ -915,6 +1034,13 @@ mod tests {
             let error =
                 r#"{"msg_type":"data:error","error_type":"vehicle_disconnected","value":"closed"}"#;
             socket.send(Message::Text(error.into())).await.unwrap();
+            let again = socket.next().await.unwrap().unwrap();
+            let Message::Text(text) = again else {
+                panic!("expected resubscribe");
+            };
+            assert!(text.as_str().contains("data:subscribe_oauth"));
+            assert!(text.as_str().contains("\"tag\":\"7\""));
+            socket.send(Message::Close(None)).await.unwrap();
         });
         let (tx, mut rx) = mpsc::channel(8);
         let end = pump_stream(
@@ -937,13 +1063,55 @@ mod tests {
                 value: "closed".to_owned(),
             })
         );
-        assert_eq!(end.class(), FailureClass::VehicleDisconnected);
+        assert_eq!(rx.recv().await.unwrap(), StreamEvent::Subscribed);
+        assert_eq!(end.class(), FailureClass::Transport);
         assert_eq!(end.stop().stats.updates, 1);
         assert_eq!(end.stop().stats.errors, 1);
-        assert!(
-            end.stop().detail.contains("vehicle_disconnected"),
-            "{end:?}"
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn binary_frames_are_parsed_like_teslamate() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _ = socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::Binary(
+                    br#"{"msg_type":"control:hello"}"#.to_vec().into(),
+                ))
+                .await
+                .unwrap();
+            let update = br#"{"msg_type":"data:update","tag":"7","value":"1710000000000,10,100,80,30,90,48.1,11.5,-3,D,200,180,90"}"#;
+            socket
+                .send(Message::Binary(update.to_vec().into()))
+                .await
+                .unwrap();
+            socket.send(Message::Close(None)).await.unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        let end = pump_stream(
+            &format!("ws://{addr}/streaming/"),
+            &SecretString::from("test-token".to_owned()),
+            7,
+            tx,
+        )
+        .await;
+        assert_eq!(rx.recv().await.unwrap(), StreamEvent::Subscribed);
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            StreamEvent::Trace(StreamTrace::Hello)
         );
+        let StreamEvent::Sample(sample) = rx.recv().await.unwrap() else {
+            panic!("sample");
+        };
+        assert_eq!(sample.shift_state.as_deref(), Some("D"));
+        assert_eq!(sample.est_lat, Some(48.1));
+        assert_eq!(end.class(), FailureClass::Transport);
+        assert_eq!(end.stop().stats.hello, 1);
+        assert_eq!(end.stop().stats.updates, 1);
         server.await.unwrap();
     }
 
