@@ -18,6 +18,7 @@ use crate::error::AppError;
 use crate::geocode::Geocoder;
 use crate::http;
 use crate::ingest::{self, Archive, FleetPoll, PollPolicy};
+use crate::logs::LogBuffer;
 use crate::mqtt;
 use crate::owner_stream::{self, StreamBoard};
 use crate::persist::LiveEvent;
@@ -43,6 +44,7 @@ pub(crate) struct Inner {
     pub owner_pending: Mutex<Option<(OwnerLogin, Instant)>>,
     pub stream_board: StreamBoard,
     pub owner_tokens: watch::Sender<u64>,
+    pub logs: LogBuffer,
 }
 
 pub(crate) struct UiSession {
@@ -59,9 +61,10 @@ impl AppState {
     }
 }
 
-pub(crate) async fn serve() -> Result<(), AppError> {
+pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
     let config = Config::load()?;
-    let state = build(config).await?;
+    logs.install_config(&config);
+    let state = build(config, logs).await?;
     let listen = state.inner.config.listen_addr;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let poll_state = state.clone();
@@ -136,7 +139,7 @@ pub(crate) async fn serve() -> Result<(), AppError> {
     Ok(())
 }
 
-pub(crate) async fn build(config: Config) -> Result<AppState, AppError> {
+pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, AppError> {
     let public_key_pem = read_public_key(&config.private_key_path)?;
     let store = Arc::new(TokenFile::open(
         &config.token_store_path,
@@ -181,6 +184,7 @@ pub(crate) async fn build(config: Config) -> Result<AppState, AppError> {
             owner_pending: Mutex::new(None),
             stream_board: StreamBoard::default(),
             owner_tokens,
+            logs,
         }),
     })
 }
@@ -290,6 +294,8 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
     let (events, _) = broadcast::channel(16);
     let (stream_kick, _) = broadcast::channel(8);
     let (owner_tokens, _) = watch::channel(0_u64);
+    let logs = LogBuffer::new(50);
+    logs.install_config(&config);
     let geocoder = Geocoder::disabled();
     let archive = Arc::new(Archive {
         db: pool.clone(),
@@ -313,6 +319,7 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
             owner_pending: Mutex::new(None),
             stream_board: StreamBoard::default(),
             owner_tokens,
+            logs,
         }),
     }
 }

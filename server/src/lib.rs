@@ -20,6 +20,7 @@ mod geofence;
 mod http;
 mod import;
 mod ingest;
+mod logs;
 mod mqtt;
 mod owner_stream;
 mod persist;

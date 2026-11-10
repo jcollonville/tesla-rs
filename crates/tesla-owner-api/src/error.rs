@@ -17,6 +17,12 @@ pub enum OwnerError {
         /// HTTP status, or `0` when the error was on the pasted redirect URL.
         status: u16,
     },
+    /// Tesla refused a vehicle or product call. This is not a failed sign-in.
+    #[error("owner API rejected the request ({status})")]
+    RequestRejected {
+        /// HTTP status from the Owner API.
+        status: u16,
+    },
     /// The token or vehicle response was missing a required field.
     #[error("owner API response was incomplete")]
     Malformed,

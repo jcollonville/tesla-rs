@@ -295,7 +295,8 @@ fn owner_markup(view: &OwnerView<'_>) -> String {
     ui::page(&format!(
         "<header class=\"toolbar\"><div><p class=\"kicker\"><a href=\"/\">tesla-logger</a></p>\
          <h1 class=\"title\">{}Owner API streaming</h1></div>\
-         <a class=\"button ghost\" href=\"/\">{}Back</a></header>\
+         <div class=\"toolbar-actions\"><a class=\"button ghost\" href=\"/logs\">{}Logs</a>\
+         <a class=\"button ghost\" href=\"/\">{}Back</a></div></header>\
          {error}{notice}\
          <p>This uses Tesla's legacy Owner API and streaming socket. They are unofficial and Tesla may shut them down. Fleet API polling stays the source for everything else. The stream adds about one position per second while driving.</p>\
          <div class=\"meta\">{stream}{stored}</div>{config_note}\
@@ -323,6 +324,7 @@ fn owner_markup(view: &OwnerView<'_>) -> String {
          <form method=\"post\" action=\"/auth/owner/disconnect\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
          <button class=\"danger\" type=\"submit\">{}Disconnect Owner API</button></form></section>",
         ui::icon(ui::ICON_CAR),
+        ui::icon(ui::ICON_LOGS),
         ui::icon(ui::ICON_ARROW),
         ui::icon(ui::ICON_KEY),
         ui::icon(ui::ICON_UNLINK)
@@ -416,6 +418,7 @@ mod tests {
         assert!(html.contains("Network tab"));
         assert!(html.contains("Do not reuse TeslaMate's refresh token"));
         assert!(!html.contains("void/callback"));
+        assert!(html.contains("href=\"/logs\""));
         assert!(html.contains("action=\"/auth/owner/start\""));
         assert!(html.contains("action=\"/auth/owner/callback\""));
         assert!(html.contains("action=\"/auth/owner/refresh\""));

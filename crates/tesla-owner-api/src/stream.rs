@@ -55,6 +55,18 @@ pub struct StreamSample {
     pub heading: Option<f64>,
 }
 
+/// One event from a streaming session.
+///
+/// `Sample` is the common variant. It stays unboxed so a GPS row is not allocated twice.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum StreamEvent {
+    /// The socket is up and the subscribe frame was written.
+    Subscribed,
+    /// A telemetry row.
+    Sample(StreamSample),
+}
+
 /// A decoded streaming frame.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Incoming {
@@ -229,12 +241,13 @@ pub fn plan_reconnect(class: FailureClass, consecutive: u32) -> ReconnectPlan {
 
 /// Reads one streaming session until Tesla closes it or a frame asks for a reconnect.
 ///
-/// Samples are sent on `samples`. The access token is copied into the subscribe frame only.
+/// [`StreamEvent::Subscribed`] is sent after the subscribe frame is written, before any GPS row.
+/// Samples follow on the same channel. The access token is copied into the subscribe frame only.
 pub async fn pump_stream(
     url: &str,
     access_token: &SecretString,
     vehicle_id: i64,
-    samples: mpsc::Sender<StreamSample>,
+    samples: mpsc::Sender<StreamEvent>,
 ) -> PumpEnd {
     if ensure_stream_url(url).is_err() {
         return PumpEnd::Failed(FailureClass::Unavailable);
@@ -256,6 +269,9 @@ pub async fn pump_stream(
     if send.is_err() {
         return PumpEnd::Failed(FailureClass::Transport);
     }
+    if samples.send(StreamEvent::Subscribed).await.is_err() {
+        return PumpEnd::Failed(FailureClass::Transport);
+    }
     loop {
         let next = tokio::time::timeout(READ_TIMEOUT, read.next()).await;
         let message = match next {
@@ -269,7 +285,7 @@ pub async fn pump_stream(
         match message {
             Message::Text(text) => match parse_message(text.as_str()) {
                 Ok(Incoming::Update(sample)) => {
-                    if samples.send(sample).await.is_err() {
+                    if samples.send(StreamEvent::Sample(sample)).await.is_err() {
                         return PumpEnd::Failed(FailureClass::Transport);
                     }
                 }
@@ -371,7 +387,7 @@ fn ensure_stream_url(url: &str) -> Result<(), OwnerError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureClass, Incoming, PumpEnd, STREAM_COLUMNS, classify_stream_error,
+        FailureClass, Incoming, PumpEnd, STREAM_COLUMNS, StreamEvent, classify_stream_error,
         classify_transport_message, parse_message, plan_reconnect, pump_stream, subscribe_frame,
     };
     use futures_util::{SinkExt, StreamExt};
@@ -538,10 +554,74 @@ mod tests {
             tx,
         )
         .await;
-        let sample = rx.recv().await.unwrap();
+        assert_eq!(rx.recv().await.unwrap(), StreamEvent::Subscribed);
+        let StreamEvent::Sample(sample) = rx.recv().await.unwrap() else {
+            panic!("sample");
+        };
         assert_eq!(sample.shift_state.as_deref(), Some("D"));
         assert_eq!(sample.est_lat, Some(48.1));
         assert_eq!(end, PumpEnd::Failed(FailureClass::VehicleDisconnected));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pump_is_subscribed_on_hello_without_a_gps_sample() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let message = socket.next().await.unwrap().unwrap();
+            let Message::Text(text) = message else {
+                panic!("expected text");
+            };
+            let value: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+            assert_eq!(value["msg_type"], "data:subscribe_oauth");
+            assert_eq!(value["tag"], "7");
+            socket
+                .send(Message::Text(r#"{"msg_type":"control:hello"}"#.into()))
+                .await
+                .unwrap();
+            socket.send(Message::Ping(vec![1].into())).await.unwrap();
+            socket.send(Message::Close(None)).await.unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(4);
+        let end = pump_stream(
+            &format!("ws://{addr}/streaming/"),
+            &SecretString::from("test-token".to_owned()),
+            7,
+            tx,
+        )
+        .await;
+        assert_eq!(rx.recv().await.unwrap(), StreamEvent::Subscribed);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(end, PumpEnd::Failed(FailureClass::Transport));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pump_reports_an_auth_error_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _ = socket.next().await.unwrap().unwrap();
+            let error =
+                r#"{"msg_type":"data:error","error_type":"client_error","value":"invalid token"}"#;
+            socket.send(Message::Text(error.into())).await.unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(4);
+        let end = pump_stream(
+            &format!("ws://{addr}/streaming/"),
+            &SecretString::from("test-token".to_owned()),
+            7,
+            tx,
+        )
+        .await;
+        assert_eq!(rx.recv().await.unwrap(), StreamEvent::Subscribed);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(end, PumpEnd::Failed(FailureClass::Auth));
         server.await.unwrap();
     }
 

@@ -41,7 +41,7 @@ Copy `server/.env.example` to `server/.env`.
 | `OWNER_STREAM_ENABLED` | Owner API streaming. Default `true`. Set `false` to keep a saved token without connecting |
 | `TESLA_OWNER_TOKEN_STORE_PATH` | Owner API token file. Default is `owner-tokens.json` next to `TESLA_TOKEN_STORE_PATH`. Encrypted with `TESLA_TOKEN_ENCRYPTION_KEY` when that is set |
 
-The UI password protects the status page and the OAuth start button. API calls use a bearer token created on that page (`Authorization: Bearer tl_...`). The WebSocket also accepts `access_token` in the query string; prefer the header so proxy logs do not store it.
+The UI password protects the status page, the logs page, and the OAuth start button. API calls use a bearer token created on that page (`Authorization: Bearer tl_...`). The WebSocket also accepts `access_token` in the query string; prefer the header so proxy logs do not store it. Recent application logs are kept in memory and shown at `/logs` after signing in. Passwords, tokens, and websocket subscribe frames are redacted. The list resets when the process restarts.
 
 ## Owner API streaming
 
@@ -56,7 +56,7 @@ Enable it from the status page:
 5. After login, the browser cannot open `tesla://auth/callback`. It may say the address is not understood, the site cannot be reached, or offer to open the Tesla app. Do not open the Tesla app.
 6. Copy the full URL from the address bar. It starts with `tesla://auth/callback?`. If Chrome drops the address, the Network tab in developer tools still shows the failed navigation. Copy that URL.
 7. Paste it into **Redirect URL** and choose **Save sign-in**. The page returns to the vehicle table. The password field is only so the authorization code is not displayed.
-8. The stream chip and `GET /api/v1/vehicles/{id}/state` field `stream_status` become `connected` while the socket is up, `error` while it is reconnecting, and `disabled` when no Owner token is stored. `stream_error` is a short class such as `timeout` or `auth` and never contains a token. The log line is `owner stream status`.
+8. The stream chip and `GET /api/v1/vehicles/{id}/state` field `stream_status` become `connected` once the streaming websocket is subscribed, including while the car is parked and Tesla sends only hello or ping frames. They are `error` while it is reconnecting, and `disabled` when no Owner token is stored. `stream_error` is a short class such as `timeout` or `auth` and never contains a token. The log line is `owner stream status`. Cars are listed with `GET /api/1/products`; `GET /api/1/vehicles` returns HTTP 412 and is not used.
 
 A refresh token generated for this logger can be pasted into **Owner API refresh token** instead of the redirect URL. Do not paste the refresh token TeslaMate is using. Tesla rotates refresh tokens, and using TeslaMate's token here can sign TeslaMate out. Each program should have its own Owner API login. The Fleet API login is a third one and is unchanged.
 

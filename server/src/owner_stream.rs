@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use tesla_auth::{Scope, TokenSet};
 use tesla_owner_api::{
     FailureClass, OwnerClient, OwnerError, OwnerRegion, OwnerTokens, PumpEnd, SecretString,
-    plan_reconnect, pump_stream,
+    StreamEvent, plan_reconnect, pump_stream,
 };
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
@@ -425,19 +425,17 @@ async fn vehicle_loop(
             tokio::select! {
                 biased;
                 _ = stop.changed() => return,
-                sample = rx.recv() => {
-                    let Some(sample) = sample else {
+                notice = rx.recv() => {
+                    let Some(notice) = notice else {
                         break PumpEnd::Failed(FailureClass::Transport);
                     };
                     saw = true;
-                    board.set_vehicle(target.db_id, "connected", None).await;
-                    store_sample(&archive, &target, &mut carry, &sample).await;
+                    accept_notice(&board, &archive, &target, &mut carry, notice).await;
                 }
                 end = &mut pump => {
-                    while let Ok(sample) = rx.try_recv() {
+                    while let Ok(notice) = rx.try_recv() {
                         saw = true;
-                        board.set_vehicle(target.db_id, "connected", None).await;
-                        store_sample(&archive, &target, &mut carry, &sample).await;
+                        accept_notice(&board, &archive, &target, &mut carry, notice).await;
                     }
                     break end;
                 }
@@ -463,6 +461,24 @@ async fn vehicle_loop(
         .await
         {
             return;
+        }
+    }
+}
+
+async fn accept_notice(
+    board: &StreamBoard,
+    archive: &Archive,
+    target: &Target,
+    carry: &mut Carry,
+    notice: StreamEvent,
+) {
+    match notice {
+        StreamEvent::Subscribed => {
+            board.set_vehicle(target.db_id, "connected", None).await;
+        }
+        StreamEvent::Sample(sample) => {
+            board.set_vehicle(target.db_id, "connected", None).await;
+            store_sample(archive, target, carry, &sample).await;
         }
     }
 }
@@ -752,7 +768,7 @@ async fn wait_stop(stop: &mut watch::Receiver<bool>, limit: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Carry, prepare};
+    use super::{Carry, OwnerSession, StreamBoard, Target, prepare, vehicle_loop};
     use tesla_owner_api::StreamSample;
 
     fn blank() -> StreamSample {
@@ -820,5 +836,114 @@ mod tests {
                 .latitude
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn parked_socket_is_connected_before_a_gps_sample() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::{Duration, SystemTime};
+
+        use futures_util::{SinkExt, StreamExt};
+        use tesla_auth::{Scope, TokenSet};
+        use tesla_owner_api::{OwnerClient, OwnerRegion, SecretString};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let message = socket.next().await.unwrap().unwrap();
+            let Message::Text(text) = message else {
+                panic!("expected text");
+            };
+            let value: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+            assert_eq!(value["msg_type"], "data:subscribe_oauth");
+            assert_eq!(value["tag"], "99");
+            socket
+                .send(Message::Text(r#"{"msg_type":"control:hello"}"#.into()))
+                .await
+                .unwrap();
+            socket.send(Message::Ping(vec![1].into())).await.unwrap();
+            let _ = release_rx.await;
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "tl-stream-{}-{}",
+            std::process::id(),
+            crate::crypto::random_token().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::crypto::TokenFile::open(dir.join("owner.json"), None).unwrap();
+        store
+            .save(&TokenSet::bearer(
+                SecretString::from("stream-access-token".to_owned()),
+                Some(SecretString::from("stream-refresh-token".to_owned())),
+                SystemTime::now() + Duration::from_secs(3_600),
+                vec![Scope::OpenId, Scope::OfflineAccess],
+            ))
+            .await
+            .unwrap();
+        let (events, _) = tokio::sync::broadcast::channel(4);
+        let (kick, _) = tokio::sync::broadcast::channel(4);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let archive = Arc::new(crate::ingest::Archive {
+            db: pool,
+            geocoder: crate::geocode::Geocoder::disabled(),
+            events,
+            runtimes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            stream_kick: kick,
+        });
+        let board = StreamBoard::default();
+        board.set_mode(true, true).await;
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(vehicle_loop(
+            Target {
+                db_id: 1,
+                vin: "5YJ3E1EA7KF000001".to_owned(),
+                stream_tag: 99,
+            },
+            Arc::new(OwnerSession {
+                client: OwnerClient::new(OwnerRegion::Global).unwrap(),
+                store,
+                lock: tokio::sync::Mutex::new(()),
+            }),
+            archive,
+            board.clone(),
+            format!("ws://{addr}/streaming/"),
+            stop_rx,
+        ));
+
+        let connected = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let snapshot = board.snapshot().await;
+                let (status, detail) = snapshot.for_vehicle(1);
+                if status == "connected" {
+                    assert!(detail.is_none());
+                    assert_eq!(snapshot.summary(), "connected");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if connected.is_err() {
+            let snapshot = board.snapshot().await;
+            let (status, detail) = snapshot.for_vehicle(1);
+            panic!(
+                "stream status {status} {detail:?} summary {}",
+                snapshot.summary()
+            );
+        }
+        let _ = release_tx.send(());
+        let _ = stop_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        server.abort();
     }
 }
