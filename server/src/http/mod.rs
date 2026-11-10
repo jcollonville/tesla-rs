@@ -3,6 +3,7 @@
 
 pub(crate) mod api;
 mod owner;
+mod stats;
 mod ui;
 
 use std::time::Instant;
@@ -25,6 +26,11 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/v1/vehicles", get(api::list_vehicles))
         .route("/api/v1/vehicles/{id}", get(api::vehicle))
         .route("/api/v1/vehicles/{id}/state", get(api::vehicle_state))
+        .route("/api/v1/vehicles/{id}/stats/series", get(stats::series))
+        .route(
+            "/api/v1/vehicles/{id}/stats/consumption_by_temp",
+            get(stats::consumption_by_temp),
+        )
         .route("/api/v1/drives", get(api::list_drives))
         .route("/api/v1/drives/{id}", get(api::drive_detail))
         .route("/api/v1/charges", get(api::list_charges))

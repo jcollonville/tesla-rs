@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use http_body_util::BodyExt;
 use sqlx::Row;
 use tower::ServiceExt;
@@ -27,6 +27,8 @@ fn openapi_lists_the_read_api() {
         "/api/v1/drives",
         "/api/v1/charges",
         "/api/v1/stats",
+        "/api/v1/vehicles/{id}/stats/series",
+        "/api/v1/vehicles/{id}/stats/consumption_by_temp",
         "/api/v1/geofences",
         "/api/v1/ws",
     ] {
@@ -50,6 +52,11 @@ fn openapi_lists_the_read_api() {
         "scheduled_charging_start_time",
         "stream_status",
         "position_mode",
+        "range_at_100_km",
+        "idle_range_loss_km_per_day",
+        "temp_c_bucket",
+        "drive_duration_s",
+        "dc_share_pct",
     ] {
         assert!(OPENAPI.contains(field), "{field}");
     }
@@ -1259,6 +1266,576 @@ async fn positions_page_uses_primary_key_index() {
     assert_eq!(ids.len(), usize::try_from(POSITIONS_PAGE).unwrap());
     assert_eq!(ids.first().copied(), Some(17_001));
     assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[tokio::test]
+async fn stats_series_buckets_indicators_and_temperature() {
+    let Some(db) = TestDb::migrated("stats").await else {
+        return;
+    };
+    let state = crate::app::test_state_with(db.pool.clone(), Some(0.5)).await;
+    let token = "tl_stats-token";
+    sqlx::query("INSERT INTO api_tokens (name, token_hash) VALUES ('ha', $1)")
+        .bind(sha256_hex(token))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let vin = "5YJ3E1EA7KF000099";
+    let (vehicle_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO vehicles (vin, name, efficiency_kwh_per_km)
+         VALUES ($1, 'Stats', 0.25) RETURNING id",
+    )
+    .bind(vin)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let (other_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO vehicles (vin, name, efficiency_kwh_per_km)
+         VALUES ('5YJ3E1EA7KF000098', 'Other', 0.25) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let months: Vec<(DateTime<Utc>,)> = sqlx::query_as(
+        "SELECT gs AT TIME ZONE 'Europe/Paris'
+         FROM generate_series(
+            date_trunc('month', timezone('Europe/Paris', now())) - interval '3 months',
+            date_trunc('month', timezone('Europe/Paris', now())),
+            interval '1 month'
+         ) AS gs
+         ORDER BY 1",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let month_2 = months[1].0;
+    let prev = months[2].0;
+    let current = months[3].0;
+
+    let d1 = current + chrono::Duration::days(2);
+    seed_drive(
+        &db.pool,
+        DriveSeed {
+            vehicle_id,
+            start: d1,
+            end: Some(d1 + chrono::Duration::hours(1)),
+            distance: Some(100.0),
+            duration_s: Some(3600),
+            start_rated: Some(400.0),
+            end_rated: Some(385.0),
+            temp: Some(7.2),
+            ..DriveSeed::closed(vehicle_id, d1)
+        },
+    )
+    .await;
+    let d2 = current + chrono::Duration::days(5);
+    seed_drive(
+        &db.pool,
+        DriveSeed {
+            vehicle_id,
+            start: d2,
+            end: Some(d2 + chrono::Duration::seconds(1200)),
+            distance: Some(40.0),
+            duration_s: Some(1200),
+            energy: Some(8.0),
+            temp: Some(7.2),
+            ..DriveSeed::closed(vehicle_id, d2)
+        },
+    )
+    .await;
+    // Open trip and another vehicle must not leak into the series.
+    seed_drive(
+        &db.pool,
+        DriveSeed {
+            vehicle_id,
+            start: current + chrono::Duration::days(6),
+            end: None,
+            distance: Some(9_999.0),
+            duration_s: Some(9_999),
+            energy: Some(9_999.0),
+            ..DriveSeed::closed(vehicle_id, current)
+        },
+    )
+    .await;
+    seed_drive(
+        &db.pool,
+        DriveSeed {
+            vehicle_id: other_id,
+            start: d1,
+            end: Some(d1 + chrono::Duration::minutes(10)),
+            distance: Some(999.0),
+            duration_s: Some(600),
+            energy: Some(50.0),
+            ..DriveSeed::closed(other_id, d1)
+        },
+    )
+    .await;
+
+    let a_start = prev + chrono::Duration::days(2);
+    let a_end = a_start + chrono::Duration::seconds(1800);
+    seed_drive(
+        &db.pool,
+        DriveSeed {
+            vehicle_id,
+            start: a_start,
+            end: Some(a_end),
+            distance: Some(50.0),
+            duration_s: Some(1800),
+            energy: Some(10.0),
+            start_rated: Some(310.0),
+            end_rated: Some(300.0),
+            start_odo: Some(990.0),
+            end_odo: Some(1_000.0),
+            temp: Some(12.0),
+            ..DriveSeed::closed(vehicle_id, a_start)
+        },
+    )
+    .await;
+    let b_start = a_end + chrono::Duration::hours(48);
+    let b_end = b_start + chrono::Duration::seconds(600);
+    seed_drive(
+        &db.pool,
+        DriveSeed {
+            vehicle_id,
+            start: b_start,
+            end: Some(b_end),
+            distance: Some(10.0),
+            duration_s: Some(600),
+            energy: Some(1.0),
+            start_rated: Some(294.0),
+            end_rated: Some(290.0),
+            start_odo: Some(1_000.2),
+            end_odo: Some(1_010.0),
+            ..DriveSeed::closed(vehicle_id, b_start)
+        },
+    )
+    .await;
+    // Odometer jumped, so this parked gap is not vampire drain.
+    let c_start = b_end + chrono::Duration::hours(24);
+    seed_drive(
+        &db.pool,
+        DriveSeed {
+            vehicle_id,
+            start: c_start,
+            end: Some(c_start + chrono::Duration::seconds(300)),
+            distance: Some(5.0),
+            duration_s: Some(300),
+            energy: Some(0.5),
+            start_rated: Some(288.0),
+            start_odo: Some(1_020.0),
+            end_odo: Some(1_025.0),
+            ..DriveSeed::closed(vehicle_id, c_start)
+        },
+    )
+    .await;
+
+    let ideal = month_2 + chrono::Duration::days(1);
+    seed_drive(
+        &db.pool,
+        DriveSeed {
+            vehicle_id,
+            start: ideal,
+            end: Some(ideal + chrono::Duration::seconds(900)),
+            distance: Some(20.0),
+            duration_s: Some(900),
+            start_ideal: Some(500.0),
+            end_ideal: Some(480.0),
+            temp: Some(-3.0),
+            source: "teslamate",
+            ..DriveSeed::closed(vehicle_id, ideal)
+        },
+    )
+    .await;
+
+    let charge_at = current + chrono::Duration::days(3);
+    let charge_end = charge_at + chrono::Duration::hours(2);
+    for (energy, cost, is_dc, charger) in [
+        (8.0, None, Some(false), None),
+        (20.0, Some(6.0), Some(true), None),
+        (2.0, None, None, Some("CCS")),
+    ] {
+        sqlx::query(
+            "INSERT INTO charges (
+                vehicle_id, start_at, end_at, energy_added_kwh, cost, is_dc, charger_type, source
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'poll')",
+        )
+        .bind(vehicle_id)
+        .bind(charge_at)
+        .bind(charge_end)
+        .bind(energy)
+        .bind(cost)
+        .bind(is_dc)
+        .bind(charger)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let (charge_id,): (i64,) = sqlx::query_as(
+        "SELECT id FROM charges WHERE vehicle_id = $1 AND is_dc IS NOT TRUE ORDER BY id LIMIT 1",
+    )
+    .bind(vehicle_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO positions (vehicle_id, recorded_at, battery_level, rated_range_km, source)
+         VALUES ($1, $2, 50, 180, 'poll'), ($1, $3, 8, 100, 'poll')",
+    )
+    .bind(vehicle_id)
+    .bind(charge_at)
+    .bind(charge_at + chrono::Duration::hours(1))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO positions (vehicle_id, recorded_at, battery_level, rated_range_km, source)
+         VALUES ($1, $2, 50, 50, 'poll')",
+    )
+    .bind(other_id)
+    .bind(charge_at)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO charge_samples (charge_id, recorded_at, battery_level, rated_range_km, source)
+         VALUES ($1, $2, 75, 300, 'poll')",
+    )
+    .bind(charge_id)
+    .bind(charge_at)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let denied = router(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!(
+                    "/api/v1/vehicles/{vehicle_id}/stats/series?period=month"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    let bad = router(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!(
+                    "/api/v1/vehicles/{vehicle_id}/stats/series?period=day"
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), axum::http::StatusCode::BAD_REQUEST);
+    let missing = router(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/vehicles/999999/stats/series?period=month&count=1")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), axum::http::StatusCode::NOT_FOUND);
+
+    let body = authed(
+        &state,
+        "GET",
+        &format!("/api/v1/vehicles/{vehicle_id}/stats/series?period=month&count=4"),
+        token,
+    )
+    .await;
+    assert!(!body.contains(vin), "{body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["period"], "month");
+    let buckets = parsed["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 4);
+    for (bucket, expected) in buckets.iter().zip(&months) {
+        let start = bucket["start"].as_str().unwrap();
+        assert!(!start.contains('.'), "{start}");
+        let parsed_start = DateTime::parse_from_rfc3339(start).unwrap();
+        assert_eq!(parsed_start.format("%H:%M:%S").to_string(), "00:00:00");
+        assert_eq!(parsed_start.with_timezone(&Utc), expected.0);
+    }
+    assert_empty_bucket(&buckets[0]);
+
+    let older = &buckets[1];
+    close(num(older, "distance_km"), 20.0);
+    close(num(older, "energy_used_kwh"), 5.0);
+    close(num(older, "wh_per_km"), 250.0);
+    assert_eq!(int(older, "drive_duration_s"), 900);
+    assert_eq!(int(older, "drive_count"), 1);
+    close(num(older, "energy_charged_kwh"), 0.0);
+    assert!(older["range_at_100_km"].is_null());
+    assert!(older["idle_range_loss_km_per_day"].is_null());
+
+    let previous = &buckets[2];
+    close(num(previous, "distance_km"), 65.0);
+    close(num(previous, "energy_used_kwh"), 11.5);
+    close(num(previous, "wh_per_km"), 11.5 * 1_000.0 / 65.0);
+    assert_eq!(int(previous, "drive_duration_s"), 2_700);
+    assert_eq!(int(previous, "drive_count"), 3);
+    close(num(previous, "idle_range_loss_km_per_day"), 3.0);
+    close(num(previous, "idle_energy_loss_kwh_per_day"), 0.75);
+    assert!(previous["charge_cost"].is_null());
+
+    let latest = &buckets[3];
+    close(num(latest, "distance_km"), 140.0);
+    close(num(latest, "energy_used_kwh"), 11.75);
+    close(num(latest, "wh_per_km"), 11.75 * 1_000.0 / 140.0);
+    close(num(latest, "energy_charged_kwh"), 30.0);
+    assert_eq!(int(latest, "drive_duration_s"), 4_800);
+    assert_eq!(int(latest, "drive_count"), 2);
+    close(num(latest, "range_at_100_km"), 380.0);
+    close(num(latest, "ac_energy_kwh"), 8.0);
+    close(num(latest, "dc_energy_kwh"), 22.0);
+    close(num(latest, "dc_share_pct"), 22.0 / 30.0 * 100.0);
+    close(num(latest, "charge_cost"), 11.0);
+    close(num(latest, "cost_per_km"), 11.0 / 140.0);
+    assert!(latest["idle_range_loss_km_per_day"].is_null());
+
+    let defaults = authed(
+        &state,
+        "GET",
+        &format!("/api/v1/vehicles/{vehicle_id}/stats/series?period=month"),
+        token,
+    )
+    .await;
+    let defaults: serde_json::Value = serde_json::from_str(&defaults).unwrap();
+    let default_buckets = defaults["buckets"].as_array().unwrap();
+    assert_eq!(default_buckets.len(), 12);
+    let distance_sum: f64 = default_buckets
+        .iter()
+        .map(|bucket| num(bucket, "distance_km"))
+        .sum();
+    close(distance_sum, 225.0);
+    assert!(
+        default_buckets
+            .iter()
+            .any(|bucket| int(bucket, "drive_count") == 0)
+    );
+
+    let years = authed(
+        &state,
+        "GET",
+        &format!("/api/v1/vehicles/{vehicle_id}/stats/series?period=year"),
+        token,
+    )
+    .await;
+    let years: serde_json::Value = serde_json::from_str(&years).unwrap();
+    let year_buckets = years["buckets"].as_array().unwrap();
+    assert_eq!(year_buckets.len(), 5);
+    let year_distance: f64 = year_buckets
+        .iter()
+        .map(|bucket| num(bucket, "distance_km"))
+        .sum();
+    close(year_distance, 225.0);
+
+    let temps = authed(
+        &state,
+        "GET",
+        &format!("/api/v1/vehicles/{vehicle_id}/stats/consumption_by_temp?period=month&count=4"),
+        token,
+    )
+    .await;
+    assert!(!temps.contains(vin), "{temps}");
+    let temps: serde_json::Value = serde_json::from_str(&temps).unwrap();
+    let temps = temps.as_array().unwrap();
+    assert_eq!(temps.len(), 3);
+    assert_eq!(int(&temps[0], "temp_c_bucket"), -5);
+    close(num(&temps[0], "distance_km"), 20.0);
+    close(num(&temps[0], "wh_per_km"), 250.0);
+    assert_eq!(int(&temps[1], "temp_c_bucket"), 5);
+    close(num(&temps[1], "distance_km"), 140.0);
+    close(num(&temps[1], "wh_per_km"), 11.75 * 1_000.0 / 140.0);
+    assert_eq!(int(&temps[2], "temp_c_bucket"), 10);
+    close(num(&temps[2], "distance_km"), 50.0);
+    close(num(&temps[2], "wh_per_km"), 200.0);
+}
+
+#[tokio::test]
+async fn stats_series_uses_iso_weeks_and_keeps_the_boundary_in_the_later_bucket() {
+    let Some(db) = TestDb::migrated("statsweek").await else {
+        return;
+    };
+    let state = crate::app::test_state(db.pool.clone()).await;
+    let token = "tl_week-token";
+    sqlx::query("INSERT INTO api_tokens (name, token_hash) VALUES ('ha', $1)")
+        .bind(sha256_hex(token))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (vehicle_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO vehicles (vin, name) VALUES ('5YJ3E1EA7KF000097', 'Week') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let edges: (DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT
+            (date_trunc('week', timezone('Europe/Paris', now())) AT TIME ZONE 'Europe/Paris'),
+            (date_trunc('week', timezone('Europe/Paris', now())) AT TIME ZONE 'Europe/Paris')
+                - interval '1 second'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    seed_drive(
+        &db.pool,
+        DriveSeed {
+            vehicle_id,
+            start: edges.1,
+            end: Some(edges.1 + chrono::Duration::minutes(5)),
+            distance: Some(7.0),
+            duration_s: Some(100),
+            ..DriveSeed::closed(vehicle_id, edges.1)
+        },
+    )
+    .await;
+    seed_drive(
+        &db.pool,
+        DriveSeed {
+            vehicle_id,
+            start: edges.0,
+            end: Some(edges.0 + chrono::Duration::minutes(5)),
+            distance: Some(3.0),
+            duration_s: Some(200),
+            ..DriveSeed::closed(vehicle_id, edges.0)
+        },
+    )
+    .await;
+    let body = authed(
+        &state,
+        "GET",
+        &format!("/api/v1/vehicles/{vehicle_id}/stats/series?period=week&count=2"),
+        token,
+    )
+    .await;
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["period"], "week");
+    let buckets = parsed["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 2);
+    close(num(&buckets[0], "distance_km"), 7.0);
+    assert_eq!(int(&buckets[0], "drive_count"), 1);
+    assert_eq!(int(&buckets[0], "drive_duration_s"), 100);
+    assert!(buckets[0]["energy_used_kwh"].is_null());
+    assert!(buckets[0]["wh_per_km"].is_null());
+    close(num(&buckets[1], "distance_km"), 3.0);
+    assert_eq!(int(&buckets[1], "drive_duration_s"), 200);
+    assert!(buckets[1]["wh_per_km"].is_null());
+    let older = DateTime::parse_from_rfc3339(buckets[0]["start"].as_str().unwrap()).unwrap();
+    let newer = DateTime::parse_from_rfc3339(buckets[1]["start"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        (newer.with_timezone(&Utc) - older.with_timezone(&Utc)).num_days(),
+        7
+    );
+    assert_eq!(newer.with_timezone(&Utc), edges.0);
+}
+
+fn assert_empty_bucket(bucket: &serde_json::Value) {
+    close(num(bucket, "distance_km"), 0.0);
+    close(num(bucket, "energy_used_kwh"), 0.0);
+    assert!(bucket["wh_per_km"].is_null());
+    close(num(bucket, "energy_charged_kwh"), 0.0);
+    assert_eq!(int(bucket, "drive_duration_s"), 0);
+    assert_eq!(int(bucket, "drive_count"), 0);
+    assert!(bucket["range_at_100_km"].is_null());
+    close(num(bucket, "ac_energy_kwh"), 0.0);
+    close(num(bucket, "dc_energy_kwh"), 0.0);
+    assert!(bucket["dc_share_pct"].is_null());
+    assert!(bucket["charge_cost"].is_null());
+    assert!(bucket["cost_per_km"].is_null());
+    assert!(bucket["idle_range_loss_km_per_day"].is_null());
+    assert!(bucket["idle_energy_loss_kwh_per_day"].is_null());
+}
+
+fn num(value: &serde_json::Value, key: &str) -> f64 {
+    value[key]
+        .as_f64()
+        .unwrap_or_else(|| panic!("{key} missing in {value}"))
+}
+
+fn int(value: &serde_json::Value, key: &str) -> i64 {
+    value[key]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{key} missing in {value}"))
+}
+
+fn close(actual: f64, expected: f64) {
+    assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+}
+
+struct DriveSeed {
+    vehicle_id: i64,
+    start: DateTime<Utc>,
+    end: Option<DateTime<Utc>>,
+    distance: Option<f64>,
+    duration_s: Option<i32>,
+    energy: Option<f64>,
+    start_rated: Option<f64>,
+    end_rated: Option<f64>,
+    start_ideal: Option<f64>,
+    end_ideal: Option<f64>,
+    start_odo: Option<f64>,
+    end_odo: Option<f64>,
+    temp: Option<f64>,
+    source: &'static str,
+}
+
+impl DriveSeed {
+    fn closed(vehicle_id: i64, start: DateTime<Utc>) -> Self {
+        Self {
+            vehicle_id,
+            start,
+            end: None,
+            distance: None,
+            duration_s: None,
+            energy: None,
+            start_rated: None,
+            end_rated: None,
+            start_ideal: None,
+            end_ideal: None,
+            start_odo: None,
+            end_odo: None,
+            temp: None,
+            source: "poll",
+        }
+    }
+}
+
+async fn seed_drive(pool: &sqlx::PgPool, seed: DriveSeed) {
+    sqlx::query(
+        "INSERT INTO drives (
+            vehicle_id, start_at, end_at, distance_km, duration_s, energy_used_kwh,
+            start_rated_range_km, end_rated_range_km, start_ideal_range_km, end_ideal_range_km,
+            start_odometer_km, end_odometer_km, outside_temp_avg_c, source
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+         )",
+    )
+    .bind(seed.vehicle_id)
+    .bind(seed.start)
+    .bind(seed.end)
+    .bind(seed.distance)
+    .bind(seed.duration_s)
+    .bind(seed.energy)
+    .bind(seed.start_rated)
+    .bind(seed.end_rated)
+    .bind(seed.start_ideal)
+    .bind(seed.end_ideal)
+    .bind(seed.start_odo)
+    .bind(seed.end_odo)
+    .bind(seed.temp)
+    .bind(seed.source)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 fn assert_positions_pkey_scan(plan: &serde_json::Value) {

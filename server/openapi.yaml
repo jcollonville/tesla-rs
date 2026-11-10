@@ -144,6 +144,56 @@ paths:
               schema: { $ref: "#/components/schemas/Stats" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v1/vehicles/{id}/stats/series:
+    get:
+      operationId: getVehicleStatsSeries
+      summary: Drive and charge totals by week, month, or year
+      description: |
+        One row per bucket, oldest first, including buckets with no trips.
+        Boundaries are calendar weeks (Monday), months, or years in `TESLA_TIMEZONE`
+        (default Europe/Paris). `count` defaults to 12 weeks, 12 months, or 5 years.
+        Drive energy uses `drives.energy_used_kwh` when stored, otherwise rated range
+        lost times vehicle efficiency, then ideal range lost times efficiency.
+        `charge_cost` uses `charges.cost`, or `energy_added_kwh * ENERGY_PRICE_PER_KWH`
+        when cost is null and that variable is set.
+      security: [{ bearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { $ref: "#/components/parameters/statsPeriod" }
+        - { $ref: "#/components/parameters/statsCount" }
+      responses:
+        "200":
+          description: Time series
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatsSeries" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/vehicles/{id}/stats/consumption_by_temp:
+    get:
+      operationId: getConsumptionByTemp
+      summary: Drive consumption by outside temperature over the same window
+      description: |
+        5°C bins of `drives.outside_temp_avg_c` for drives whose `start_at` falls in
+        the selected week, month, or year window. `temp_c_bucket` is the lower edge
+        (`floor(temp / 5) * 5`). Empty bins are omitted.
+      security: [{ bearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { $ref: "#/components/parameters/statsPeriod" }
+        - { $ref: "#/components/parameters/statsCount" }
+      responses:
+        "200":
+          description: Temperature bins, coldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ConsumptionByTemp" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /api/v1/geofences:
     get:
       operationId: listGeofences
@@ -202,6 +252,19 @@ components:
       name: per_page
       in: query
       schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+    statsPeriod:
+      name: period
+      in: query
+      required: true
+      schema: { type: string, enum: [week, month, year] }
+    statsCount:
+      name: count
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 120
+        description: Defaults to 12 for week and month, and 5 for year.
   responses:
     Unauthorized:
       description: Missing or revoked token
@@ -455,6 +518,89 @@ components:
         energy_used_kwh: { type: number }
         charge_count: { type: integer, format: int64 }
         energy_added_kwh: { type: number }
+    StatsSeries:
+      type: object
+      required: [period, buckets]
+      properties:
+        period: { type: string, enum: [week, month, year] }
+        buckets:
+          type: array
+          items: { $ref: "#/components/schemas/StatsBucket" }
+    StatsBucket:
+      type: object
+      required:
+        - start
+        - distance_km
+        - energy_used_kwh
+        - wh_per_km
+        - energy_charged_kwh
+        - drive_duration_s
+        - drive_count
+        - range_at_100_km
+        - ac_energy_kwh
+        - dc_energy_kwh
+        - dc_share_pct
+        - charge_cost
+        - cost_per_km
+        - idle_range_loss_km_per_day
+        - idle_energy_loss_kwh_per_day
+      properties:
+        start:
+          type: string
+          format: date-time
+          description: Bucket start in the configured timezone, with its UTC offset
+          example: "2026-11-01T00:00:00+01:00"
+        distance_km: { type: number, description: Sum of drives.distance_km }
+        energy_used_kwh:
+          type: number
+          nullable: true
+          description: Sum of drive consumption. 0 when the bucket has no drives
+        wh_per_km:
+          type: number
+          nullable: true
+          description: energy_used_kwh * 1000 / distance_km when distance is positive
+        energy_charged_kwh: { type: number, description: Sum of charges.energy_added_kwh }
+        drive_duration_s: { type: integer, format: int64 }
+        drive_count: { type: integer, format: int64 }
+        range_at_100_km:
+          type: number
+          nullable: true
+          description: >
+            Average of rated_range_km / battery_level * 100 over positions, charge
+            samples, and charge endpoints in the bucket. Samples at or below 10%
+            or above 100% state of charge are ignored.
+        ac_energy_kwh: { type: number, description: Energy added on AC charges }
+        dc_energy_kwh: { type: number, description: Energy added on DC fast charges }
+        dc_share_pct:
+          type: number
+          nullable: true
+          description: DC energy as a percent of AC plus DC. Null when no energy was added
+        charge_cost:
+          type: number
+          nullable: true
+          description: Sum of known charge costs. Null when none can be priced
+        cost_per_km:
+          type: number
+          nullable: true
+          description: charge_cost / distance_km when both exist
+        idle_range_loss_km_per_day:
+          type: number
+          nullable: true
+          description: >
+            Rated range lost between the end of one closed drive or charge and the
+            start of the next, per parked day. The car must not have moved a kilometre
+            or more. Null when the bucket has no such parked time.
+        idle_energy_loss_kwh_per_day:
+          type: number
+          nullable: true
+          description: idle_range_loss_km_per_day times vehicle efficiency
+    ConsumptionByTemp:
+      type: object
+      required: [temp_c_bucket, wh_per_km, distance_km]
+      properties:
+        temp_c_bucket: { type: integer, description: Lower edge of a 5°C bin, in Celsius }
+        wh_per_km: { type: number, nullable: true }
+        distance_km: { type: number }
     Geofence:
       type: object
       required: [id, name, latitude, longitude, radius_m]

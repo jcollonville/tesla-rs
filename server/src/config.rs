@@ -49,6 +49,10 @@ pub(crate) struct Config {
     pub telemetry_key_path: Option<PathBuf>,
     pub owner_stream_enabled: bool,
     pub owner_token_store_path: PathBuf,
+    /// IANA zone for stats buckets. `TESLA_TIMEZONE`, default `Europe/Paris`.
+    pub timezone: String,
+    /// Optional currency per kWh used when a charge has no stored cost.
+    pub energy_price_per_kwh: Option<f64>,
 }
 
 impl std::fmt::Debug for Config {
@@ -76,6 +80,8 @@ impl std::fmt::Debug for Config {
                 "mqtt_password",
                 &self.mqtt_password.as_ref().map(|_| "<redacted>"),
             )
+            .field("timezone", &self.timezone)
+            .field("energy_price_per_kwh", &self.energy_price_per_kwh)
             .finish_non_exhaustive()
     }
 }
@@ -170,6 +176,8 @@ impl Config {
             telemetry_key_path: optional(map, "TELEMETRY_KEY_PATH").map(PathBuf::from),
             owner_stream_enabled,
             owner_token_store_path,
+            timezone: timezone_name(map)?,
+            energy_price_per_kwh: optional_f64(map, "ENERGY_PRICE_PER_KWH")?,
         })
     }
 }
@@ -260,6 +268,44 @@ fn optional_u64(
     }
 }
 
+fn timezone_name(map: &BTreeMap<String, String>) -> Result<String, AppError> {
+    let value = optional(map, "TESLA_TIMEZONE").unwrap_or_else(|| "Europe/Paris".to_owned());
+    let ok = (1..=64).contains(&value.len())
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '+' | '-'));
+    if ok {
+        Ok(value)
+    } else {
+        Err(AppError::message(
+            "TESLA_TIMEZONE must be an IANA name such as Europe/Paris",
+        ))
+    }
+}
+
+fn optional_f64(
+    map: &BTreeMap<String, String>,
+    key: &'static str,
+) -> Result<Option<f64>, AppError> {
+    match optional(map, key) {
+        None => Ok(None),
+        Some(value) => {
+            let parsed = value
+                .parse::<f64>()
+                .map_err(|_| AppError::message(format!("{key} must be a non-negative number")))?;
+            if parsed.is_finite() && parsed >= 0.0 {
+                Ok(Some(parsed))
+            } else {
+                Err(AppError::message(format!(
+                    "{key} must be a non-negative number"
+                )))
+            }
+        }
+    }
+}
+
 fn optional_bool(
     map: &BTreeMap<String, String>,
     key: &'static str,
@@ -347,6 +393,8 @@ mod tests {
         assert!(!rendered.contains("encrypt-secret"));
         assert_eq!(config.redirect_uri, "https://tsl.b-612.fr/auth/callback");
         assert_eq!(config.region, tesla_auth::Region::Europe);
+        assert_eq!(config.timezone, "Europe/Paris");
+        assert_eq!(config.energy_price_per_kwh, None);
         assert!(config.owner_stream_enabled);
         assert_eq!(
             config.gps_fallback_poll,
