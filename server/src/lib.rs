@@ -30,6 +30,7 @@ mod owner_stream;
 mod passkeys;
 mod persist;
 mod position_mode;
+mod qr;
 mod rdp;
 mod settings;
 mod state;

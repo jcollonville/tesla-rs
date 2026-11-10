@@ -484,3 +484,68 @@ table.settings caption { text-align: left; margin-bottom: var(--space); }
 @media (max-width: 640px) {
   .global-nav { margin-top: calc(var(--space) / 2); }
 }
+
+.steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space);
+  margin: 0 0 calc(var(--space) * 2);
+  padding: 0;
+  list-style: none;
+  font-size: 0.875rem;
+}
+
+.steps li {
+  padding: calc(var(--space) / 2) var(--space);
+  border-radius: 999px;
+  background: var(--chip);
+}
+
+.steps [aria-current="step"] {
+  background: var(--primary-container);
+  color: var(--on-primary-container);
+  font-weight: 700;
+}
+
+.hint { margin: 0; color: var(--muted); font-size: 0.875rem; }
+
+.qr-frame { display: flex; justify-content: center; }
+svg.qr {
+  width: 220px;
+  height: 220px;
+  max-width: 100%;
+  background: #ffffff;
+}
+
+.secret-groups, .recovery-code {
+  font-family: ui-monospace, "Cascadia Mono", "Segoe UI Mono", monospace;
+  font-size: 1.125rem;
+  letter-spacing: 0.06em;
+  overflow-wrap: anywhere;
+}
+
+.recovery-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.actions { display: flex; flex-wrap: wrap; gap: var(--space); align-items: center; }
+.actions form { margin: 0; }
+
+label.check {
+  display: flex;
+  align-items: center;
+  gap: var(--space);
+  min-height: 48px;
+  font-weight: 600;
+}
+
+label.check input { width: 1.25rem; min-height: 1.25rem; }
+
+@media (max-width: 480px) {
+  .recovery-grid { grid-template-columns: 1fr; }
+}

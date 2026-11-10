@@ -173,6 +173,7 @@ async fn needs_setup(app: &AppState, headers: &HeaderMap, path: &str) -> bool {
         || path == "/security/password"
         || path == "/security/totp"
         || path == "/security/totp/confirm"
+        || path == "/security/setup/finish"
         || path == "/logout"
         || path == "/healthz"
         || assets::is_static(path)
@@ -483,5 +484,178 @@ mod tests {
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("Mot de passe incorrect"), "{body}");
         assert!(!body.contains("cross-origin request rejected"));
+    }
+
+    #[tokio::test]
+    async fn setup_wizard_checks_the_password_then_shows_codes_once() {
+        let Some(db) = crate::test_util::TestDb::migrated("setup-wizard").await else {
+            return;
+        };
+        let state = crate::app::test_state(db.pool.clone()).await;
+        let login = router(state.clone())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let csrf = set_cookie(login.headers(), "tl_csrf").expect("csrf");
+        let posted = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header(header::COOKIE, format!("tl_csrf={csrf}"))
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("password=test-password&csrf={csrf}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let session = set_cookie(posted.headers(), "__Host-tl_session").expect("session");
+        let cookies = format!("tl_csrf={csrf}; __Host-tl_session={session}");
+        let mismatch = post_form(
+            &state,
+            "/security/password",
+            &cookies,
+            &format!(
+                "current=test-password&password=correct-horse-1&confirm=other-password-1&csrf={csrf}"
+            ),
+        )
+        .await;
+        assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+        let mismatch_body = body_string(mismatch).await;
+        assert!(mismatch_body.contains("Les mots de passe ne correspondent pas."));
+        assert!(mismatch_body.contains("Confirmer le mot de passe"));
+        assert!(mismatch_body.contains("Mot de passe actuel"));
+        assert!(mismatch_body.contains("12 caractères minimum."));
+        let still: (bool,) =
+            sqlx::query_as("SELECT must_change_password FROM users WHERE username = 'admin'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(still.0);
+
+        let changed = post_form(
+            &state,
+            "/security/password",
+            &cookies,
+            &format!(
+                "current=test-password&password=correct-horse-1&confirm=correct-horse-1&csrf={csrf}"
+            ),
+        )
+        .await;
+        assert!(changed.status().is_redirection());
+        let qr_page = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/security/setup")
+                    .header(header::COOKIE, &cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            qr_page.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let qr_body = body_string(qr_page).await;
+        let svg_at = qr_body.find("<svg").expect("qr");
+        let svg_end = qr_body[svg_at..].find("</svg>").expect("qr end") + svg_at;
+        let svg = &qr_body[svg_at..=svg_end];
+        assert!(!svg.contains("http://"), "{svg}");
+        assert!(!svg.contains("https://"), "{svg}");
+        let secret = attr_value(&qr_body, "totp-secret").expect("secret");
+        let code = crate::identity::current_totp(&secret).expect("code");
+        let confirmed = post_form(
+            &state,
+            "/security/totp/confirm",
+            &cookies,
+            &format!("code={code}&csrf={csrf}"),
+        )
+        .await;
+        let confirmed_status = confirmed.status();
+        let codes_body = body_string(confirmed).await;
+        assert_eq!(confirmed_status, StatusCode::OK);
+        assert!(codes_body.contains("Ces codes ne sont affichés qu'une seule fois."));
+        assert!(codes_body.contains("J'ai sauvegardé mes codes"));
+        let codes = recovery_codes(&codes_body);
+        assert_eq!(codes.len(), 8, "{codes_body}");
+        let again = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/security/setup")
+                    .header(header::COOKIE, &cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let again_body = body_string(again).await;
+        for code in &codes {
+            assert!(!again_body.contains(code), "{code}");
+        }
+        assert!(!again_body.contains(&secret));
+    }
+
+    fn set_cookie(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+        headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|value| {
+                let text = value.to_str().ok()?;
+                let pair = text.split(';').next()?;
+                let (key, value) = pair.split_once('=')?;
+                (key.trim() == name).then(|| value.trim().to_owned())
+            })
+    }
+
+    async fn post_form(
+        state: &crate::app::AppState,
+        uri: &str,
+        cookies: &str,
+        form: &str,
+    ) -> axum::response::Response {
+        router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::COOKIE, cookies)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn body_string(response: axum::response::Response) -> String {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn attr_value(html: &str, id: &str) -> Option<String> {
+        let marker = format!("id=\"{id}\"");
+        let start = html.find(&marker)?;
+        let slice = &html[start..];
+        let key = "data-value=\"";
+        let value_at = slice.find(key)? + key.len();
+        let end = slice[value_at..].find('"')? + value_at;
+        Some(slice[value_at..end].to_owned())
+    }
+
+    fn recovery_codes(html: &str) -> Vec<String> {
+        let mut codes = Vec::new();
+        let mut rest = html;
+        while let Some(start) = rest.find("class=\"recovery-code\"") {
+            let after = &rest[start..];
+            let open = after.find('>').unwrap_or(0) + 1;
+            let close = after[open..].find("</code>").unwrap_or(0) + open;
+            let code = after[open..close].trim();
+            if !code.is_empty() {
+                codes.push(code.to_owned());
+            }
+            rest = &after[close..];
+        }
+        codes
     }
 }

@@ -6,6 +6,7 @@
 //! Session ids are stored as SHA-256 hashes. TOTP secrets are AES-GCM ciphertext.
 //! The audit log is insert-only from this module.
 
+use std::fmt::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tesla_auth::ExposeSecret;
@@ -280,8 +281,10 @@ pub(crate) async fn change_password(
     user_id: i64,
     password: &str,
 ) -> Result<(), AppError> {
-    if password.len() < 12 {
-        return Err(AppError::message("password must be at least 12 characters"));
+    if password.chars().count() < 12 {
+        return Err(AppError::message(
+            "Le mot de passe doit contenir au moins 12 caractères.",
+        ));
     }
     let hash = hash_password(password)?;
     sqlx::query("UPDATE users SET password_hash = $2, must_change_password = false WHERE id = $1")
@@ -293,73 +296,170 @@ pub(crate) async fn change_password(
     Ok(())
 }
 
-pub(crate) struct TotpEnrollment {
-    pub secret: String,
-    pub recovery: Vec<String>,
+pub(crate) async fn password_matches(
+    pool: &PgPool,
+    user_id: i64,
+    password: &str,
+) -> Result<bool, AppError> {
+    let hash: (String,) = sqlx::query_as("SELECT password_hash FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(verify_password(&hash.0, password))
 }
 
-pub(crate) async fn enroll_totp(app: &AppState, user_id: i64) -> Result<TotpEnrollment, AppError> {
-    let secret = crypto::random_token().map_err(|_| AppError::message("entropy failed"))?;
-    let secret = secret.into_bytes();
-    let key = totp_key(&app.inner.config)?;
-    let sealed =
-        crypto::seal(&key, &secret).map_err(|_| AppError::message("could not store totp"))?;
-    let mut recovery = Vec::new();
-    sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1 AND used_at IS NULL")
-        .bind(user_id)
-        .execute(&app.inner.db)
-        .await?;
-    for _ in 0..8 {
-        let code = recovery_code()?;
-        sqlx::query("INSERT INTO recovery_codes (user_id, code_hash) VALUES ($1, $2)")
-            .bind(user_id)
-            .bind(sha256_hex(&code))
-            .execute(&app.inner.db)
-            .await?;
-        recovery.push(code);
-    }
-    let preview = crypto::seal(&key, recovery.join("\n").as_bytes())
-        .map_err(|_| AppError::message("could not store recovery codes"))?;
-    sqlx::query(
-        "UPDATE users SET totp_secret = $2, totp_enabled = false, recovery_preview = $3 WHERE id = $1",
+/// `otpauth://` URI for an authenticator app. The issuer is Tesla Logger.
+pub(crate) fn otpauth_uri(username: &str, secret: &str) -> String {
+    format!(
+        "otpauth://totp/{}:{}?secret={secret}&issuer={}&algorithm=SHA1&digits=6&period=30",
+        uri_encode("Tesla Logger"),
+        uri_encode(username),
+        uri_encode("Tesla Logger"),
     )
+}
+
+pub(crate) fn grouped_secret(secret: &str) -> String {
+    secret
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(4)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Keeps one pending secret on this session for 15 minutes.
+///
+/// A later call returns the same secret until it expires, unless `force` is set.
+pub(crate) async fn ensure_pending_totp(
+    app: &AppState,
+    session_id: &str,
+    user_id: i64,
+    force: bool,
+) -> Result<String, AppError> {
+    let hash = sha256_hex(session_id);
+    if !force
+        && let Some(secret) =
+            pending_secret(&app.inner.db, &app.inner.config, &hash, user_id).await?
+    {
+        return Ok(base32(&secret));
+    }
+    let raw = crypto::random_token().map_err(|_| AppError::message("entropy failed"))?;
+    let raw = raw.into_bytes();
+    let key = totp_key(&app.inner.config)?;
+    let sealed = crypto::seal(&key, &raw).map_err(|_| AppError::message("could not store totp"))?;
+    let updated = sqlx::query(
+        "UPDATE sessions
+         SET totp_pending = $2, totp_pending_until = now() + interval '15 minutes'
+         WHERE id_hash = $1 AND user_id = $3",
+    )
+    .bind(&hash)
+    .bind(&sealed)
     .bind(user_id)
-    .bind(sealed)
-    .bind(preview)
     .execute(&app.inner.db)
-    .await?;
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        return Err(AppError::message("session expired"));
+    }
     audit(&app.inner.db, Some(user_id), "2fa.enroll", "ok", "{}").await;
-    Ok(TotpEnrollment {
-        secret: base32(&secret),
-        recovery,
-    })
+    Ok(base32(&raw))
+}
+
+pub(crate) enum TotpConfirm {
+    Accepted(Vec<String>),
+    Rejected,
+    Expired,
 }
 
 pub(crate) async fn confirm_totp(
     app: &AppState,
+    session_id: &str,
     user_id: i64,
     code: &str,
-) -> Result<bool, AppError> {
-    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT totp_secret FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(&app.inner.db)
-        .await?;
-    let Some((sealed,)) = row else {
-        return Ok(false);
+) -> Result<TotpConfirm, AppError> {
+    let hash = sha256_hex(session_id);
+    let Some(secret) = pending_secret(&app.inner.db, &app.inner.config, &hash, user_id).await?
+    else {
+        return Ok(TotpConfirm::Expired);
     };
-    let key = totp_key(&app.inner.config)?;
-    let secret = crypto::open_payload(&sealed, Some(&key))
-        .map_err(|_| AppError::message("totp unreadable"))?;
     if !totp_matches(&secret, code, unix_now()) {
         audit(&app.inner.db, Some(user_id), "2fa.confirm", "failure", "{}").await;
-        return Ok(false);
+        return Ok(TotpConfirm::Rejected);
     }
-    sqlx::query("UPDATE users SET totp_enabled = true, recovery_preview = NULL WHERE id = $1")
+    let key = totp_key(&app.inner.config)?;
+    let sealed =
+        crypto::seal(&key, &secret).map_err(|_| AppError::message("could not store totp"))?;
+    let mut codes = Vec::with_capacity(8);
+    for _ in 0..8 {
+        codes.push(recovery_code()?);
+    }
+    let mut tx = app.inner.db.begin().await?;
+    sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1 AND used_at IS NULL")
         .bind(user_id)
-        .execute(&app.inner.db)
+        .execute(&mut *tx)
         .await?;
+    for code in &codes {
+        sqlx::query("INSERT INTO recovery_codes (user_id, code_hash) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(sha256_hex(code))
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(
+        "UPDATE users
+         SET totp_secret = $2, totp_enabled = true, recovery_preview = NULL
+         WHERE id = $1",
+    )
+    .bind(user_id)
+    .bind(&sealed)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE sessions SET totp_pending = NULL, totp_pending_until = NULL WHERE id_hash = $1",
+    )
+    .bind(&hash)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     audit(&app.inner.db, Some(user_id), "2fa.confirm", "ok", "{}").await;
-    Ok(true)
+    Ok(TotpConfirm::Accepted(codes))
+}
+
+async fn pending_secret(
+    pool: &PgPool,
+    config: &Config,
+    session_hash: &str,
+    user_id: i64,
+) -> Result<Option<Vec<u8>>, AppError> {
+    let row: Option<(Vec<u8>,)> = sqlx::query_as(
+        "SELECT totp_pending FROM sessions
+         WHERE id_hash = $1 AND user_id = $2
+           AND totp_pending IS NOT NULL AND totp_pending_until > now()",
+    )
+    .bind(session_hash)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((sealed,)) = row else {
+        return Ok(None);
+    };
+    let key = totp_key(config)?;
+    let secret = crypto::open_payload(&sealed, Some(&key))
+        .map_err(|_| AppError::message("totp unreadable"))?;
+    Ok(Some(secret))
+}
+
+fn uri_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
 }
 
 pub(crate) async fn create_user(
@@ -745,6 +845,33 @@ async fn throttle_clear(pool: &PgPool, subject: &str) -> Result<(), AppError> {
 }
 
 #[cfg(test)]
+pub(crate) fn current_totp(secret_b32: &str) -> Option<String> {
+    let bytes = decode_base32(secret_b32)?;
+    Some(format!("{:06}", hotp(&bytes, unix_now() / 30)))
+}
+
+#[cfg(test)]
+fn decode_base32(value: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut buffer = 0_u32;
+    let mut bits = 0;
+    let mut out = Vec::new();
+    for ch in value.chars() {
+        if ch == ' ' {
+            continue;
+        }
+        let index = ALPHABET.iter().position(|item| *item == ch as u8)?;
+        buffer = (buffer << 5) | u32::try_from(index).unwrap_or(0);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
 mod tests {
     use super::{base32, hotp, origin_allowed, totp_matches};
     use axum::http::{HeaderMap, Method};
@@ -757,6 +884,10 @@ mod tests {
         assert!(totp_matches(secret, &format!("{code:06}"), now));
         assert!(!totp_matches(secret, "000000", now));
         assert_eq!(base32(b"f"), "MY");
+        let raw = b"abcdefghijklmnopqrstuvwxyz0123456789!!!";
+        let encoded = base32(raw);
+        let code = super::current_totp(&encoded).expect("code");
+        assert!(totp_matches(raw, &code, super::unix_now()));
     }
 
     #[test]
