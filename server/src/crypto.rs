@@ -29,6 +29,7 @@ const MAGIC: &[u8; 4] = b"TLG1";
 /// to poll.
 pub(crate) type TokenSaved = std::sync::Arc<dyn Fn(std::time::SystemTime) + Send + Sync>;
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TokenFile {
     path: PathBuf,
     key: Option<[u8; 32]>,
@@ -55,10 +56,7 @@ impl Drop for TokenFile {
     }
 }
 
-/// Shares one [`TokenFile`] between the OAuth session and the status page.
-#[derive(Clone)]
-pub(crate) struct SharedTokenStore(pub std::sync::Arc<TokenFile>);
-
+#[cfg_attr(not(test), allow(dead_code))]
 impl TokenFile {
     pub(crate) fn open(
         path: impl Into<PathBuf>,
@@ -80,6 +78,7 @@ impl TokenFile {
     }
 
     /// Called after a token set is stored. The hook receives the access-token expiry only.
+    #[allow(dead_code)]
     pub(crate) fn on_saved(&self, hook: TokenSaved) {
         *self
             .saved
@@ -135,17 +134,18 @@ impl TokenFile {
     }
 }
 
-impl TokenStore for SharedTokenStore {
+#[cfg_attr(not(test), allow(dead_code))]
+impl TokenStore for TokenFile {
     async fn load(&self) -> Result<Option<TokenSet>, AuthError> {
-        self.0.load().await
+        TokenFile::load(self).await
     }
 
     async fn save(&self, tokens: &TokenSet) -> Result<(), AuthError> {
-        self.0.save(tokens).await
+        TokenFile::save(self, tokens).await
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
-        self.0.clear().await
+        TokenFile::clear(self).await
     }
 }
 
@@ -187,6 +187,11 @@ pub(crate) fn sha256_hex(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
+/// SHA-256 of the public PEM. The private key is never hashed or returned.
+pub(crate) fn public_key_fingerprint(pem: &str) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(pem.as_bytes())))
+}
+
 pub(crate) fn ct_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -204,7 +209,7 @@ pub(crate) fn password_matches(expected: &str, presented: &str) -> bool {
     ct_eq(&left, &right)
 }
 
-fn derive_key(material: &str) -> Result<[u8; 32], AppError> {
+pub(crate) fn derive_key(material: &str) -> Result<[u8; 32], AppError> {
     if material.len() == 64 && material.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         let mut key = [0u8; 32];
         hex::decode_to_slice(material, &mut key)
@@ -217,7 +222,7 @@ fn derive_key(material: &str) -> Result<[u8; 32], AppError> {
     Ok(key)
 }
 
-fn seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|_| "encryption key was rejected".to_owned())?;
     let mut nonce_bytes = [0u8; 12];
@@ -233,7 +238,7 @@ fn seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn open_payload(bytes: &[u8], key: Option<&[u8; 32]>) -> Result<Vec<u8>, String> {
+pub(crate) fn open_payload(bytes: &[u8], key: Option<&[u8; 32]>) -> Result<Vec<u8>, String> {
     if bytes.starts_with(MAGIC) {
         let Some(key) = key else {
             return Err("token file is encrypted; set TESLA_TOKEN_ENCRYPTION_KEY".to_owned());
@@ -274,7 +279,7 @@ impl Drop for StoredTokens {
     }
 }
 
-fn tokens_to_json(tokens: &TokenSet) -> Result<Vec<u8>, String> {
+pub(crate) fn tokens_to_json(tokens: &TokenSet) -> Result<Vec<u8>, String> {
     let stored = StoredTokens {
         access_token: tokens.access_token().expose_secret().to_owned(),
         refresh_token: tokens
@@ -294,7 +299,7 @@ fn tokens_to_json(tokens: &TokenSet) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&stored).map_err(|_| "token set could not be encoded".to_owned())
 }
 
-fn tokens_from_json(bytes: &[u8]) -> Result<TokenSet, AuthError> {
+pub(crate) fn tokens_from_json(bytes: &[u8]) -> Result<TokenSet, AuthError> {
     let mut stored: StoredTokens =
         serde_json::from_slice(bytes).map_err(|_| AuthError::TokenStore {
             message: "token file is not a valid token set".to_owned(),
@@ -313,6 +318,7 @@ fn tokens_from_json(bytes: &[u8]) -> Result<TokenSet, AuthError> {
     Ok(TokenSet::bearer(access, refresh, expires_at, scopes))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -333,6 +339,7 @@ async fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn temporary_path(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
@@ -341,6 +348,7 @@ fn temporary_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn restrict(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -355,6 +363,7 @@ fn restrict(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn store_err(err: impl std::fmt::Display) -> AuthError {
     AuthError::TokenStore {
         message: err.to_string(),

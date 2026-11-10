@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
-use tesla_auth::{Scope, TokenSet};
+use tesla_auth::{Scope, TokenSet, TokenStore};
 use tesla_owner_api::{
     FailureClass, OwnerClient, OwnerError, OwnerRegion, OwnerTokens, PumpEnd, STREAM_COLUMNS,
     SecretString, StreamEvent, StreamSample, StreamStop, StreamTrace, plan_reconnect, pump_stream,
@@ -25,7 +25,6 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 use crate::config::Config;
-use crate::crypto::TokenFile;
 use crate::debug::{DebugBoard, OwnerCount, OwnerNote};
 use crate::ingest::{Archive, apply_stream_for_vin};
 use crate::persist::{StreamFix, VehicleIdentity, upsert_vehicle};
@@ -58,8 +57,6 @@ pub(crate) struct StreamSnapshot {
     enabled: bool,
     configured: bool,
     vehicles: HashMap<i64, (String, Option<String>)>,
-    /// `hybrid` or `fallback` per database id. Empty means fallback.
-    pub(crate) modes: HashMap<i64, String>,
 }
 
 impl StreamSnapshot {
@@ -72,13 +69,6 @@ impl StreamSnapshot {
             .get(&vehicle_id)
             .cloned()
             .unwrap_or_else(|| ("error".to_owned(), Some("connecting".to_owned())))
-    }
-
-    /// `hybrid` while the Owner stream is the drive GPS source, otherwise `fallback`.
-    pub(crate) fn position_mode(&self, vehicle_id: i64) -> &str {
-        self.modes
-            .get(&vehicle_id)
-            .map_or("fallback", String::as_str)
     }
 
     /// Page-level status. Per-vehicle state is on [`Self::for_vehicle`].
@@ -146,7 +136,6 @@ impl StreamBoard {
                 .iter()
                 .map(|(id, slot)| (*id, (slot.status.clone(), slot.detail.clone())))
                 .collect(),
-            modes: HashMap::new(),
         }
     }
 }
@@ -163,14 +152,14 @@ enum SessionError {
     Other(String),
 }
 
-struct OwnerSession {
+struct OwnerSession<S> {
     client: OwnerClient,
-    store: TokenFile,
+    store: S,
     lock: Mutex<()>,
     debug: DebugBoard,
 }
 
-impl OwnerSession {
+impl<S: TokenStore> OwnerSession<S> {
     async fn access_token(&self) -> Result<SecretString, SessionError> {
         let _guard = self.lock.lock().await;
         self.load_token(false).await
@@ -214,7 +203,7 @@ impl OwnerSession {
         );
         if let Err(err) = self.store.save(&saved).await {
             self.debug
-                .token_failed("owner", "owner token file could not be saved");
+                .token_failed("owner", "owner token could not be saved");
             return Err(SessionError::Other(err.to_string()));
         }
         Ok(updated.access_token().clone())
@@ -247,16 +236,45 @@ pub(crate) async fn run(
         debug.set_owner_overview("disabled", None, true);
         return;
     }
+    let Some(account_id) = archive.owner_account_id else {
+        board.set_mode(true, false).await;
+        debug.set_owner_overview("disabled", Some("no owner account".to_owned()), true);
+        return;
+    };
+    let store = match crate::accounts::DbTokenStore::open(
+        archive.db.clone(),
+        account_id,
+        config.token_encryption_key.as_deref(),
+    ) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!(
+                error = %crate::logs::redact_line(&err.to_string(), &[]),
+                "owner token store could not be opened"
+            );
+            board.set_mode(true, true).await;
+            debug.set_owner_overview(
+                "error",
+                Some("owner token store could not be opened".to_owned()),
+                true,
+            );
+            return;
+        }
+    };
+    let saved = debug.clone();
+    store.on_saved(std::sync::Arc::new(move |expires| {
+        saved.token_saved("owner", expires);
+    }));
     loop {
         if *shutdown.borrow() {
             break;
         }
-        match tokens_ready(config).await {
+        match tokens_ready(&store).await {
             TokenFileState::Absent => {
                 board.set_mode(true, false).await;
                 debug.set_owner_overview(
                     "disabled",
-                    Some("owner token file is absent".to_owned()),
+                    Some("owner token is absent".to_owned()),
                     true,
                 );
                 if !wait_signal(&mut tokens, &mut shutdown, None).await {
@@ -266,7 +284,7 @@ pub(crate) async fn run(
             }
             TokenFileState::Unreadable(message) => {
                 let message = crate::logs::redact_line(&message, &[]);
-                tracing::warn!(error = %message, "owner token file could not be read");
+                tracing::warn!(error = %message, "owner token could not be read");
                 board.set_mode(true, true).await;
                 debug.set_owner_overview("error", Some(message), true);
                 if !wait_signal(&mut tokens, &mut shutdown, Some(Duration::from_secs(900))).await {
@@ -282,8 +300,7 @@ pub(crate) async fn run(
         let (stop_tx, stop_rx) = watch::channel(false);
         let task = tokio::spawn(supervise(
             config.region,
-            config.owner_token_store_path.clone(),
-            config.token_encryption_key.clone(),
+            store.clone(),
             Arc::clone(&archive),
             board.clone(),
             debug.clone(),
@@ -325,10 +342,9 @@ pub(crate) async fn run(
     }
 }
 
-async fn supervise(
+async fn supervise<S: TokenStore + 'static>(
     region: tesla_auth::Region,
-    token_path: std::path::PathBuf,
-    encryption_key: Option<String>,
+    store: S,
     archive: Arc<Archive>,
     board: StreamBoard,
     debug: DebugBoard,
@@ -344,17 +360,6 @@ async fn supervise(
             return;
         }
     };
-    let store = match TokenFile::open(&token_path, encryption_key.as_deref()) {
-        Ok(store) => store,
-        Err(err) => {
-            tracing::warn!(error = %err, "owner token file could not be opened");
-            return;
-        }
-    };
-    let saved = debug.clone();
-    store.on_saved(std::sync::Arc::new(move |expires| {
-        saved.token_saved("owner", expires);
-    }));
     let session = Arc::new(OwnerSession {
         client: client.clone(),
         store,
@@ -410,9 +415,9 @@ async fn supervise(
     }
 }
 
-async fn vehicle_loop(
+async fn vehicle_loop<S: TokenStore + 'static>(
     target: Target,
-    session: Arc<OwnerSession>,
+    session: Arc<OwnerSession<S>>,
     archive: Arc<Archive>,
     board: StreamBoard,
     debug: DebugBoard,
@@ -826,9 +831,9 @@ async fn backoff(
     }
 }
 
-async fn targets(
+async fn targets<S: TokenStore>(
     client: &OwnerClient,
-    session: &OwnerSession,
+    session: &OwnerSession<S>,
     archive: &Archive,
 ) -> Result<Vec<Target>, SessionError> {
     let access = session.access_token().await?;
@@ -844,6 +849,7 @@ async fn targets(
                         legacy_vehicle_id: None,
                         name: None,
                     },
+                    archive.fleet_account_id,
                 )
                 .await
                 .map_err(|err| SessionError::Other(err.to_string()))?;
@@ -1009,14 +1015,7 @@ fn session_err(err: &OwnerError) -> SessionError {
     }
 }
 
-async fn tokens_ready(config: &Config) -> TokenFileState {
-    let store = match TokenFile::open(
-        &config.owner_token_store_path,
-        config.token_encryption_key.as_deref(),
-    ) {
-        Ok(store) => store,
-        Err(err) => return TokenFileState::Unreadable(err.to_string()),
-    };
+async fn tokens_ready(store: &impl TokenStore) -> TokenFileState {
     match store.load().await {
         Ok(Some(_)) => TokenFileState::Ready,
         Ok(None) => TokenFileState::Absent,
@@ -1127,7 +1126,6 @@ mod tests {
 
     #[tokio::test]
     async fn parked_socket_is_connected_before_a_gps_sample() {
-        use std::collections::HashMap;
         use std::sync::Arc;
         use std::time::{Duration, SystemTime};
 
@@ -1180,14 +1178,13 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/unused")
             .unwrap();
-        let archive = Arc::new(crate::ingest::Archive {
-            db: pool,
-            geocoder: crate::geocode::Geocoder::disabled(),
+        let archive = Arc::new(crate::ingest::Archive::new(
+            pool,
+            crate::geocode::Geocoder::disabled(),
             events,
-            runtimes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            stream_kick: kick,
-            gps: crate::position_mode::GpsBoard::default(),
-        });
+            kick,
+            crate::position_mode::GpsBoard::default(),
+        ));
         let board = StreamBoard::default();
         board.set_mode(true, true).await;
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);

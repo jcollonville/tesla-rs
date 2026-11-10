@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 pub(crate) mod api;
+mod markup;
 mod owner;
 pub(crate) mod stats;
 mod ui;
@@ -11,14 +12,14 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
-use axum::middleware::{Next, from_fn, from_fn_with_state};
+use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 
 use crate::app::AppState;
-use crate::crypto::sha256_hex;
+use crate::crypto::{random_token, sha256_hex};
 use crate::error::redact_secrets;
 
 pub(crate) fn router(state: AppState) -> Router {
@@ -48,7 +49,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/openapi.yaml", get(openapi))
         .merge(ui::routes())
         .merge(api)
-        .layer(from_fn(security_headers))
+        .layer(from_fn_with_state(state.clone(), security_headers))
         .with_state(state)
 }
 
@@ -90,9 +91,15 @@ async fn openapi() -> Response {
         .into_response()
 }
 
-async fn security_headers(request: Request<Body>, next: Next) -> Response {
+async fn security_headers(
+    State(app): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
     let path = request.uri().path().to_owned();
     let method = request.method().clone();
+    let https = request_is_https(&request, &app.inner.config.public_base_url);
+    let nonce = random_token().unwrap_or_else(|_| "nonce".to_owned());
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(
@@ -104,10 +111,47 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
         HeaderValue::from_static("no-referrer"),
     );
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    if let Ok(csp) = HeaderValue::from_str(&format!(
+        "default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; frame-ancestors 'none'"
+    )) {
+        headers.insert("content-security-policy", csp);
+    }
+    headers.insert(
+        "permissions-policy",
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=(), usb=()"),
+    );
+    if https {
+        headers.insert(
+            "strict-transport-security",
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    if private_page(&path) && !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     if path != "/healthz" && !path.ends_with("public-key.pem") {
         tracing::info!(%method, %path, status = %response.status(), "request");
     }
     response
+}
+
+fn request_is_https(request: &Request<Body>, public_base: &str) -> bool {
+    if public_base.starts_with("https://") || request.uri().scheme_str() == Some("https") {
+        return true;
+    }
+    request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("https"))
+}
+
+fn private_page(path: &str) -> bool {
+    !path.starts_with("/api/")
+        && !path.starts_with("/static/")
+        && path != "/healthz"
+        && path != "/api/openapi.yaml"
+        && !path.starts_with("/.well-known/")
 }
 
 async fn require_bearer(
@@ -210,3 +254,84 @@ struct ErrorBody {
 }
 
 pub(crate) const OPENAPI: &str = include_str!("../../openapi.yaml");
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use super::router;
+    use crate::app::test_state;
+
+    #[tokio::test]
+    async fn csp_uses_a_nonce_and_hsts_follows_https() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let state = test_state(pool).await;
+        let plain = router(state.clone())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let csp = plain
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(csp.contains("default-src 'self'"), "{csp}");
+        assert!(csp.contains("script-src 'self' 'nonce-"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("object-src 'none'"), "{csp}");
+        assert!(!csp.contains("unsafe-inline"), "{csp}");
+        assert!(plain.headers().get("permissions-policy").is_some());
+        assert!(plain.headers().get("strict-transport-security").is_none());
+        assert_eq!(
+            plain.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(plain.status(), StatusCode::OK);
+
+        let secure = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/settings")
+                    .header("x-forwarded-proto", "https")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let hsts = secure
+            .headers()
+            .get("strict-transport-security")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(hsts.contains("max-age=31536000"), "{hsts}");
+        let again = secure
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_ne!(csp, again, "each response gets its own nonce");
+
+        let css = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/static/ui.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cache = css.headers().get(header::CACHE_CONTROL).unwrap();
+        assert_eq!(cache, "public, max-age=86400");
+        let body = css.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("color-scheme"));
+    }
+}

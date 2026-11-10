@@ -841,10 +841,20 @@ mod tests {
         .await;
         assert!(posted.status().is_redirection());
         let session = header_cookie(posted.headers(), "tl_session").expect("session");
-        let page = call(
+        let legacy = call(
             &state,
             "GET",
             "/logs",
+            Some(&format!("tl_session={session}")),
+            None,
+        )
+        .await;
+        assert_eq!(legacy.status(), axum::http::StatusCode::SEE_OTHER);
+        assert_eq!(legacy.headers().get("location").unwrap(), "/debug");
+        let page = call(
+            &state,
+            "GET",
+            "/debug",
             Some(&format!("tl_session={session}")),
             None,
         )
@@ -873,8 +883,9 @@ mod tests {
         assert!(html.contains("Owner stream"));
         assert!(html.contains("Connection history"));
         assert!(html.contains(">Debug</h1>") || html.contains("Debug</h1>"));
-        assert!(html.contains("href=\"/auth/owner\""));
+        assert!(html.contains("href=\"/debug\""));
         assert!(html.contains("href=\"/\""));
+        assert!(html.contains("content=\"width=device-width"));
         assert!(html.contains("&lt;note&gt;"));
         assert!(!html.contains("<note>"));
         assert_secret_free(&html);
@@ -887,9 +898,20 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(owner.status(), axum::http::StatusCode::OK);
-        let owner_html = body_text(owner).await;
-        assert!(owner_html.contains("href=\"/logs\""));
+        assert_eq!(owner.status(), axum::http::StatusCode::SEE_OTHER);
+        assert_eq!(owner.headers().get("location").unwrap(), "/connection");
+        let connection = call(
+            &state,
+            "GET",
+            "/connection",
+            Some(&format!("tl_session={session}")),
+            None,
+        )
+        .await;
+        assert_eq!(connection.status(), axum::http::StatusCode::OK);
+        let owner_html = body_text(connection).await;
+        assert!(owner_html.contains("href=\"/debug\""));
+        assert!(owner_html.contains("action=\"/auth/owner/start\""));
         assert_secret_free(&owner_html);
     }
 

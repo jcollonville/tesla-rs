@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Jean Collonvillé
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -53,6 +53,8 @@ pub(crate) struct Config {
     pub timezone: String,
     /// Optional currency per kWh used when a charge has no stored cost.
     pub energy_price_per_kwh: Option<f64>,
+    /// Keys present in the environment or dotenv file. Values are not stored here.
+    explicit_env: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -178,8 +180,132 @@ impl Config {
             owner_token_store_path,
             timezone: timezone_name(map)?,
             energy_price_per_kwh: optional_f64(map, "ENERGY_PRICE_PER_KWH")?,
+            explicit_env: map.keys().cloned().collect(),
         })
     }
+
+    pub(crate) fn public_settings(&self) -> Vec<PublicSetting> {
+        let mut rows = Vec::new();
+        let mut push = |label: &'static str, key: &str, value: String| {
+            rows.push(PublicSetting {
+                label,
+                value,
+                source: self.source_label(key),
+            });
+        };
+        push("Domaine", "TESLA_DOMAIN", self.domain.clone());
+        push(
+            "URL publique",
+            "TESLA_PUBLIC_BASE_URL",
+            self.public_base_url.clone(),
+        );
+        push("Région", "TESLA_FLEET_AUDIENCE", self.region.to_string());
+        push("Client ID", "TESLA_CLIENT_ID", self.client_id.clone());
+        push("Écoute", "TESLA_LISTEN_ADDR", self.listen_addr.to_string());
+        push(
+            "Poll conduite (s)",
+            "POLL_DRIVE_SECS",
+            self.drive_poll.as_secs().to_string(),
+        );
+        push(
+            "Poll charge (s)",
+            "POLL_CHARGE_SECS",
+            self.charge_poll.as_secs().to_string(),
+        );
+        push(
+            "Poll à l'arrêt (s)",
+            "POLL_PARKED_SECS",
+            self.parked_poll.as_secs().to_string(),
+        );
+        push(
+            "Poll endormi (s)",
+            "POLL_ASLEEP_SECS",
+            self.asleep_poll.as_secs().to_string(),
+        );
+        push(
+            "Poll repli (s)",
+            "POLL_BACKOFF_SECS",
+            self.backoff_poll.as_secs().to_string(),
+        );
+        push(
+            "Lectures à l'arrêt",
+            "POLL_PARKED_LIVE_LIMIT",
+            self.parked_live_limit.to_string(),
+        );
+        push(
+            "Repli GPS (s)",
+            "POLL_GPS_FALLBACK_SECS",
+            self.gps_fallback_poll.as_secs().to_string(),
+        );
+        push("Fuseau", "TESLA_TIMEZONE", self.timezone.clone());
+        push(
+            "Prix du kWh",
+            "ENERGY_PRICE_PER_KWH",
+            self.energy_price_per_kwh
+                .map_or_else(|| "—".to_owned(), |price| price.to_string()),
+        );
+        push(
+            "Nominatim",
+            "NOMINATIM_ENABLED",
+            self.nominatim_enabled.to_string(),
+        );
+        push("Nominatim URL", "NOMINATIM_URL", self.nominatim_url.clone());
+        push(
+            "Nominatim contact",
+            "NOMINATIM_CONTACT",
+            self.nominatim_contact
+                .clone()
+                .unwrap_or_else(|| "—".to_owned()),
+        );
+        push(
+            "Nominatim intervalle (ms)",
+            "NOMINATIM_MIN_INTERVAL_MS",
+            self.nominatim_min_interval.as_millis().to_string(),
+        );
+        push("MQTT", "MQTT_ENABLED", self.mqtt_enabled.to_string());
+        push("MQTT hôte", "MQTT_HOST", self.mqtt_host.clone());
+        push("MQTT port", "MQTT_PORT", self.mqtt_port.to_string());
+        push(
+            "MQTT utilisateur",
+            "MQTT_USERNAME",
+            self.mqtt_username.clone().unwrap_or_else(|| "—".to_owned()),
+        );
+        push(
+            "MQTT préfixe",
+            "MQTT_TOPIC_PREFIX",
+            self.mqtt_prefix.clone(),
+        );
+        push(
+            "Télémétrie",
+            "TELEMETRY_ENABLED",
+            self.telemetry_enabled.to_string(),
+        );
+        push(
+            "Télémétrie écoute",
+            "TELEMETRY_BIND",
+            self.telemetry_bind.to_string(),
+        );
+        push(
+            "Stream Owner",
+            "OWNER_STREAM_ENABLED",
+            self.owner_stream_enabled.to_string(),
+        );
+        rows
+    }
+
+    fn source_label(&self, key: &str) -> &'static str {
+        if self.explicit_env.contains(key) {
+            "env"
+        } else {
+            "défaut"
+        }
+    }
+}
+
+pub(crate) struct PublicSetting {
+    pub label: &'static str,
+    pub value: String,
+    pub source: &'static str,
 }
 
 fn owner_token_path(fleet_tokens: &std::path::Path) -> PathBuf {
@@ -391,6 +517,17 @@ mod tests {
         assert!(!rendered.contains("db-secret"));
         assert!(!rendered.contains("ui-secret-value"));
         assert!(!rendered.contains("encrypt-secret"));
+        let settings = config
+            .public_settings()
+            .into_iter()
+            .map(|row| row.value)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!settings.contains("client-secret-value"));
+        assert!(!settings.contains("db-secret"));
+        assert!(!settings.contains("ui-secret-value"));
+        assert!(!settings.contains("encrypt-secret"));
+        assert!(settings.contains("tsl.b-612.fr"));
         assert_eq!(config.redirect_uri, "https://tsl.b-612.fr/auth/callback");
         assert_eq!(config.region, tesla_auth::Region::Europe);
         assert_eq!(config.timezone, "Europe/Paris");

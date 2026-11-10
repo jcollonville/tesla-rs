@@ -11,6 +11,7 @@
 
 pub mod cli;
 
+mod accounts;
 mod app;
 mod config;
 mod crypto;

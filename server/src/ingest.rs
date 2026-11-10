@@ -152,6 +152,34 @@ pub(crate) struct Archive {
     pub stream_kick: broadcast::Sender<String>,
     /// Owner-stream GPS mode. Fallback wakes the poller through this board.
     pub gps: crate::position_mode::GpsBoard,
+    /// Fleet account that discovers these vehicles. `None` in tests that do not poll.
+    pub fleet_account_id: Option<i64>,
+    /// Owner-stream account. `None` when streaming is not wired.
+    pub owner_account_id: Option<i64>,
+    /// 429 pause deadlines keyed by Tesla account id.
+    pub account_backoff: Arc<Mutex<HashMap<i64, Instant>>>,
+}
+
+impl Archive {
+    pub(crate) fn new(
+        db: PgPool,
+        geocoder: Geocoder,
+        events: broadcast::Sender<LiveEvent>,
+        stream_kick: broadcast::Sender<String>,
+        gps: crate::position_mode::GpsBoard,
+    ) -> Self {
+        Self {
+            db,
+            geocoder,
+            events,
+            runtimes: Arc::new(Mutex::new(HashMap::new())),
+            stream_kick,
+            gps,
+            fleet_account_id: None,
+            owner_account_id: None,
+            account_backoff: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 pub(crate) async fn apply_for_vin(
@@ -162,7 +190,7 @@ pub(crate) async fn apply_for_vin(
     live: bool,
     from_telemetry: bool,
 ) -> Result<(), AppError> {
-    let vehicle_id = upsert_vehicle(&archive.db, identity).await?;
+    let vehicle_id = upsert_vehicle(&archive.db, identity, archive.fleet_account_id).await?;
     let mut guard = archive.runtimes.lock().await;
     if !guard.contains_key(vin) {
         let runtime = load_runtime(&archive.db, vehicle_id, vin).await?;
@@ -191,7 +219,7 @@ pub(crate) async fn apply_stream_for_vin(
     identity: VehicleIdentity<'_>,
     sample: &crate::persist::StreamFix,
 ) -> Result<(), AppError> {
-    let vehicle_id = upsert_vehicle(&archive.db, identity).await?;
+    let vehicle_id = upsert_vehicle(&archive.db, identity, archive.fleet_account_id).await?;
     let mut guard = archive.runtimes.lock().await;
     if !guard.contains_key(vin) {
         let runtime = load_runtime(&archive.db, vehicle_id, vin).await?;
@@ -568,19 +596,23 @@ pub(crate) async fn run_poll<T: AccessTokenProvider>(
     source: &FleetPoll<T>,
     archive: Arc<Archive>,
     policy: PollPolicy,
-    global_error: Arc<Mutex<Option<String>>>,
+    account_id: Option<i64>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
         if *shutdown.borrow() {
             break;
         }
-        let control = run_cycle(source, &archive, &policy, &global_error).await;
+        let control = run_cycle(source, &archive, &policy, account_id).await;
         let wait = match control {
             Ok(CycleControl::Wait(wait) | CycleControl::Pause(wait)) => wait,
             Err(err) => {
-                tracing::warn!(error = %err, "ingest cycle failed");
-                set_error(&global_error, err.to_string()).await;
+                let message = crate::logs::redact_line(&err.to_string(), &[]);
+                tracing::warn!(error = %message, "ingest cycle failed");
+                if let Some(account_id) = account_id {
+                    let _ =
+                        crate::accounts::set_last_error(&archive.db, account_id, &message).await;
+                }
                 Duration::from_secs(30)
             }
         };
@@ -602,18 +634,35 @@ async fn run_cycle(
     source: &impl IngestSource,
     archive: &Archive,
     policy: &PollPolicy,
-    global_error: &Mutex<Option<String>>,
+    account_id: Option<i64>,
 ) -> Result<CycleControl, AppError> {
+    if let Some(account_id) = account_id
+        && let Some(wait) = account_pause(archive, account_id).await
+    {
+        return Ok(CycleControl::Pause(wait));
+    }
     let vehicles = match source.discover().await {
         Ok(vehicles) => vehicles,
-        Err(AppError::RateLimited { retry_after }) => return Ok(CycleControl::Pause(retry_after)),
+        Err(AppError::RateLimited { retry_after }) => {
+            note_rate_limit(archive, account_id, retry_after).await;
+            return Ok(CycleControl::Pause(retry_after));
+        }
         Err(err) => return Err(err),
     };
     if vehicles.is_empty() {
-        set_error(global_error, "no vehicles on the Tesla account".to_owned()).await;
+        if let Some(account_id) = account_id {
+            let _ = crate::accounts::set_last_error(
+                &archive.db,
+                account_id,
+                "no vehicles on the Tesla account",
+            )
+            .await;
+        }
         return Ok(CycleControl::Wait(policy.asleep));
     }
-    clear_error(global_error).await;
+    if let Some(account_id) = account_id {
+        let _ = crate::accounts::clear_last_error(&archive.db, account_id).await;
+    }
     let mut soonest = policy.backoff;
     let now = Instant::now();
     for summary in vehicles {
@@ -632,16 +681,85 @@ async fn run_cycle(
             }
             continue;
         }
-        match handle_summary(source, archive, policy, &summary).await? {
-            CycleControl::Pause(wait) => return Ok(CycleControl::Pause(wait)),
-            CycleControl::Wait(wait) => {
+        match handle_summary(source, archive, policy, &summary).await {
+            Ok(CycleControl::Pause(wait)) => {
+                note_rate_limit(archive, account_id, wait).await;
+                return Ok(CycleControl::Pause(wait));
+            }
+            Ok(CycleControl::Wait(wait)) => {
                 if wait < soonest {
                     soonest = wait;
+                }
+            }
+            Err(err) => {
+                let message = crate::logs::redact_line(&err.to_string(), &[]);
+                tracing::warn!(error = %message, "vehicle poll failed");
+                if let Some(vehicle_id) = vehicle_id_by_vin(&archive.db, &summary.vin).await {
+                    let _ = record_error(&archive.db, vehicle_id, &message).await;
+                } else if let Some(account_id) = account_id {
+                    let _ =
+                        crate::accounts::set_last_error(&archive.db, account_id, &message).await;
+                }
+                {
+                    let mut guard = archive.runtimes.lock().await;
+                    if let Some(runtime) = guard.get_mut(&summary.vin) {
+                        runtime.next_due = Instant::now() + policy.backoff;
+                    }
+                }
+                if policy.backoff < soonest {
+                    soonest = policy.backoff;
                 }
             }
         }
     }
     Ok(CycleControl::Wait(soonest.max(Duration::from_secs(1))))
+}
+
+async fn note_rate_limit(archive: &Archive, account_id: Option<i64>, wait: Duration) {
+    let Some(account_id) = account_id else {
+        return;
+    };
+    note_account_pause(archive, account_id, wait).await;
+    let _ = crate::accounts::set_last_error(
+        &archive.db,
+        account_id,
+        &format!("rate limited; retry after {}s", wait.as_secs()),
+    )
+    .await;
+}
+
+pub(crate) async fn account_pause(archive: &Archive, account_id: i64) -> Option<Duration> {
+    let guard = archive.account_backoff.lock().await;
+    let until = *guard.get(&account_id)?;
+    let now = Instant::now();
+    if until <= now {
+        None
+    } else {
+        Some(until.saturating_duration_since(now))
+    }
+}
+
+pub(crate) async fn note_account_pause(archive: &Archive, account_id: i64, wait: Duration) {
+    let until = Instant::now() + wait;
+    let mut guard = archive.account_backoff.lock().await;
+    guard
+        .entry(account_id)
+        .and_modify(|existing| {
+            if *existing < until {
+                *existing = until;
+            }
+        })
+        .or_insert(until);
+}
+
+async fn vehicle_id_by_vin(pool: &PgPool, vin: &str) -> Option<i64> {
+    sqlx::query_as::<_, (i64,)>("SELECT id FROM vehicles WHERE vin = $1")
+        .bind(vin)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.0)
 }
 
 async fn handle_summary(
@@ -661,6 +779,7 @@ async fn handle_summary(
             legacy_vehicle_id: summary.legacy_vehicle_id,
             name: summary.name.as_deref(),
         },
+        archive.fleet_account_id,
     )
     .await?;
     let (activity, telemetry_fresh, parked_live_polls) = {
@@ -786,14 +905,6 @@ async fn apply_existing(
         store_position,
     )
     .await
-}
-
-async fn set_error(slot: &Mutex<Option<String>>, message: String) {
-    *slot.lock().await = Some(message);
-}
-
-async fn clear_error(slot: &Mutex<Option<String>>) {
-    *slot.lock().await = None;
 }
 
 #[cfg(test)]
@@ -1056,5 +1167,94 @@ mod tests {
                 .as_deref(),
             Some("Combo")
         );
+    }
+
+    struct SplitSource {
+        fail_vin: &'static str,
+        ok_vin: &'static str,
+    }
+
+    impl IngestSource for SplitSource {
+        async fn discover(&self) -> Result<Vec<super::Summary>, crate::error::AppError> {
+            std::future::ready(Ok(vec![summary(self.fail_vin, 1), summary(self.ok_vin, 2)])).await
+        }
+
+        async fn observe(&self, vin: &str) -> Result<super::ObserveResult, crate::error::AppError> {
+            let result = if vin == self.fail_vin {
+                Err(crate::error::AppError::message("vehicle data failed"))
+            } else {
+                Ok(super::ObserveResult::Resting(Presence::Asleep))
+            };
+            std::future::ready(result).await
+        }
+    }
+
+    fn summary(vin: &'static str, tesla_id: i64) -> super::Summary {
+        super::Summary {
+            vin: vin.to_owned(),
+            tesla_id,
+            legacy_vehicle_id: None,
+            name: Some(vin.to_owned()),
+            presence: Presence::Online,
+        }
+    }
+
+    #[tokio::test]
+    async fn one_vehicle_error_does_not_fail_the_cycle() {
+        let Some(db) = crate::test_util::TestDb::migrated("isolate").await else {
+            return;
+        };
+        let archive = super::Archive::new(
+            db.pool.clone(),
+            crate::geocode::Geocoder::disabled(),
+            tokio::sync::broadcast::channel(4).0,
+            tokio::sync::broadcast::channel(4).0,
+            crate::position_mode::GpsBoard::default(),
+        );
+        let fail_vin = "5YJ3E1EA7KF000001";
+        let ok_vin = "5YJ3E1EA7KF000002";
+        let control = super::run_cycle(
+            &SplitSource { fail_vin, ok_vin },
+            &archive,
+            &policy(),
+            Some(1),
+        )
+        .await
+        .expect("cycle stays up");
+        assert!(matches!(control, super::CycleControl::Wait(_)));
+        let failed: (Option<String>,) = sqlx::query_as(
+            "SELECT s.last_error FROM vehicle_state s
+                 JOIN vehicles v ON v.id = s.vehicle_id WHERE v.vin = $1",
+        )
+        .bind(fail_vin)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(failed.0.as_deref(), Some("vehicle data failed"));
+        let ok: (Option<String>,) = sqlx::query_as(
+            "SELECT s.last_error FROM vehicle_state s
+             JOIN vehicles v ON v.id = s.vehicle_id WHERE v.vin = $1",
+        )
+        .bind(ok_vin)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(ok.0, None);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_backoff_is_per_account() {
+        let archive = super::Archive::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://localhost/unused")
+                .unwrap(),
+            crate::geocode::Geocoder::disabled(),
+            tokio::sync::broadcast::channel(1).0,
+            tokio::sync::broadcast::channel(1).0,
+            crate::position_mode::GpsBoard::default(),
+        );
+        super::note_account_pause(&archive, 7, Duration::from_secs(40)).await;
+        assert!(super::account_pause(&archive, 7).await.is_some());
+        assert!(super::account_pause(&archive, 8).await.is_none());
     }
 }
