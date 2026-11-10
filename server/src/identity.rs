@@ -503,20 +503,32 @@ pub(crate) fn origin_allowed(method: &Method, headers: &HeaderMap, public_base: 
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
         return true;
     }
-    if let Some(site) = headers
+    let site = headers
         .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok())
-        && !matches!(site, "same-origin" | "same-site" | "none")
+        .and_then(|value| value.to_str().ok());
+    // `same-site` would allow a sibling subdomain such as `other.b-612.fr`.
+    if let Some(site) = site
+        && !matches!(site, "same-origin" | "none")
     {
         return false;
     }
-    let Some(origin) = headers
+    let origin = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
-    else {
-        return true;
-    };
-    let origin = origin.trim_end_matches('/');
+        .map(|value| value.trim_end_matches('/'));
+    // `Referrer-Policy: no-referrer` makes browsers send `Origin: null` on a
+    // same-origin form POST. Accept that opaque origin only with `same-origin`.
+    if origin == Some("null") {
+        return site == Some("same-origin");
+    }
+    let matches = origin.is_some_and(|origin| origin_matches(origin, headers, public_base));
+    if site == Some("none") {
+        return matches;
+    }
+    origin.is_none_or(|_| matches)
+}
+
+fn origin_matches(origin: &str, headers: &HeaderMap, public_base: &str) -> bool {
     if origin == public_base.trim_end_matches('/') {
         return true;
     }
@@ -768,6 +780,35 @@ mod tests {
             &headers,
             "https://logger.example"
         ));
+    }
+
+    #[test]
+    fn null_origin_is_allowed_only_for_a_same_origin_fetch() {
+        let base = "https://tsl.b-612.fr";
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "null".parse().unwrap());
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert!(origin_allowed(&Method::POST, &headers, base));
+
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert!(!origin_allowed(&Method::POST, &headers, base));
+
+        headers.remove("sec-fetch-site");
+        assert!(!origin_allowed(&Method::POST, &headers, base));
+
+        headers.insert("sec-fetch-site", "none".parse().unwrap());
+        assert!(!origin_allowed(&Method::POST, &headers, base));
+
+        headers.insert("origin", "https://evil.example".parse().unwrap());
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert!(!origin_allowed(&Method::POST, &headers, base));
+
+        headers.insert("origin", "https://tsl.b-612.fr".parse().unwrap());
+        headers.insert("sec-fetch-site", "same-site".parse().unwrap());
+        assert!(!origin_allowed(&Method::POST, &headers, base));
+
+        headers.insert("sec-fetch-site", "none".parse().unwrap());
+        assert!(origin_allowed(&Method::POST, &headers, base));
     }
 
     #[tokio::test]
