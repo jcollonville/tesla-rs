@@ -4,6 +4,8 @@ Self-hosted archive of Tesla drives, charges, and vehicle state. It is a clean-r
 
 The server is licensed `AGPL-3.0-only`. The library crates in `crates/` stay `MIT OR Apache-2.0`.
 
+Local setup — toolchain, Postgres, environment variables, `cargo run`, Docker Compose, and the checks that show it is working — is in the repository [README](../README.md#run-locally). The variable list there is the one to follow. This file describes logger behavior that the root guide only summarizes.
+
 ## What works
 
 * Tesla OAuth (authorization code + PKCE) through `tesla-auth`, with the redirect `https://<TESLA_DOMAIN>/auth/callback`.
@@ -11,7 +13,7 @@ The server is licensed `AGPL-3.0-only`. The library crates in `crates/` stay `MI
 * Sleep-aware Fleet API polling. The poller never calls `wake_up`. It uses the vehicle list to see `online` / `asleep` / `offline`, calls `vehicle_data` only while the car is already online, polls faster while driving or charging, and backs off when parked.
 * Drive and charge detection, positions partitioned by month, Nominatim reverse geocoding (cached, rate limited, disable-able), and geofences.
 * Read API for Home Assistant: REST plus a WebSocket, described by `openapi.yaml`.
-* Optional MQTT Home Assistant discovery (`MQTT_ENABLED=false` by default). The client speaks plain MQTT, which is the usual setup for a broker on the same NAS.
+* Optional MQTT Home Assistant discovery (`MQTT_ENABLED=false` by default). The client speaks plain MQTT to `MQTT_HOST` and `MQTT_PORT`.
 * Optional Fleet Telemetry ingest (`TELEMETRY_ENABLED=false` by default) through `tesla-fleet-telemetry`. A fresh stream suppresses billable live polls for that car.
 * Optional Owner API streaming for dense drive traces. Fleet API polling stays the primary source. The legacy streaming socket is unofficial and Tesla may remove it.
 * TeslaMate 4.x importer (`import-teslamate`), read-only, batched, idempotent, and resumable.
@@ -20,28 +22,9 @@ Vehicle commands are not part of this server. Use `tesla-vehicle-command` separa
 
 ## Configure
 
-Copy `server/.env.example` to `server/.env`.
+Copy `server/.env.example` to `server/.env` for Docker Compose. For `cargo run` on the host, the container hostnames and `/data` paths in that example do not apply; use the local file in the repository README. `tesla-logger` reads `TESLA_LOGGER_ENV_FILE` or `./.env`, and a process environment variable overrides the file. The Fleet redirect is always `https://<TESLA_DOMAIN>/auth/callback`.
 
-| Variable | Purpose |
-| --- | --- |
-| `TESLA_CLIENT_ID` / `TESLA_CLIENT_SECRET` | Fleet API application |
-| `TESLA_FLEET_AUDIENCE` | `https://fleet-api.prd.eu.vn.cloud.tesla.com` for Europe |
-| `TESLA_DOMAIN` | Hostname behind the reverse proxy, for example `tsl.b-612.fr` |
-| `TESLA_PUBLIC_BASE_URL` | Public `https://` origin. Defaults to `https://<TESLA_DOMAIN>` |
-| `DATABASE_URL` | Postgres URL |
-| `TESLA_PRIVATE_KEY_PATH` | P-256 PEM, mounted read-only |
-| `TESLA_TOKEN_STORE_PATH` | OAuth token file. Mode `0600` |
-| `TESLA_TOKEN_ENCRYPTION_KEY` | Optional. 64 hex chars, or a passphrase hashed with SHA-256, encrypts the token file with AES-256-GCM |
-| `TESLA_LISTEN_ADDR` | Default `0.0.0.0:4000` |
-| `TESLA_LOGGER_UI_PASSWORD` | Password for the status page |
-| `NOMINATIM_*` | Reverse geocoding. Set `NOMINATIM_ENABLED=false` to disable |
-| `MQTT_*` | Home Assistant discovery. Off by default |
-| `TELEMETRY_*` | Mutual-TLS Fleet Telemetry receiver. Off by default |
-| `POLL_*` | Poll intervals |
-| `OWNER_STREAM_ENABLED` | Owner API streaming. Default `true`. Set `false` to keep a saved token without connecting |
-| `TESLA_OWNER_TOKEN_STORE_PATH` | Owner API token file. Default is `owner-tokens.json` next to `TESLA_TOKEN_STORE_PATH`. Encrypted with `TESLA_TOKEN_ENCRYPTION_KEY` when that is set |
-
-The UI password protects the status page, the logs page, and the OAuth start button. API calls use a bearer token created on that page (`Authorization: Bearer tl_...`). The WebSocket also accepts `access_token` in the query string; prefer the header so proxy logs do not store it. Recent application logs are kept in memory and shown at `/logs` after signing in. Passwords, tokens, and websocket subscribe frames are redacted. The list resets when the process restarts.
+The UI password protects the status page, the logs page, and the OAuth start button. API calls use a bearer token created on that page (`Authorization: Bearer tl_...`). The WebSocket also accepts `access_token` in the query string; prefer the header so proxy logs do not store it. Recent application logs are kept in memory and shown at `/logs` after signing in. A request with no session is redirected to `/`, which is the sign-in page. Passwords, tokens, authorization headers, and websocket subscribe frames are redacted. The list resets when the process restarts.
 
 ## Owner API streaming
 
@@ -52,11 +35,11 @@ Enable it from the status page:
 1. Open the logger and sign in with `TESLA_LOGGER_UI_PASSWORD`.
 2. Connect the Fleet API account if it is not connected yet. Polling does not use the Owner API token.
 3. Open **Set up streaming**.
-4. Choose **Prepare Tesla sign-in**, open the Tesla link, and sign in with the Tesla account that owns the car. The authorize host is `auth.tesla.com` (China accounts use `auth.tesla.cn`).
+4. Choose **Prepare Tesla sign-in** once, open the Tesla link, and sign in with the Tesla account that owns the car. The authorize host is `auth.tesla.com`. China accounts (`TESLA_FLEET_AUDIENCE` on the China Fleet API host) use `auth.tesla.cn`. Choosing Prepare again replaces the pending login; the URL from the first attempt then fails the state check.
 5. After login, the browser cannot open `tesla://auth/callback`. It may say the address is not understood, the site cannot be reached, or offer to open the Tesla app. Do not open the Tesla app.
-6. Copy the full URL from the address bar. It starts with `tesla://auth/callback?`. If Chrome drops the address, the Network tab in developer tools still shows the failed navigation. Copy that URL.
-7. Paste it into **Redirect URL** and choose **Save sign-in**. The page returns to the vehicle table. The password field is only so the authorization code is not displayed.
-8. The stream chip and `GET /api/v1/vehicles/{id}/state` field `stream_status` become `connected` once the streaming websocket is subscribed, including while the car is parked and Tesla sends only hello or ping frames. They are `error` while it is reconnecting, and `disabled` when no Owner token is stored. `stream_error` is a short class such as `timeout` or `auth` and never contains a token. The log line is `owner stream status`. Cars are listed with `GET /api/1/products`; `GET /api/1/vehicles` returns HTTP 412 and is not used.
+6. Copy the full URL from the address bar, the console, or the failed navigation in the Network tab. It starts with `tesla://auth/callback?`. Paste that URL only into this logger. It contains the authorization code.
+7. Paste it into **Redirect URL** and choose **Save sign-in**. The page returns to the vehicle table. The password field is only so the authorization code is not displayed. The pending login lasts 10 minutes. Pasting with nothing pending, or after a newer Prepare, asks you to prepare again.
+8. The stream chip and `GET /api/v1/vehicles/{id}/state` field `stream_status` become `connected` once the subscribe frame is written, including while the car is parked and Tesla sends only hello or ping frames. They are `error` while it is reconnecting, and `disabled` when no Owner token is stored or `OWNER_STREAM_ENABLED` is false. `stream_error` is a short class such as `timeout` or `auth` and never contains a token. The log line is `owner stream status`. Cars are listed with `GET /api/1/products`; `GET /api/1/vehicles` returns HTTP 412 and is not used.
 
 A refresh token generated for this logger can be pasted into **Owner API refresh token** instead of the redirect URL. Do not paste the refresh token TeslaMate is using. Tesla rotates refresh tokens, and using TeslaMate's token here can sign TeslaMate out. Each program should have its own Owner API login. The Fleet API login is a third one and is unchanged.
 
@@ -66,15 +49,15 @@ Streamed rows are stored in `positions` with `source = 'stream'` and linked to t
 
 Do not enable `sqlx=trace` in production. Query logs can include bound values. Tokens, the client secret, and the private key are not written to logs.
 
-## Docker on a Synology NAS (amd64)
+## Docker Compose
 
-From the repository root, with `server/.env` filled in and `server/private-key.pem` readable by uid `10001`:
+The command sequence, published port, volume warning, and uid `10001` key requirement are in the repository [README](../README.md#docker-compose). Short form, from the repository root, with `server/.env` filled in and `server/private-key.pem` readable by uid `10001`:
 
 ```bash
 docker compose -f server/docker-compose.yml up -d --build
 ```
 
-The image runs as uid 10001, uses `postgres:17`, and healthchecks `/healthz`. Point the existing reverse proxy at port 4000 and serve the public key from this process instead of nginx.
+The image runs as uid 10001, uses `postgres:17`, and healthchecks `/healthz`. Publish host port 4000. Terminate TLS in front of this process and forward `/auth/callback` and `/.well-known/appspecific/com.tesla.3p.public-key.pem` to it. `docker compose down` keeps the `postgres` and `logger-data` volumes; `down -v` deletes them.
 
 Import an existing TeslaMate database (read-only role). `import-tesla-mate` is accepted as an alias.
 
