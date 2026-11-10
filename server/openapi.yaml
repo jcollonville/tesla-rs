@@ -156,6 +156,8 @@ paths:
         lost times vehicle efficiency, then ideal range lost times efficiency.
         `charge_cost` uses `charges.cost`, or `energy_added_kwh * ENERGY_PRICE_PER_KWH`
         when cost is null and that variable is set.
+        Successful responses are cached in memory for 5 minutes per vehicle, period,
+        count, timezone, and price. The JSON shape does not change.
       security: [{ bearer: [] }]
       parameters:
         - { $ref: "#/components/parameters/id" }
@@ -566,9 +568,12 @@ components:
           type: number
           nullable: true
           description: >
-            Average of rated_range_km / battery_level * 100 over positions, charge
-            samples, and charge endpoints in the bucket. Samples at or below 10%
-            or above 100% state of charge are ignored.
+            Average projected rated range at 100% in the bucket. One value per
+            closed charge (end rated range / end battery level, or the start
+            reading when the end reading is missing) and one value per closed
+            drive (the average of the valid start and end readings). State of
+            charge at or below 10% or above 100% is ignored. Position history is
+            not read.
         ac_energy_kwh: { type: number, description: Energy added on AC charges }
         dc_energy_kwh: { type: number, description: Energy added on DC fast charges }
         dc_share_pct:

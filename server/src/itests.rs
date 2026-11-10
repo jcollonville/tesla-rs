@@ -1477,9 +1477,11 @@ async fn stats_series_buckets_indicators_and_temperature() {
     .fetch_one(&db.pool)
     .await
     .unwrap();
+    // Position and charge-sample readings must not affect range_at_100_km.
+    // 90% / 900 km would project to 1000 km if the series still scanned them.
     sqlx::query(
         "INSERT INTO positions (vehicle_id, recorded_at, battery_level, rated_range_km, source)
-         VALUES ($1, $2, 50, 180, 'poll'), ($1, $3, 8, 100, 'poll')",
+         VALUES ($1, $2, 90, 900, 'poll'), ($1, $3, 8, 100, 'poll')",
     )
     .bind(vehicle_id)
     .bind(charge_at)
@@ -1498,10 +1500,35 @@ async fn stats_series_buckets_indicators_and_temperature() {
     .unwrap();
     sqlx::query(
         "INSERT INTO charge_samples (charge_id, recorded_at, battery_level, rated_range_km, source)
-         VALUES ($1, $2, 75, 300, 'poll')",
+         VALUES ($1, $2, 20, 40, 'poll')",
     )
     .bind(charge_id)
     .bind(charge_at)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // One health value per drive (end reading) and per charge (end reading).
+    sqlx::query(
+        "UPDATE drives SET end_battery_level = 50, end_rated_range_km = 180
+         WHERE vehicle_id = $1 AND distance_km = 40",
+    )
+    .bind(vehicle_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE charges SET end_battery_level = 75, end_rated_range_km = 300
+         WHERE vehicle_id = $1 AND energy_added_kwh = 8",
+    )
+    .bind(vehicle_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE charges SET end_battery_level = 5, end_rated_range_km = 40
+         WHERE vehicle_id = $1 AND energy_added_kwh = 2",
+    )
+    .bind(vehicle_id)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -1657,6 +1684,47 @@ async fn stats_series_buckets_indicators_and_temperature() {
     assert_eq!(int(&temps[2], "temp_c_bucket"), 10);
     close(num(&temps[2], "distance_km"), 50.0);
     close(num(&temps[2], "wh_per_km"), 200.0);
+
+    // A repeat inside the 5 minute cache must ignore a later edit.
+    sqlx::query("UPDATE drives SET distance_km = 0 WHERE vehicle_id = $1 AND distance_km = 100")
+        .bind(vehicle_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let cached = authed(
+        &state,
+        "GET",
+        &format!("/api/v1/vehicles/{vehicle_id}/stats/series?period=month&count=4"),
+        token,
+    )
+    .await;
+    let cached: serde_json::Value = serde_json::from_str(&cached).unwrap();
+    close(num(&cached["buckets"][3], "distance_km"), 140.0);
+
+    // Benchmark note: on a 9.3M-row positions table this used to plan for ~1.7s
+    // and execute for 12–85s, because range_at_100_km scanned positions and
+    // charge_samples through a subquery bound (no partition pruning) and then
+    // nested-looped every bucket. The statement below must stay off those
+    // tables. Bounds are timestamptz literals and buckets join on date_trunc.
+    let window = crate::http::stats::stats_window("week", 12, "Europe/Paris", Utc::now()).unwrap();
+    let sql = crate::http::stats::series_query_sql(&window);
+    assert!(!sql.contains("positions"), "{sql}");
+    assert!(!sql.contains("charge_samples"), "{sql}");
+    assert!(sql.contains("date_trunc('week'"));
+    assert!(sql.contains("TIMESTAMPTZ '"));
+    assert!(!sql.contains(">= b.start_at"));
+    let explained = format!("EXPLAIN (FORMAT JSON) {sql}");
+    let (plan,): (serde_json::Value,) = sqlx::query_as(&explained)
+        .bind(vehicle_id)
+        .bind(0.5_f64)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let rendered = plan.to_string();
+    assert!(
+        !rendered.contains("positions") && !rendered.contains("charge_samples"),
+        "{rendered}"
+    );
 }
 
 #[tokio::test]

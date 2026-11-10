@@ -15,6 +15,7 @@ aes-gcm = "0.10"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "form", "ws", "tokio", "macros"] }
 base64 = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+chrono-tz = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 getrandom = { workspace = true }
 hex = "0.4"
