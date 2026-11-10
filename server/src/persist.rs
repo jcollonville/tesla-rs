@@ -9,8 +9,8 @@ use crate::error::{AppError, redact_secrets};
 use crate::geocode::{Geocoder, cache_key};
 use crate::geofence::{Fence, matching_geofence};
 use crate::state::{
-    Activity, DriveSummary, Observation, Presence, Sample, Tracker, Transition, soc_level,
-    summarize_charge, summarize_drive,
+    Activity, DriveSummary, Observation, Presence, Sample, Tracker, Transition, keep_closed_drive,
+    soc_level, summarize_charge, summarize_drive,
 };
 
 /// Identity fields learned from a vehicle list response.
@@ -381,15 +381,18 @@ pub(crate) async fn apply_observation(
         push_address(&mut address_jobs, Some(drive_id), None, "start", obs);
     }
     if ending_drive && let Some(drive_id) = runtime.open_drive_id {
-        close_drive(
+        let kept = close_drive(
             &mut tx,
+            runtime.vehicle_id,
             drive_id,
             obs,
             runtime.efficiency_kwh_per_km,
             fence_id,
         )
         .await?;
-        push_address(&mut address_jobs, Some(drive_id), None, "end", obs);
+        if kept {
+            push_address(&mut address_jobs, Some(drive_id), None, "end", obs);
+        }
         runtime.open_drive_id = None;
     }
     if ending_charge && let Some(charge_id) = runtime.open_charge_id {
@@ -523,15 +526,18 @@ pub(crate) async fn apply_stream_sample(
     if decision.end_drive
         && let Some(drive_id) = open_drive_id
     {
-        close_drive(
+        let kept = close_drive(
             &mut tx,
+            runtime.vehicle_id,
             drive_id,
             &obs,
             runtime.efficiency_kwh_per_km,
             fence_id,
         )
         .await?;
-        push_address(&mut address_jobs, Some(drive_id), None, "end", &obs);
+        if kept {
+            push_address(&mut address_jobs, Some(drive_id), None, "end", &obs);
+        }
         open_drive_id = None;
         drive_open = false;
     }
@@ -851,36 +857,59 @@ async fn insert_charge_sample(
     Ok(())
 }
 
+/// Closes `drive_id`. Returns whether the row was kept.
+///
+/// A drive with fewer than two positions, or an odometer delta that is NULL or
+/// below 0.01 km, is deleted in this transaction. Its positions stay, with
+/// `drive_id` set to NULL before the delete. Callers must not read the row
+/// when this returns false.
 async fn close_drive(
     tx: &mut Transaction<'_, Postgres>,
+    vehicle_id: i64,
     drive_id: i64,
     obs: &Observation,
     efficiency: Option<f64>,
     geofence_id: Option<i64>,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let rows = sqlx::query_as::<_, PositionSample>(
         "SELECT recorded_at, latitude, longitude, speed_kmh, power_kw, odometer_km, elevation_m,
                 battery_level, rated_range_km, ideal_range_km, inside_temp_c, outside_temp_c
          FROM positions
          WHERE drive_id = $1
-         ORDER BY recorded_at",
+         ORDER BY recorded_at, id",
     )
     .bind(drive_id)
     .fetch_all(&mut **tx)
     .await?;
     let samples: Vec<Sample> = rows.into_iter().map(PositionSample::into_sample).collect();
-    let Some(summary) = summarize_drive(&samples, efficiency) else {
-        sqlx::query("UPDATE drives SET end_at = $2 WHERE id = $1 AND end_at IS NULL")
-            .bind(drive_id)
-            .bind(obs.at)
-            .execute(&mut **tx)
-            .await?;
-        return Ok(());
+    let Some(summary) =
+        summarize_drive(&samples, efficiency).filter(|_| keep_closed_drive(&samples))
+    else {
+        discard_drive(tx, vehicle_id, drive_id).await?;
+        return Ok(false);
     };
     let end_battery = summary
         .end_battery_level
         .or(soc_level(obs.battery_level, obs.usable_battery_level));
-    update_drive(tx, drive_id, &summary, end_battery, geofence_id).await
+    update_drive(tx, drive_id, &summary, end_battery, geofence_id).await?;
+    Ok(true)
+}
+
+async fn discard_drive(
+    tx: &mut Transaction<'_, Postgres>,
+    vehicle_id: i64,
+    drive_id: i64,
+) -> Result<(), AppError> {
+    sqlx::query("UPDATE positions SET drive_id = NULL WHERE drive_id = $1")
+        .bind(drive_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM drives WHERE id = $1")
+        .bind(drive_id)
+        .execute(&mut **tx)
+        .await?;
+    tracing::info!(vehicle_id, drive_id, "discarded drive");
+    Ok(())
 }
 
 async fn update_drive(

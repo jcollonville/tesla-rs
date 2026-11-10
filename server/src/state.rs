@@ -576,6 +576,36 @@ pub(crate) struct DriveSummary {
     pub outside_temp_avg_c: Option<f64>,
 }
 
+/// Minimum odometer delta, in kilometres, for a closed drive to be kept.
+///
+/// TeslaMate `Log.close_drive/2` uses this same 0.01 km threshold.
+pub(crate) const MIN_CLOSED_DRIVE_KM: f64 = 0.01;
+
+/// Whether closing this drive should update the row.
+///
+/// TeslaMate keeps a drive only when it has at least two positions and the
+/// odometer of the last position minus the odometer of the first (ordered by
+/// date) is at least [`MIN_CLOSED_DRIVE_KM`]. A missing odometer makes that
+/// distance NULL. GPS distance is not consulted.
+pub(crate) fn keep_closed_drive(samples: &[Sample]) -> bool {
+    let Some((first, last)) = samples.first().zip(samples.last()) else {
+        return false;
+    };
+    let Some(start) = first.odometer_km.filter(|km| km.is_finite()) else {
+        return false;
+    };
+    let Some(end) = last.odometer_km.filter(|km| km.is_finite()) else {
+        return false;
+    };
+    if samples.len() < 2 {
+        return false;
+    }
+    // Odometers are decimal kilometres in TeslaMate and float8 here. Round the
+    // delta to the nearest millimetre so a stored 0.01 km still meets the check.
+    let delta_km = ((end - start) * 1_000_000.0).round() / 1_000_000.0;
+    delta_km >= MIN_CLOSED_DRIVE_KM
+}
+
 pub(crate) fn summarize_drive(
     samples: &[Sample],
     efficiency_kwh_per_km: Option<f64>,
@@ -839,10 +869,19 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use super::{
-        Activity, Observation, Presence, Tracker, Transition, reduce, sanitize_charger_type,
-        should_store_stream_position, stream_collides_with_poll, stream_drive_decision,
-        summarize_charge, summarize_drive,
+        Activity, Observation, Presence, Sample, Tracker, Transition, keep_closed_drive, reduce,
+        sanitize_charger_type, should_store_stream_position, stream_collides_with_poll,
+        stream_drive_decision, summarize_charge, summarize_drive,
     };
+
+    fn odometer_sample(minute: i64, odometer_km: Option<f64>, latitude: f64) -> Sample {
+        let mut obs = online(minute);
+        obs.odometer_km = odometer_km;
+        obs.latitude = Some(latitude);
+        obs.longitude = Some(2.35);
+        obs.speed_kmh = Some(20.0);
+        obs.sample()
+    }
 
     fn at(minute: i64) -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2024, 6, 1, 10, 0, 0).unwrap() + Duration::minutes(minute)
@@ -1137,5 +1176,54 @@ mod tests {
             Some(0.0)
         ));
         assert!(!should_store_stream_position(true, false, None, Some(11.5)));
+    }
+
+    #[test]
+    fn one_position_is_not_a_drive() {
+        let samples = vec![odometer_sample(0, Some(100.0), 48.85)];
+        assert!(!keep_closed_drive(&samples));
+    }
+
+    #[test]
+    fn two_positions_with_zero_odometer_delta_are_not_a_drive() {
+        // Far apart on the map. The filter uses the odometer, not GPS.
+        let samples = vec![
+            odometer_sample(0, Some(100.0), 48.0),
+            odometer_sample(1, Some(100.0), 49.5),
+        ];
+        assert!(!keep_closed_drive(&samples));
+    }
+
+    #[test]
+    fn odometer_delta_under_ten_metres_is_not_a_drive() {
+        let samples = vec![
+            odometer_sample(0, Some(100.0), 48.85),
+            odometer_sample(1, Some(100.009), 48.86),
+        ];
+        assert!(!keep_closed_drive(&samples));
+    }
+
+    #[test]
+    fn odometer_delta_of_ten_metres_with_two_positions_is_a_drive() {
+        let samples = vec![
+            odometer_sample(0, Some(100.0), 48.85),
+            odometer_sample(1, Some(100.01), 48.86),
+        ];
+        assert!(keep_closed_drive(&samples));
+        // 400.01 is not an exact float. The threshold is still the decimal 0.01 km.
+        let large = vec![
+            odometer_sample(0, Some(400.0), 48.85),
+            odometer_sample(1, Some(400.01), 48.86),
+        ];
+        assert!(keep_closed_drive(&large));
+    }
+
+    #[test]
+    fn missing_odometer_is_not_a_drive() {
+        let samples = vec![
+            odometer_sample(0, None, 48.0),
+            odometer_sample(1, Some(110.0), 49.0),
+        ];
+        assert!(!keep_closed_drive(&samples));
     }
 }
