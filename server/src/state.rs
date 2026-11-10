@@ -283,6 +283,22 @@ fn cable_is_connected(cable: Option<&str>) -> bool {
     )
 }
 
+/// Charger type worth storing.
+///
+/// Tesla reports `fast_charger_type` as `<invalid>` when the car is not on a
+/// fast charger. Empty text, `none`, `null`, and any `<...>` placeholder are
+/// dropped. Comparison is trimmed and ASCII case-insensitive.
+pub(crate) fn sanitize_charger_type(value: Option<&str>) -> Option<String> {
+    let value = nonempty(value)?;
+    let normalized = value.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "<invalid>" | "none" | "null")
+        || (value.starts_with('<') && value.ends_with('>'))
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
 fn is_disconnected(state: &str) -> bool {
     matches!(
         state.to_ascii_lowercase().as_str(),
@@ -646,12 +662,9 @@ pub(crate) fn summarize_charge(samples: &[Sample]) -> Option<ChargeSummary> {
     } else {
         None
     };
-    let charger_type = samples.iter().find_map(|sample| {
-        sample
-            .fast_charger_type
-            .clone()
-            .filter(|value| !value.is_empty() && value != "<invalid>")
-    });
+    let charger_type = samples
+        .iter()
+        .find_map(|sample| sanitize_charger_type(sample.fast_charger_type.as_deref()));
     Some(ChargeSummary {
         start: first.at,
         end: last.at,
@@ -826,8 +839,9 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use super::{
-        Activity, Observation, Presence, Tracker, Transition, reduce, should_store_stream_position,
-        stream_collides_with_poll, stream_drive_decision, summarize_charge, summarize_drive,
+        Activity, Observation, Presence, Tracker, Transition, reduce, sanitize_charger_type,
+        should_store_stream_position, stream_collides_with_poll, stream_drive_decision,
+        summarize_charge, summarize_drive,
     };
 
     fn at(minute: i64) -> chrono::DateTime<Utc> {
@@ -1002,6 +1016,47 @@ mod tests {
         assert_eq!(summary.is_dc, Some(true));
         assert_eq!(summary.charger_type.as_deref(), Some("Combo"));
         assert!((summary.max_power_kw.unwrap() - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn open_charge_with_invalid_charger_type_ends_with_none() {
+        let mut charging = online(0);
+        charging.charging_state = Some("Charging".to_owned());
+        charging.fast_charger = Some(false);
+        charging.fast_charger_type = Some("<invalid>".to_owned());
+        charging.charger_power_kw = Some(7.4);
+        charging.charge_energy_added_kwh = Some(1.2);
+
+        let mut still = online(20);
+        still.charging_state = Some("Charging".to_owned());
+        still.fast_charger = Some(false);
+        still.fast_charger_type = Some("<INVALID>".to_owned());
+        still.charger_power_kw = Some(7.4);
+        still.charge_energy_added_kwh = Some(4.0);
+
+        let summary = summarize_charge(&[charging.sample(), still.sample()]).unwrap();
+        assert_eq!(summary.charger_type, None);
+    }
+
+    #[test]
+    fn sanitize_charger_type_rejects_placeholders() {
+        assert_eq!(sanitize_charger_type(None), None);
+        assert_eq!(sanitize_charger_type(Some("")), None);
+        assert_eq!(sanitize_charger_type(Some("   ")), None);
+        assert_eq!(sanitize_charger_type(Some("<invalid>")), None);
+        assert_eq!(sanitize_charger_type(Some(" <INVALID> ")), None);
+        assert_eq!(sanitize_charger_type(Some("<none>")), None);
+        assert_eq!(sanitize_charger_type(Some("none")), None);
+        assert_eq!(sanitize_charger_type(Some("NULL")), None);
+        assert_eq!(sanitize_charger_type(Some(" Null ")), None);
+        assert_eq!(
+            sanitize_charger_type(Some("Combo")).as_deref(),
+            Some("Combo")
+        );
+        assert_eq!(
+            sanitize_charger_type(Some("  Tesla  ")).as_deref(),
+            Some("Tesla")
+        );
     }
 
     #[test]
