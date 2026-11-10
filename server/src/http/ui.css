@@ -246,6 +246,27 @@ ul.list li {
   border-top: 1px solid var(--line);
 }
 
+ol.logs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+ol.logs li {
+  padding: 0.55rem 0;
+  border-top: 1px solid var(--line);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+ol.logs li:first-child { border-top: 0; padding-top: 0; }
+ol.logs time { color: var(--muted); margin-right: 0.35rem; }
+ol.logs .bad { color: var(--danger); font-weight: 700; }
+ol.logs .warn { font-weight: 700; }
+
 footer {
   width: min(52rem, calc(100% - 2rem));
   margin: 0 auto 2rem;

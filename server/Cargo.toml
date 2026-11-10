@@ -40,7 +40,9 @@ url = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 http-body-util = "0.1"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 tower = { version = "0.5", features = ["util"] }
 wiremock = { workspace = true }
 

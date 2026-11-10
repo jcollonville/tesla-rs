@@ -21,9 +21,10 @@ use crate::import;
 /// The message does not include tokens, the client secret, or the private key.
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
-    init_tracing();
+    let logs = crate::logs::LogBuffer::new(400);
+    init_tracing(logs.clone());
     match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => app::serve().await?,
+        Command::Serve => app::serve(logs).await?,
         Command::ImportTeslaMate { source, batch_size } => {
             let dest = Config::database_url()?;
             let stats = import::import_url(&dest, &source, batch_size).await?;
@@ -77,14 +78,24 @@ enum Command {
     },
 }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info,sqlx=warn,hyper=warn,h2=warn,rumqttc=warn,reqwest=warn")
-    });
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+fn init_tracing(logs: crate::logs::LogBuffer) {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let fmt_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter());
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
+        .with_filter(fmt_filter);
+    let capture = crate::logs::CaptureLayer::new(logs).with_filter(default_filter());
+    let _ = tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(capture)
         .try_init();
+}
+
+fn default_filter() -> EnvFilter {
+    EnvFilter::new("info,sqlx=warn,hyper=warn,h2=warn,rumqttc=warn,reqwest=warn")
 }
 
 async fn healthcheck(url: &str) -> Result<(), AppError> {

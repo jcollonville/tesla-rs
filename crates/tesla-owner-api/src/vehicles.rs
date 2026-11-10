@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-/// One vehicle from `GET /api/1/vehicles`.
+/// One car from `GET /api/1/products`.
 ///
-/// [`Self::vehicle_id`] is the streaming tag. [`Self::id`] is the REST id. They are different
-/// numbers.
+/// Powerwall and solar products are not represented. [`Self::vehicle_id`] is the streaming tag.
+/// [`Self::id`] is the REST id. They are different numbers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnerVehicle {
     /// Vehicle identification number.

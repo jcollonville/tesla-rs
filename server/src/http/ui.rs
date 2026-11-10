@@ -29,6 +29,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/auth/owner/disconnect", post(super::owner::disconnect))
         .route("/tokens", post(create_token))
         .route("/tokens/{id}/revoke", post(revoke_token))
+        .route("/logs", get(logs))
 }
 
 #[derive(Deserialize)]
@@ -46,6 +47,57 @@ struct CsrfForm {
 struct TokenForm {
     csrf: String,
     name: String,
+}
+
+async fn logs(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    if ui_session(&app, &headers).await.is_none() {
+        return Redirect::to("/").into_response();
+    }
+    let mut response = Html(logs_markup(&app.inner.logs.lines())).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn logs_markup(lines: &[crate::logs::LogLine]) -> String {
+    let mut items = String::new();
+    if lines.is_empty() {
+        items.push_str("<p class=\"muted\">No log lines yet.</p>");
+    } else {
+        items.push_str("<ol class=\"logs\">");
+        for line in lines {
+            let _ = write!(
+                items,
+                "<li><time>{}</time> <span class=\"{}\">{}</span> {}</li>",
+                escape(&line.at.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
+                level_class(&line.level),
+                escape(&line.level),
+                escape(&line.text)
+            );
+        }
+        items.push_str("</ol>");
+    }
+    page(&format!(
+        "<header class=\"toolbar\"><div><p class=\"kicker\"><a href=\"/\">tesla-logger</a></p>\
+         <h1 class=\"title\">{}Logs</h1></div>\
+         <div class=\"toolbar-actions\">\
+         <a class=\"button ghost\" href=\"/auth/owner\">{}Streaming</a>\
+         <a class=\"button ghost\" href=\"/\">{}Dashboard</a></div></header>\
+         <p class=\"muted\">Recent lines from this process. They stay in memory and reset on restart. Passwords, tokens, and subscribe frames are removed.</p>\
+         <section class=\"card\">{items}</section>",
+        icon(ICON_LOGS),
+        icon(ICON_STREAM),
+        icon(ICON_ARROW)
+    ))
+}
+
+fn level_class(level: &str) -> &'static str {
+    match level.to_ascii_uppercase().as_str() {
+        "ERROR" => "bad",
+        "WARN" | "WARNING" => "warn",
+        _ => "info",
+    }
 }
 
 async fn status(State(app): State<AppState>, headers: HeaderMap) -> Response {
@@ -385,7 +437,7 @@ fn render_status(
          <div class=\"toolbar-actions\">{connect}\
          <form method=\"post\" action=\"/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"ghost\" type=\"submit\">{}Sign out</button></form></div></header>\
          {global}\
-         <div class=\"meta\">{account}{stream}<a class=\"button ghost\" href=\"/auth/owner\">{}Set up streaming</a></div>\
+         <div class=\"meta\">{account}{stream}<a class=\"button ghost\" href=\"/auth/owner\">{}Set up streaming</a><a class=\"button ghost\" href=\"/logs\">Logs</a></div>\
          <section><h2>Vehicles</h2><div class=\"vehicles\">{cards}</div></section>\
          <section class=\"card\"><h2>API tokens</h2>{revealed}\
          <form class=\"stack\" method=\"post\" action=\"/tokens\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
@@ -525,6 +577,7 @@ pub(super) const ICON_STREAM: &str = "M4.93,4.93C3.12,6.74 2,9.24 2,12C2,14.76 3
 pub(super) const ICON_UNLINK: &str = "M17,7H13V8.9H17C18.71,8.9 20.1,10.29 20.1,12C20.1,13.43 19.12,14.63 17.79,15L19.25,16.44C20.88,15.61 22,13.95 22,12A5,5 0 0,0 17,7M16,11H13.81L15.81,13H16V11M2,4.27L5.11,7.38C3.29,8.12 2,9.91 2,12A5,5 0 0,0 7,17H11V15.1H7C5.29,15.1 3.9,13.71 3.9,12C3.9,10.41 5.11,9.1 6.66,8.93L8.73,11H8V13H10.73L13,15.27V17H14.73L18.74,21L20,19.74L3.27,3L2,4.27Z";
 pub(super) const ICON_ARROW: &str =
     "M20,11V13H8L13.5,18.5L12.08,19.92L4.16,12L12.08,4.08L13.5,5.5L8,11H20Z";
+pub(super) const ICON_LOGS: &str = "M5,3C3.89,3 3,3.89 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V5C21,3.89 20.1,3 19,3H5M5,5H19V19H5V5M7,7V9H17V7H7M7,11V13H17V11H7M7,15V17H14V15H7Z";
 pub(super) const ICON_CAR: &str = "M5,11L6.5,6.5H17.5L19,11M17.5,16A1.5,1.5 0 0,1 16,14.5A1.5,1.5 0 0,1 17.5,13A1.5,1.5 0 0,1 19,14.5A1.5,1.5 0 0,1 17.5,16M6.5,16A1.5,1.5 0 0,1 5,14.5A1.5,1.5 0 0,1 6.5,13A1.5,1.5 0 0,1 8,14.5A1.5,1.5 0 0,1 6.5,16M18.92,6C18.72,5.42 18.16,5 17.5,5H6.5C5.84,5 5.28,5.42 5.08,6L3,12V20A1,1 0 0,0 4,21H5A1,1 0 0,0 6,20V19H18V20A1,1 0 0,0 19,21H20A1,1 0 0,0 21,20V12L18.92,6Z";
 
 fn fmt_time(value: Option<chrono::DateTime<chrono::Utc>>) -> String {
@@ -614,6 +667,7 @@ mod tests {
         assert!(html.contains("action=\"/logout\""));
         assert!(html.contains("action=\"/auth/disconnect\""));
         assert!(html.contains("href=\"/auth/owner\""));
+        assert!(html.contains("href=\"/logs\""));
         assert!(html.contains("action=\"/tokens\""));
         assert!(html.contains("action=\"/tokens/3/revoke\""));
         assert!(html.contains("name=\"csrf\" value=\"csrf-token\""));

@@ -301,14 +301,16 @@ impl OwnerClient {
         tokens
     }
 
-    /// Lists vehicles visible to the Owner API token.
+    /// Lists cars visible to the Owner API token.
     ///
-    /// The response can include streaming tokens. Those fields are ignored and are not logged.
+    /// Calls `GET /api/1/products` and keeps objects with a VIN and a non-zero `vehicle_id`.
+    /// Tesla returns HTTP 412 for `GET /api/1/vehicles`. Powerwall and solar products are skipped.
+    /// Streaming tokens in the payload are ignored and are not logged.
     ///
     /// # Errors
     ///
-    /// Returns [`OwnerError::LoginRequired`] on HTTP 401 and [`OwnerError::Malformed`] when the
-    /// body is not a vehicle list.
+    /// Returns [`OwnerError::LoginRequired`] on HTTP 401, [`OwnerError::RequestRejected`] on any
+    /// other non-success status, and [`OwnerError::Malformed`] when the body is not a product list.
     pub async fn list_vehicles(
         &self,
         access_token: &SecretString,
@@ -316,7 +318,7 @@ impl OwnerClient {
         let url = self
             .endpoints
             .api_base
-            .join("/api/1/vehicles")
+            .join("/api/1/products")
             .map_err(|_| OwnerError::InsecureUrl)?;
         ensure_http(&url)?;
         let response = self
@@ -332,7 +334,7 @@ impl OwnerClient {
             return Err(OwnerError::LoginRequired);
         }
         if !(200..300).contains(&status) {
-            return Err(OwnerError::Rejected { status });
+            return Err(OwnerError::RequestRejected { status });
         }
         parse_vehicle_list(&bytes)
     }
@@ -468,29 +470,23 @@ fn parse_vehicle_list(bytes: &[u8]) -> Result<Vec<OwnerVehicle>, OwnerError> {
     let Some(rows) = value.get("response").and_then(Value::as_array) else {
         return Err(OwnerError::Malformed);
     };
-    let mut vehicles = Vec::new();
-    for row in rows {
-        let Some(vin) = row.get("vin").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(id) = row.get("id").and_then(json_i64) else {
-            continue;
-        };
-        let Some(vehicle_id) = row.get("vehicle_id").and_then(json_i64) else {
-            continue;
-        };
-        if vin.is_empty() || vehicle_id == 0 {
-            continue;
-        }
-        let state = row.get("state").and_then(Value::as_str).map(str::to_owned);
-        vehicles.push(OwnerVehicle {
-            vin: vin.to_owned(),
-            id,
-            vehicle_id,
-            state,
-        });
+    Ok(rows.iter().filter_map(vehicle_from_product).collect())
+}
+
+fn vehicle_from_product(row: &Value) -> Option<OwnerVehicle> {
+    let vin = row.get("vin").and_then(Value::as_str)?;
+    let id = row.get("id").and_then(json_i64)?;
+    let vehicle_id = row.get("vehicle_id").and_then(json_i64)?;
+    if vin.is_empty() || vehicle_id == 0 {
+        return None;
     }
-    Ok(vehicles)
+    let state = row.get("state").and_then(Value::as_str).map(str::to_owned);
+    Some(OwnerVehicle {
+        vin: vin.to_owned(),
+        id,
+        vehicle_id,
+        state,
+    })
 }
 
 fn token_error(status: u16, bytes: &[u8]) -> OwnerError {
@@ -666,7 +662,7 @@ mod tests {
     async fn vehicle_list_uses_vehicle_id_not_the_rest_id() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/api/1/vehicles"))
+            .and(wiremock::matchers::path("/api/1/products"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
                 r#"{"response":[{"id":1,"vehicle_id":99,"vin":"5YJ3E1EA7KF000001","state":"online","tokens":["do-not-keep"]}]}"#,
             ))
@@ -681,7 +677,10 @@ mod tests {
         assert_eq!(vehicles[0].id, 1);
         assert_eq!(vehicles[0].vehicle_id, 99);
         assert_eq!(vehicles[0].vin, "5YJ3E1EA7KF000001");
-        let header = server.received_requests().await.unwrap()[0]
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/api/1/products");
+        let header = requests[0]
             .headers
             .get("authorization")
             .unwrap()
@@ -689,6 +688,77 @@ mod tests {
             .unwrap()
             .to_owned();
         assert_eq!(header, "Bearer access-token");
+        assert!(!format!("{vehicles:?}").contains("do-not-keep"));
+    }
+
+    #[tokio::test]
+    async fn products_list_keeps_cars_and_drops_energy_products() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/1/products"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+                r#"{"response":[
+                    {"energy_site_id":225,"resource_type":"battery","site_name":"Home","id":"site-1","components":{"battery":true,"solar":true}},
+                    {"id":77,"vin":"SOLAR000000000000","resource_type":"solar","site_name":"Roof"},
+                    {"id":1,"vehicle_id":99,"vin":"5YJ3E1EA7KF000001","state":"asleep","display_name":"Faucon Millenium","tokens":["do-not-keep"]},
+                    {"id":2,"vehicle_id":0,"vin":"5YJ3E1EA7KF000002"},
+                    {"id":3,"vehicle_id":null,"vin":"5YJ3E1EA7KF000003","resource_type":"solar"}
+                ]}"#,
+            ))
+            .mount(&server)
+            .await;
+        let client = OwnerClient::for_test_origin(&server.uri()).unwrap();
+        let vehicles = client
+            .list_vehicles(&SecretString::from("access-token".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(vehicles.len(), 1);
+        assert_eq!(vehicles[0].vin, "5YJ3E1EA7KF000001");
+        assert_eq!(vehicles[0].vehicle_id, 99);
+        assert_eq!(vehicles[0].id, 1);
+        assert!(!format!("{vehicles:?}").contains("do-not-keep"));
+        assert!(!format!("{vehicles:?}").contains("Home"));
+        assert!(!format!("{vehicles:?}").contains("SOLAR"));
+    }
+
+    #[tokio::test]
+    async fn products_412_is_not_a_failed_sign_in() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/1/products"))
+            .respond_with(wiremock::ResponseTemplate::new(412).set_body_string(
+                r#"{"response":null,"error":"Endpoint is only available on fleetapi","error_description":"","body_secret":"fleetapi-body-secret"}"#,
+            ))
+            .mount(&server)
+            .await;
+        let client = OwnerClient::for_test_origin(&server.uri()).unwrap();
+        let err = client
+            .list_vehicles(&SecretString::from("access-token".to_owned()))
+            .await
+            .unwrap_err();
+        assert!(!err.is_login_required());
+        let rendered = err.to_string();
+        assert!(rendered.contains("412"));
+        assert!(!rendered.contains("sign-in"));
+        assert!(!rendered.contains("fleetapi-body-secret"));
+        assert!(!rendered.contains("access-token"));
+    }
+
+    #[tokio::test]
+    async fn products_401_requires_sign_in() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/1/products"))
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let client = OwnerClient::for_test_origin(&server.uri()).unwrap();
+        let err = client
+            .list_vehicles(&SecretString::from("access-token".to_owned()))
+            .await
+            .unwrap_err();
+        assert!(err.is_login_required());
+        assert!(!err.to_string().contains("access-token"));
     }
 
     #[test]
