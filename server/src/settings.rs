@@ -24,6 +24,7 @@ pub(crate) const KEYS: &[&str] = &[
     "MQTT_HOST",
     "MQTT_PORT",
     "MQTT_TOPIC_PREFIX",
+    "ADMIN_SEES_ALL_TRIPS",
 ];
 
 pub(crate) fn allowed(key: &str) -> bool {

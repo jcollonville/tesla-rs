@@ -25,6 +25,8 @@ allow = [
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
+    # File-level weak copyleft. webauthn-rs uses it.
+    "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
 ]
