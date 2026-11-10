@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use url::Url;
 use zeroize::Zeroize;
 
@@ -58,6 +59,8 @@ pub struct StreamSample {
 /// One event from a streaming session.
 ///
 /// `Sample` is the common variant. It stays unboxed so a GPS row is not allocated twice.
+/// [`StreamEvent::Trace`] is observability only. It is not telemetry and it never carries the
+/// OAuth token.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamEvent {
@@ -65,6 +68,48 @@ pub enum StreamEvent {
     Subscribed,
     /// A telemetry row.
     Sample(StreamSample),
+    /// A frame or socket event the caller can show in a debug console.
+    Trace(StreamTrace),
+}
+
+/// A websocket event that is not a telemetry row.
+///
+/// Error text is shortened before it is sent. A long opaque value is replaced so a token echoed
+/// by the vehicle is not forwarded. The subscribe token is never placed in a trace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamTrace {
+    /// `control:hello` from the vehicle.
+    Hello,
+    /// Websocket ping from the vehicle.
+    Ping,
+    /// Websocket pong written in reply to a ping.
+    Pong,
+    /// Websocket pong received from the vehicle.
+    PongReceived,
+    /// The vehicle closed the socket. `detail` is the close code and reason.
+    Closed {
+        /// Short close description, for example `close code=1000 reason=bye`.
+        detail: String,
+    },
+    /// `data:error`. `value` has already been shortened.
+    Error {
+        /// `error_type` from the frame, when present.
+        error_type: String,
+        /// Short, redacted `value` from the frame.
+        value: String,
+    },
+    /// A text frame that could not be parsed.
+    ParseFailed {
+        /// Stable reason, for example `too many columns` or `value is not a string`.
+        reason: &'static str,
+        /// `msg_type` when the frame was JSON and the type was a short label.
+        msg_type: Option<String>,
+    },
+    /// A text frame this client does not use.
+    Ignored {
+        /// `msg_type`, or `unknown` when the frame did not name one.
+        msg_type: String,
+    },
 }
 
 /// A decoded streaming frame.
@@ -126,11 +171,85 @@ pub struct ReconnectPlan {
     pub refresh_token: bool,
 }
 
-/// How a [`pump_stream`] call ended.
+/// Frames seen on one websocket connection.
+///
+/// Counts are incoming frames only. A ping reply is not a ping. The subscribe frame is outgoing
+/// and is not included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamStats {
+    /// How long the websocket stayed open after the handshake.
+    pub connected: Duration,
+    /// Delay between the previous incoming frame and the end of the connection.
+    ///
+    /// [`None`] when the vehicle sent no frame.
+    pub since_last_frame: Option<Duration>,
+    /// `control:hello` frames.
+    pub hello: u32,
+    /// Websocket pings.
+    pub ping: u32,
+    /// `data:update` frames.
+    pub updates: u32,
+    /// `data:error` frames.
+    pub errors: u32,
+    /// Text frames that failed to parse.
+    pub parse_failures: u32,
+}
+
+/// Why [`pump_stream`] stopped, plus what that connection carried.
+///
+/// [`Self::detail`] is a close code and reason, or a short IO error. It does not contain the
+/// access token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamStop {
+    /// Reconnect class.
+    pub class: FailureClass,
+    /// Close code and reason, or the underlying protocol or IO error.
+    pub detail: String,
+    /// Frames and timing for this connection.
+    pub stats: StreamStats,
+}
+
+impl StreamStop {
+    fn offline(class: FailureClass, detail: impl Into<String>) -> Self {
+        Self {
+            class,
+            detail: detail.into(),
+            stats: StreamStats {
+                connected: Duration::ZERO,
+                since_last_frame: None,
+                hello: 0,
+                ping: 0,
+                updates: 0,
+                errors: 0,
+                parse_failures: 0,
+            },
+        }
+    }
+}
+
+/// How a [`pump_stream`] call ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PumpEnd {
     /// The socket ended and the caller should reconnect.
-    Failed(FailureClass),
+    Failed(StreamStop),
+}
+
+impl PumpEnd {
+    /// Reconnect class for this end.
+    #[must_use]
+    pub const fn class(&self) -> FailureClass {
+        match self {
+            Self::Failed(stop) => stop.class,
+        }
+    }
+
+    /// Close or IO detail and the frame counts for this connection.
+    #[must_use]
+    pub const fn stop(&self) -> &StreamStop {
+        match self {
+            Self::Failed(stop) => stop,
+        }
+    }
 }
 
 /// Parses one text frame.
@@ -140,30 +259,81 @@ pub enum PumpEnd {
 /// Returns [`OwnerError::Malformed`] when the frame is not JSON or the update row has too many
 /// columns. A short row is accepted. Missing cells are [`None`].
 pub fn parse_message(text: &str) -> Result<Incoming, OwnerError> {
-    let value: Value = serde_json::from_str(text).map_err(|_| OwnerError::Malformed)?;
-    let kind = value.get("msg_type").and_then(Value::as_str).unwrap_or("");
-    match kind {
-        "data:update" => {
-            let csv = value
-                .get("value")
-                .and_then(Value::as_str)
-                .ok_or(OwnerError::Malformed)?;
-            Ok(Incoming::Update(parse_csv(csv)?))
+    read_frame(text)
+        .map(|decoded| decoded.incoming)
+        .map_err(|_| OwnerError::Malformed)
+}
+
+struct Decoded {
+    incoming: Incoming,
+    msg_type: Option<String>,
+}
+
+struct ParseFault {
+    reason: &'static str,
+    msg_type: Option<String>,
+}
+
+fn read_frame(text: &str) -> Result<Decoded, ParseFault> {
+    let value: Value = match serde_json::from_str(text) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(ParseFault {
+                reason: "not json",
+                msg_type: None,
+            });
         }
-        "data:error" => Ok(Incoming::Error {
-            error_type: value
-                .get("error_type")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned(),
-            value: value
-                .get("value")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned(),
+    };
+    if !value.is_object() {
+        return Err(ParseFault {
+            reason: "not a json object",
+            msg_type: None,
+        });
+    }
+    let msg_type = clean_msg_type(value.get("msg_type").and_then(Value::as_str));
+    match msg_type.as_deref().unwrap_or("") {
+        "data:update" => match value.get("value") {
+            Some(Value::String(csv)) => match parse_csv(csv) {
+                Ok(sample) => Ok(Decoded {
+                    incoming: Incoming::Update(sample),
+                    msg_type,
+                }),
+                Err(reason) => Err(ParseFault { reason, msg_type }),
+            },
+            Some(_) => Err(ParseFault {
+                reason: "value is not a string",
+                msg_type,
+            }),
+            None => Err(ParseFault {
+                reason: "missing value",
+                msg_type,
+            }),
+        },
+        "data:error" => match value.get("value") {
+            Some(value) if !value.is_string() => Err(ParseFault {
+                reason: "value is not a string",
+                msg_type,
+            }),
+            other => Ok(Decoded {
+                incoming: Incoming::Error {
+                    error_type: value
+                        .get("error_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    value: other.and_then(Value::as_str).unwrap_or("").to_owned(),
+                },
+                msg_type,
+            }),
+        },
+        "control:hello" => Ok(Decoded {
+            incoming: Incoming::Hello,
+            msg_type,
         }),
-        "control:hello" => Ok(Incoming::Hello),
-        _ => Ok(Incoming::Ignore),
+        _ => Ok(Decoded {
+            incoming: Incoming::Ignore,
+            msg_type,
+        }),
     }
 }
 
@@ -243,6 +413,8 @@ pub fn plan_reconnect(class: FailureClass, consecutive: u32) -> ReconnectPlan {
 ///
 /// [`StreamEvent::Subscribed`] is sent after the subscribe frame is written, before any GPS row.
 /// Samples follow on the same channel. The access token is copied into the subscribe frame only.
+/// Parse failures, hello, ping, and `data:error` are forwarded as [`StreamEvent::Trace`]. The
+/// subscribe token is not included in those traces.
 pub async fn pump_stream(
     url: &str,
     access_token: &SecretString,
@@ -250,7 +422,10 @@ pub async fn pump_stream(
     samples: mpsc::Sender<StreamEvent>,
 ) -> PumpEnd {
     if ensure_stream_url(url).is_err() {
-        return PumpEnd::Failed(FailureClass::Unavailable);
+        return PumpEnd::Failed(StreamStop::offline(
+            FailureClass::Unavailable,
+            "insecure stream url",
+        ));
     }
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(64 * 1024);
@@ -259,61 +434,202 @@ pub async fn pump_stream(
     let (socket, _) = match connection {
         Ok(pair) => pair,
         Err(err) => {
-            return PumpEnd::Failed(classify_transport_message(&err.to_string()));
+            let detail = scrub_error_value(&err.to_string());
+            return PumpEnd::Failed(StreamStop::offline(
+                classify_transport_message(&detail),
+                detail,
+            ));
         }
     };
     let (mut write, mut read) = socket.split();
     let mut frame = subscribe_frame(access_token.expose_secret(), vehicle_id);
     let send = write.send(Message::Text(frame.clone().into())).await;
     frame.zeroize();
+    let mut live = Live::new();
     if send.is_err() {
-        return PumpEnd::Failed(FailureClass::Transport);
+        return live.finish(FailureClass::Transport, "subscribe send failed");
     }
-    if samples.send(StreamEvent::Subscribed).await.is_err() {
-        return PumpEnd::Failed(FailureClass::Transport);
+    if !emit(&samples, StreamEvent::Subscribed).await {
+        return live.finish(FailureClass::Transport, "event channel closed");
     }
     loop {
         let next = tokio::time::timeout(READ_TIMEOUT, read.next()).await;
         let message = match next {
-            Err(_) => return PumpEnd::Failed(FailureClass::Timeout),
-            Ok(None) => return PumpEnd::Failed(FailureClass::Transport),
+            Err(_) => return live.finish(FailureClass::Timeout, "read timeout"),
+            Ok(None) => return live.finish(FailureClass::Transport, "stream ended"),
             Ok(Some(Err(err))) => {
-                return PumpEnd::Failed(classify_transport_message(&err.to_string()));
+                let detail = scrub_error_value(&err.to_string());
+                return live.finish(classify_transport_message(&detail), detail);
             }
             Ok(Some(Ok(message))) => message,
         };
         match message {
-            Message::Text(text) => match parse_message(text.as_str()) {
-                Ok(Incoming::Update(sample)) => {
-                    if samples.send(StreamEvent::Sample(sample)).await.is_err() {
-                        return PumpEnd::Failed(FailureClass::Transport);
+            Message::Text(text) => match read_frame(text.as_str()) {
+                Ok(decoded) => match decoded.incoming {
+                    Incoming::Update(sample) => {
+                        live.updates = live.updates.saturating_add(1);
+                        live.saw_frame();
+                        if !emit(&samples, StreamEvent::Sample(sample)).await {
+                            return live.finish(FailureClass::Transport, "event channel closed");
+                        }
+                    }
+                    Incoming::Error { error_type, value } => {
+                        let class = classify_stream_error(&error_type, &value);
+                        let value = scrub_error_value(&value);
+                        live.errors = live.errors.saturating_add(1);
+                        live.saw_frame();
+                        let detail = format!("data:error type={error_type} value={value}");
+                        if !emit(
+                            &samples,
+                            StreamEvent::Trace(StreamTrace::Error { error_type, value }),
+                        )
+                        .await
+                        {
+                            return live.finish(FailureClass::Transport, "event channel closed");
+                        }
+                        return live.finish(class, detail);
+                    }
+                    Incoming::Hello => {
+                        live.hello = live.hello.saturating_add(1);
+                        live.saw_frame();
+                        if !emit(&samples, StreamEvent::Trace(StreamTrace::Hello)).await {
+                            return live.finish(FailureClass::Transport, "event channel closed");
+                        }
+                    }
+                    Incoming::Ignore => {
+                        live.saw_frame();
+                        let msg_type = decoded.msg_type.unwrap_or_else(|| "unknown".to_owned());
+                        if !emit(
+                            &samples,
+                            StreamEvent::Trace(StreamTrace::Ignored { msg_type }),
+                        )
+                        .await
+                        {
+                            return live.finish(FailureClass::Transport, "event channel closed");
+                        }
+                    }
+                },
+                Err(fault) => {
+                    live.parse_failures = live.parse_failures.saturating_add(1);
+                    live.saw_frame();
+                    if !emit(
+                        &samples,
+                        StreamEvent::Trace(StreamTrace::ParseFailed {
+                            reason: fault.reason,
+                            msg_type: fault.msg_type,
+                        }),
+                    )
+                    .await
+                    {
+                        return live.finish(FailureClass::Transport, "event channel closed");
                     }
                 }
-                Ok(Incoming::Error { error_type, value }) => {
-                    return PumpEnd::Failed(classify_stream_error(&error_type, &value));
-                }
-                Ok(Incoming::Hello | Incoming::Ignore) | Err(_) => {}
             },
             Message::Ping(payload) => {
+                live.ping = live.ping.saturating_add(1);
+                live.saw_frame();
+                if !emit(&samples, StreamEvent::Trace(StreamTrace::Ping)).await {
+                    return live.finish(FailureClass::Transport, "event channel closed");
+                }
                 if write.send(Message::Pong(payload)).await.is_err() {
-                    return PumpEnd::Failed(FailureClass::Transport);
+                    return live.finish(FailureClass::Transport, "pong send failed");
+                }
+                if !emit(&samples, StreamEvent::Trace(StreamTrace::Pong)).await {
+                    return live.finish(FailureClass::Transport, "event channel closed");
                 }
             }
-            Message::Close(_) => return PumpEnd::Failed(FailureClass::Transport),
-            Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
+            Message::Close(frame) => {
+                let detail = close_detail(frame);
+                let _ = emit(
+                    &samples,
+                    StreamEvent::Trace(StreamTrace::Closed {
+                        detail: detail.clone(),
+                    }),
+                )
+                .await;
+                return live.finish(FailureClass::Transport, detail);
+            }
+            Message::Pong(_) => {
+                live.saw_frame();
+                if !emit(&samples, StreamEvent::Trace(StreamTrace::PongReceived)).await {
+                    return live.finish(FailureClass::Transport, "event channel closed");
+                }
+            }
+            Message::Binary(_) | Message::Frame(_) => live.saw_frame(),
         }
     }
 }
 
-fn parse_csv(csv: &str) -> Result<StreamSample, OwnerError> {
+struct Live {
+    started: std::time::Instant,
+    last_frame: Option<std::time::Instant>,
+    hello: u32,
+    ping: u32,
+    updates: u32,
+    errors: u32,
+    parse_failures: u32,
+}
+
+impl Live {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            last_frame: None,
+            hello: 0,
+            ping: 0,
+            updates: 0,
+            errors: 0,
+            parse_failures: 0,
+        }
+    }
+
+    fn saw_frame(&mut self) {
+        self.last_frame = Some(std::time::Instant::now());
+    }
+
+    fn finish(&self, class: FailureClass, detail: impl Into<String>) -> PumpEnd {
+        PumpEnd::Failed(StreamStop {
+            class,
+            detail: detail.into(),
+            stats: StreamStats {
+                connected: self.started.elapsed(),
+                since_last_frame: self.last_frame.map(|at| at.elapsed()),
+                hello: self.hello,
+                ping: self.ping,
+                updates: self.updates,
+                errors: self.errors,
+                parse_failures: self.parse_failures,
+            },
+        })
+    }
+}
+
+/// Keepalives are dropped when the channel is full. Samples, errors, and parse failures wait.
+async fn emit(samples: &mpsc::Sender<StreamEvent>, event: StreamEvent) -> bool {
+    let lossy = matches!(
+        event,
+        StreamEvent::Trace(
+            StreamTrace::Hello | StreamTrace::Ping | StreamTrace::Pong | StreamTrace::PongReceived
+        )
+    );
+    if lossy {
+        return !matches!(
+            samples.try_send(event),
+            Err(mpsc::error::TrySendError::Closed(_))
+        );
+    }
+    samples.send(event).await.is_ok()
+}
+
+fn parse_csv(csv: &str) -> Result<StreamSample, &'static str> {
     let mut cells = csv.split(',');
-    let stamp = cells.next().ok_or(OwnerError::Malformed)?;
-    let recorded_at_ms = parse_timestamp(stamp).ok_or(OwnerError::Malformed)?;
+    let stamp = cells.next().ok_or("missing timestamp")?;
+    let recorded_at_ms = parse_timestamp(stamp).ok_or("bad timestamp")?;
     let mut fields = Vec::with_capacity(COLUMN_COUNT);
     for cell in cells {
         fields.push(cell);
         if fields.len() > COLUMN_COUNT {
-            return Err(OwnerError::Malformed);
+            return Err("too many columns");
         }
     }
     let cell = |index: usize| fields.get(index).copied().unwrap_or("");
@@ -375,6 +691,52 @@ fn capped_exp(base_secs: u64, cap_secs: u64, consecutive: u32) -> Duration {
     Duration::from_secs(base_secs.saturating_mul(factor).min(cap_secs))
 }
 
+fn clean_msg_type(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.len() > 64
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '_' | '-'))
+    {
+        return Some("unknown".to_owned());
+    }
+    Some(value.to_owned())
+}
+
+fn close_detail(frame: Option<CloseFrame>) -> String {
+    let Some(frame) = frame else {
+        return "close without a code".to_owned();
+    };
+    let code: u16 = frame.code.into();
+    let reason = scrub_error_value(frame.reason.as_ref());
+    if reason.is_empty() {
+        format!("close code={code}")
+    } else {
+        format!("close code={code} reason={reason}")
+    }
+}
+
+fn scrub_error_value(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if let Some(at) = lower.find("bearer") {
+        let after = at + "bearer".len();
+        if value.len() > after && value.as_bytes()[after].is_ascii_whitespace() {
+            return "Bearer ***".to_owned();
+        }
+    }
+    if value.len() >= 24
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return "***".to_owned();
+    }
+    value.chars().take(180).collect()
+}
+
 fn ensure_stream_url(url: &str) -> Result<(), OwnerError> {
     let url = Url::parse(url).map_err(|_| OwnerError::InsecureStreamUrl)?;
     match url.scheme() {
@@ -387,7 +749,7 @@ fn ensure_stream_url(url: &str) -> Result<(), OwnerError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureClass, Incoming, PumpEnd, STREAM_COLUMNS, StreamEvent, classify_stream_error,
+        FailureClass, Incoming, STREAM_COLUMNS, StreamEvent, StreamTrace, classify_stream_error,
         classify_transport_message, parse_message, plan_reconnect, pump_stream, subscribe_frame,
     };
     use futures_util::{SinkExt, StreamExt};
@@ -397,6 +759,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 
     #[test]
     fn parses_a_full_update_and_blank_cells() {
@@ -427,6 +790,13 @@ mod tests {
         assert_eq!(sample.est_lat, None);
 
         assert!(parse_message("not-json").is_err());
+        assert!(parse_message(r#"{"msg_type":"data:update","value":1}"#).is_err());
+        assert!(
+            parse_message(
+                r#"{"msg_type":"data:update","value":"1,2,3,4,5,6,7,8,9,10,11,12,13,14"}"#
+            )
+            .is_err()
+        );
         assert!(matches!(
             parse_message(r#"{"msg_type":"control:hello"}"#).unwrap(),
             Incoming::Hello
@@ -546,7 +916,7 @@ mod tests {
                 r#"{"msg_type":"data:error","error_type":"vehicle_disconnected","value":"closed"}"#;
             socket.send(Message::Text(error.into())).await.unwrap();
         });
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(8);
         let end = pump_stream(
             &format!("ws://{addr}/streaming/"),
             &SecretString::from("test-token".to_owned()),
@@ -560,7 +930,20 @@ mod tests {
         };
         assert_eq!(sample.shift_state.as_deref(), Some("D"));
         assert_eq!(sample.est_lat, Some(48.1));
-        assert_eq!(end, PumpEnd::Failed(FailureClass::VehicleDisconnected));
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            StreamEvent::Trace(StreamTrace::Error {
+                error_type: "vehicle_disconnected".to_owned(),
+                value: "closed".to_owned(),
+            })
+        );
+        assert_eq!(end.class(), FailureClass::VehicleDisconnected);
+        assert_eq!(end.stop().stats.updates, 1);
+        assert_eq!(end.stop().stats.errors, 1);
+        assert!(
+            end.stop().detail.contains("vehicle_disconnected"),
+            "{end:?}"
+        );
         server.await.unwrap();
     }
 
@@ -585,7 +968,7 @@ mod tests {
             socket.send(Message::Ping(vec![1].into())).await.unwrap();
             socket.send(Message::Close(None)).await.unwrap();
         });
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(8);
         let end = pump_stream(
             &format!("ws://{addr}/streaming/"),
             &SecretString::from("test-token".to_owned()),
@@ -594,8 +977,29 @@ mod tests {
         )
         .await;
         assert_eq!(rx.recv().await.unwrap(), StreamEvent::Subscribed);
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            StreamEvent::Trace(StreamTrace::Hello)
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            StreamEvent::Trace(StreamTrace::Ping)
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            StreamEvent::Trace(StreamTrace::Pong)
+        );
+        match rx.recv().await.unwrap() {
+            StreamEvent::Trace(StreamTrace::Closed { detail }) => {
+                assert!(detail.contains("close"), "{detail}");
+            }
+            other => panic!("expected close, got {other:?}"),
+        }
         assert!(rx.try_recv().is_err());
-        assert_eq!(end, PumpEnd::Failed(FailureClass::Transport));
+        assert_eq!(end.class(), FailureClass::Transport);
+        assert_eq!(end.stop().stats.hello, 1);
+        assert_eq!(end.stop().stats.ping, 1);
+        assert!(end.stop().stats.since_last_frame.is_some());
         server.await.unwrap();
     }
 
@@ -611,7 +1015,7 @@ mod tests {
                 r#"{"msg_type":"data:error","error_type":"client_error","value":"invalid token"}"#;
             socket.send(Message::Text(error.into())).await.unwrap();
         });
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(8);
         let end = pump_stream(
             &format!("ws://{addr}/streaming/"),
             &SecretString::from("test-token".to_owned()),
@@ -620,8 +1024,131 @@ mod tests {
         )
         .await;
         assert_eq!(rx.recv().await.unwrap(), StreamEvent::Subscribed);
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            StreamEvent::Trace(StreamTrace::Error {
+                error_type: "client_error".to_owned(),
+                value: "invalid token".to_owned(),
+            })
+        );
         assert!(rx.try_recv().is_err());
-        assert_eq!(end, PumpEnd::Failed(FailureClass::Auth));
+        assert_eq!(end.class(), FailureClass::Auth);
+        assert_eq!(end.stop().stats.errors, 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pump_reports_frames_that_fail_to_parse() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _ = socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::Text(
+                    r#"{"msg_type":"data:update","value":1}"#.into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    r#"{"msg_type":"data:update","value":"1,2,3,4,5,6,7,8,9,10,11,12,13,14"}"#
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            socket.send(Message::Text("not-json".into())).await.unwrap();
+            socket.send(Message::Close(None)).await.unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        let end = pump_stream(
+            &format!("ws://{addr}/streaming/"),
+            &SecretString::from("test-token".to_owned()),
+            7,
+            tx,
+        )
+        .await;
+        assert_eq!(rx.recv().await.unwrap(), StreamEvent::Subscribed);
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            StreamEvent::Trace(StreamTrace::ParseFailed {
+                reason: "value is not a string",
+                msg_type: Some("data:update".to_owned()),
+            })
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            StreamEvent::Trace(StreamTrace::ParseFailed {
+                reason: "too many columns",
+                msg_type: Some("data:update".to_owned()),
+            })
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            StreamEvent::Trace(StreamTrace::ParseFailed {
+                reason: "not json",
+                msg_type: None,
+            })
+        );
+        match rx.recv().await.unwrap() {
+            StreamEvent::Trace(StreamTrace::Closed { .. }) => {}
+            other => panic!("expected close, got {other:?}"),
+        }
+        assert_eq!(end.class(), FailureClass::Transport);
+        assert_eq!(end.stop().stats.parse_failures, 3);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pump_records_the_close_code_reason_and_frame_counts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _ = socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::Text(r#"{"msg_type":"control:hello"}"#.into()))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: 1000.into(),
+                    reason: "bye".into(),
+                })))
+                .await
+                .unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        let end = pump_stream(
+            &format!("ws://{addr}/streaming/"),
+            &SecretString::from("test-token".to_owned()),
+            7,
+            tx,
+        )
+        .await;
+        assert_eq!(rx.recv().await.unwrap(), StreamEvent::Subscribed);
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            StreamEvent::Trace(StreamTrace::Hello)
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            StreamEvent::Trace(StreamTrace::Closed {
+                detail: "close code=1000 reason=bye".to_owned(),
+            })
+        );
+        let stop = end.stop();
+        assert_eq!(stop.class, FailureClass::Transport);
+        assert_eq!(stop.detail, "close code=1000 reason=bye");
+        assert_eq!(stop.stats.hello, 1);
+        assert_eq!(stop.stats.ping, 0);
+        assert_eq!(stop.stats.updates, 0);
+        assert_eq!(stop.stats.errors, 0);
+        assert_eq!(stop.stats.parse_failures, 0);
+        assert!(stop.stats.connected > Duration::ZERO);
+        assert!(stop.stats.since_last_frame.is_some());
         server.await.unwrap();
     }
 
@@ -635,6 +1162,7 @@ mod tests {
             tx,
         )
         .await;
-        assert_eq!(end, PumpEnd::Failed(FailureClass::Unavailable));
+        assert_eq!(end.class(), FailureClass::Unavailable);
+        assert_eq!(end.stop().stats.connected, Duration::ZERO);
     }
 }

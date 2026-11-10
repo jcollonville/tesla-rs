@@ -16,8 +16,8 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::{DateTime, Utc};
 use tesla_auth::{Scope, TokenSet};
 use tesla_owner_api::{
-    FailureClass, OwnerClient, OwnerError, OwnerRegion, OwnerTokens, PumpEnd, SecretString,
-    StreamEvent, plan_reconnect, pump_stream,
+    FailureClass, OwnerClient, OwnerError, OwnerRegion, OwnerTokens, PumpEnd, STREAM_COLUMNS,
+    SecretString, StreamEvent, StreamSample, StreamStop, StreamTrace, plan_reconnect, pump_stream,
 };
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
@@ -25,6 +25,7 @@ use tokio::time::sleep;
 
 use crate::config::Config;
 use crate::crypto::TokenFile;
+use crate::debug::{DebugBoard, OwnerCount, OwnerNote};
 use crate::ingest::{Archive, apply_stream_for_vin};
 use crate::persist::{StreamFix, VehicleIdentity, upsert_vehicle};
 use crate::units::{MILES_TO_KM, miles_to_km};
@@ -155,6 +156,7 @@ struct OwnerSession {
     client: OwnerClient,
     store: TokenFile,
     lock: Mutex<()>,
+    debug: DebugBoard,
 }
 
 impl OwnerSession {
@@ -186,21 +188,24 @@ impl OwnerSession {
         let Some(refresh) = current.refresh_token().cloned() else {
             return Err(SessionError::LoginRequired);
         };
-        let updated = self
-            .client
-            .refresh(&refresh)
-            .await
-            .map_err(|err| session_err(&err))?;
+        let updated = match self.client.refresh(&refresh).await {
+            Ok(updated) => updated,
+            Err(err) => {
+                self.debug.token_failed("owner", &err.to_string());
+                return Err(session_err(&err));
+            }
+        };
         let saved = TokenSet::bearer(
             updated.access_token().clone(),
             updated.refresh_token().cloned(),
             updated.expires_at(),
             owner_scopes(),
         );
-        self.store
-            .save(&saved)
-            .await
-            .map_err(|err| SessionError::Other(err.to_string()))?;
+        if let Err(err) = self.store.save(&saved).await {
+            self.debug
+                .token_failed("owner", "owner token file could not be saved");
+            return Err(SessionError::Other(err.to_string()));
+        }
         Ok(updated.access_token().clone())
     }
 }
@@ -222,11 +227,13 @@ pub(crate) async fn run(
     config: &Config,
     archive: Arc<Archive>,
     board: StreamBoard,
+    debug: DebugBoard,
     mut tokens: watch::Receiver<u64>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     if !config.owner_stream_enabled {
         board.set_mode(false, false).await;
+        debug.set_owner_overview("disabled", None, true);
         return;
     }
     loop {
@@ -236,20 +243,30 @@ pub(crate) async fn run(
         match tokens_ready(config).await {
             TokenFileState::Absent => {
                 board.set_mode(true, false).await;
+                debug.set_owner_overview(
+                    "disabled",
+                    Some("owner token file is absent".to_owned()),
+                    true,
+                );
                 if !wait_signal(&mut tokens, &mut shutdown, None).await {
                     break;
                 }
                 continue;
             }
             TokenFileState::Unreadable(message) => {
+                let message = crate::logs::redact_line(&message, &[]);
                 tracing::warn!(error = %message, "owner token file could not be read");
                 board.set_mode(true, true).await;
+                debug.set_owner_overview("error", Some(message), true);
                 if !wait_signal(&mut tokens, &mut shutdown, Some(Duration::from_secs(900))).await {
                     break;
                 }
                 continue;
             }
-            TokenFileState::Ready => board.set_mode(true, true).await,
+            TokenFileState::Ready => {
+                board.set_mode(true, true).await;
+                debug.set_owner_overview("connecting", None, false);
+            }
         }
         let (stop_tx, stop_rx) = watch::channel(false);
         let task = tokio::spawn(supervise(
@@ -258,6 +275,7 @@ pub(crate) async fn run(
             config.token_encryption_key.clone(),
             Arc::clone(&archive),
             board.clone(),
+            debug.clone(),
             stop_rx,
         ));
         let abort = task.abort_handle();
@@ -302,6 +320,7 @@ async fn supervise(
     encryption_key: Option<String>,
     archive: Arc<Archive>,
     board: StreamBoard,
+    debug: DebugBoard,
     mut stop: watch::Receiver<bool>,
 ) {
     if *stop.borrow() {
@@ -321,10 +340,15 @@ async fn supervise(
             return;
         }
     };
+    let saved = debug.clone();
+    store.on_saved(std::sync::Arc::new(move |expires| {
+        saved.token_saved("owner", expires);
+    }));
     let session = Arc::new(OwnerSession {
         client: client.clone(),
         store,
         lock: Mutex::new(()),
+        debug: debug.clone(),
     });
     let found = match targets(&client, &session, &archive).await {
         Ok(found) => found,
@@ -350,11 +374,13 @@ async fn supervise(
         board
             .set_vehicle(target.db_id, "error", Some("connecting".to_owned()))
             .await;
+        debug.set_owner_vehicle(target.db_id, target.stream_tag, "connecting");
         tasks.spawn(vehicle_loop(
             target,
             Arc::clone(&session),
             Arc::clone(&archive),
             board.clone(),
+            debug.clone(),
             client.stream_url().to_owned(),
             stop.clone(),
         ));
@@ -376,6 +402,7 @@ async fn vehicle_loop(
     session: Arc<OwnerSession>,
     archive: Arc<Archive>,
     board: StreamBoard,
+    debug: DebugBoard,
     url: String,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -393,7 +420,12 @@ async fn vehicle_loop(
                 let class = match err {
                     SessionError::LoginRequired => FailureClass::Auth,
                     SessionError::Other(message) => {
-                        tracing::warn!(vin = %target.vin, error = %message, "owner token was not usable");
+                        tracing::warn!(
+                            vehicle_id = target.db_id,
+                            stream_id = target.stream_tag,
+                            error = %crate::logs::redact_line(&message, &[]),
+                            "owner token was not usable"
+                        );
                         FailureClass::Auth
                     }
                     SessionError::Missing => return,
@@ -403,9 +435,11 @@ async fn vehicle_loop(
                     class,
                     &target,
                     &board,
+                    &debug,
                     &mut kick,
                     &mut stop,
                     true,
+                    None,
                 )
                 .await
                 {
@@ -417,46 +451,58 @@ async fn vehicle_loop(
         board
             .set_vehicle(target.db_id, "error", Some("connecting".to_owned()))
             .await;
-        let (tx, mut rx) = mpsc::channel(8);
+        debug.set_owner_vehicle(target.db_id, target.stream_tag, "connecting");
+        let (tx, mut rx) = mpsc::channel(32);
         let pump = pump_stream(&url, &access, target.stream_tag, tx);
         tokio::pin!(pump);
         let mut saw = false;
+        let mut rx_open = true;
         let end = loop {
             tokio::select! {
                 biased;
                 _ = stop.changed() => return,
-                notice = rx.recv() => {
-                    let Some(notice) = notice else {
-                        break PumpEnd::Failed(FailureClass::Transport);
-                    };
-                    saw = true;
-                    accept_notice(&board, &archive, &target, &mut carry, notice).await;
+                notice = rx.recv(), if rx_open => {
+                    match notice {
+                        Some(notice) => {
+                            saw = true;
+                            accept_notice(&board, &debug, &archive, &target, &mut carry, notice).await;
+                        }
+                        None => rx_open = false,
+                    }
                 }
                 end = &mut pump => {
                     while let Ok(notice) = rx.try_recv() {
                         saw = true;
-                        accept_notice(&board, &archive, &target, &mut carry, notice).await;
+                        accept_notice(&board, &debug, &archive, &target, &mut carry, notice).await;
                     }
                     break end;
                 }
             }
         };
-        let PumpEnd::Failed(class) = end;
+        let PumpEnd::Failed(stop_info) = end;
         if saw {
             consecutive = 0;
         }
+        let class = stop_info.class;
         let refresh = plan_reconnect(class, consecutive.saturating_add(1)).refresh_token;
         if refresh && session.force_refresh().await.is_err() {
-            tracing::warn!(vin = %target.vin, class = "auth", "owner token refresh failed");
+            tracing::warn!(
+                vehicle_id = target.db_id,
+                stream_id = target.stream_tag,
+                class = "auth",
+                "owner token refresh failed"
+            );
         }
         if !backoff(
             &mut consecutive,
             class,
             &target,
             &board,
+            &debug,
             &mut kick,
             &mut stop,
             true,
+            Some(&stop_info),
         )
         .await
         {
@@ -467,29 +513,169 @@ async fn vehicle_loop(
 
 async fn accept_notice(
     board: &StreamBoard,
+    debug: &DebugBoard,
     archive: &Archive,
     target: &Target,
     carry: &mut Carry,
     notice: StreamEvent,
 ) {
+    note_stream_event(debug, target, &notice);
     match notice {
         StreamEvent::Subscribed => {
             board.set_vehicle(target.db_id, "connected", None).await;
         }
         StreamEvent::Sample(sample) => {
             board.set_vehicle(target.db_id, "connected", None).await;
-            store_sample(archive, target, carry, &sample).await;
+            store_sample(debug, archive, target, carry, &sample).await;
         }
+        StreamEvent::Trace(_) => {}
+    }
+}
+
+fn note_stream_event(debug: &DebugBoard, target: &Target, notice: &StreamEvent) {
+    match notice {
+        StreamEvent::Subscribed => {
+            debug.set_owner_vehicle(target.db_id, target.stream_tag, "connected");
+            debug.record_event(
+                "out",
+                "data:subscribe_oauth",
+                false,
+                &format!(
+                    "msg_type=data:subscribe_oauth tag={} columns={STREAM_COLUMNS}",
+                    target.stream_tag
+                ),
+            );
+        }
+        StreamEvent::Sample(sample) => {
+            debug.set_owner_vehicle(target.db_id, target.stream_tag, "connected");
+            debug.record_owner(OwnerNote {
+                db_id: target.db_id,
+                stream_tag: target.stream_tag,
+                direction: "in",
+                kind: "data:update",
+                keepalive: false,
+                incoming: true,
+                text: &summarize_sample(sample),
+                count: OwnerCount::Update,
+            });
+        }
+        StreamEvent::Trace(trace) => note_trace(debug, target, trace),
+    }
+}
+
+fn note_trace(debug: &DebugBoard, target: &Target, trace: &StreamTrace) {
+    let (direction, kind, keepalive, incoming, text, count) = match trace {
+        StreamTrace::Hello => (
+            "in",
+            "control:hello",
+            true,
+            true,
+            "control:hello".to_owned(),
+            OwnerCount::HelloPing,
+        ),
+        StreamTrace::Ping => (
+            "in",
+            "ping",
+            true,
+            true,
+            "ping".to_owned(),
+            OwnerCount::HelloPing,
+        ),
+        StreamTrace::Pong => (
+            "out",
+            "pong",
+            true,
+            false,
+            "pong".to_owned(),
+            OwnerCount::None,
+        ),
+        StreamTrace::PongReceived => (
+            "in",
+            "pong",
+            true,
+            true,
+            "pong".to_owned(),
+            OwnerCount::None,
+        ),
+        StreamTrace::Closed { detail } => {
+            ("in", "close", false, true, detail.clone(), OwnerCount::None)
+        }
+        StreamTrace::Error { error_type, value } => {
+            let class = tesla_owner_api::classify_stream_error(error_type, value);
+            let text = format!("type={error_type} value={value}");
+            debug.note_owner_error(target.db_id, target.stream_tag, class.as_str(), &text);
+            (
+                "in",
+                "data:error",
+                false,
+                true,
+                format!("data:error {text}"),
+                OwnerCount::Error,
+            )
+        }
+        StreamTrace::ParseFailed { reason, msg_type } => {
+            let text = match msg_type {
+                Some(kind) => {
+                    format!("frame received but failed to parse: {reason} (msg_type={kind})")
+                }
+                None => format!("frame received but failed to parse: {reason}"),
+            };
+            ("in", "parse", false, true, text, OwnerCount::Parse)
+        }
+        StreamTrace::Ignored { msg_type } => (
+            "in",
+            msg_type.as_str(),
+            false,
+            true,
+            format!("msg_type={msg_type}"),
+            OwnerCount::None,
+        ),
+    };
+    debug.record_owner(OwnerNote {
+        db_id: target.db_id,
+        stream_tag: target.stream_tag,
+        direction,
+        kind,
+        keepalive,
+        incoming,
+        text: &text,
+        count,
+    });
+}
+
+fn summarize_sample(sample: &StreamSample) -> String {
+    let location = match (sample.est_lat, sample.est_lng) {
+        (Some(lat), Some(lng)) => format!("lat={lat:.6} lng={lng:.6}"),
+        (Some(_), None) | (None, Some(_)) => "latlng=partial".to_owned(),
+        (None, None) => "latlng=absent".to_owned(),
+    };
+    format!(
+        "speed_mph={} soc={} shift={} power_kw={} {location}",
+        fmt_num(sample.speed_mph),
+        fmt_num(sample.soc),
+        sample.shift_state.as_deref().unwrap_or("-"),
+        fmt_num(sample.power_kw),
+    )
+}
+
+fn fmt_num(value: Option<f64>) -> String {
+    match value {
+        Some(value) => {
+            let text = format!("{value:.4}");
+            text.trim_end_matches('0').trim_end_matches('.').to_owned()
+        }
+        None => "-".to_owned(),
     }
 }
 
 async fn store_sample(
+    debug: &DebugBoard,
     archive: &Archive,
     target: &Target,
     carry: &mut Carry,
-    sample: &tesla_owner_api::StreamSample,
+    sample: &StreamSample,
 ) {
-    let Some(fix) = prepare(carry, sample) else {
+    let Some(fix) = consider_sample(debug, target, carry, sample) else {
         return;
     };
     if let Err(err) = apply_stream_for_vin(
@@ -505,18 +691,26 @@ async fn store_sample(
     )
     .await
     {
-        tracing::warn!(vin = %target.vin, error = %err, "owner stream sample was not stored");
+        tracing::warn!(
+            vehicle_id = target.db_id,
+            stream_id = target.stream_tag,
+            error = %crate::logs::redact_line(&err.to_string(), &[]),
+            "owner stream sample was not stored"
+        );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn backoff(
     consecutive: &mut u32,
     class: FailureClass,
     target: &Target,
     board: &StreamBoard,
+    debug: &DebugBoard,
     kick: &mut broadcast::Receiver<String>,
     stop: &mut watch::Receiver<bool>,
     count_failure: bool,
+    report: Option<&StreamStop>,
 ) -> bool {
     if count_failure {
         *consecutive = consecutive.saturating_add(1);
@@ -525,13 +719,40 @@ async fn backoff(
     board
         .set_vehicle(target.db_id, "error", Some(class.as_str().to_owned()))
         .await;
-    tracing::warn!(
-        vin = %target.vin,
-        status = "error",
-        class = class.as_str(),
-        retry_secs = plan.after.as_secs(),
-        "owner stream status"
-    );
+    debug.owner_down(target.db_id, target.stream_tag, class.as_str());
+    if let Some(report) = report {
+        let detail = crate::logs::redact_line(&report.detail, &[]);
+        let since = report
+            .stats
+            .since_last_frame
+            .map_or_else(|| "none".to_owned(), |delay| delay.as_millis().to_string());
+        tracing::warn!(
+            vehicle_id = target.db_id,
+            stream_id = target.stream_tag,
+            status = "error",
+            class = class.as_str(),
+            detail = %detail,
+            connected_ms = u64::try_from(report.stats.connected.as_millis()).unwrap_or(u64::MAX),
+            since_frame_ms = %since,
+            hello = report.stats.hello,
+            ping = report.stats.ping,
+            updates = report.stats.updates,
+            errors = report.stats.errors,
+            parse_fails = report.stats.parse_failures,
+            retry_secs = plan.after.as_secs(),
+            "owner stream status"
+        );
+        debug.record_connection(target.db_id, target.stream_tag, report);
+    } else {
+        tracing::warn!(
+            vehicle_id = target.db_id,
+            stream_id = target.stream_tag,
+            status = "error",
+            class = class.as_str(),
+            retry_secs = plan.after.as_secs(),
+            "owner stream status"
+        );
+    }
     let kickable = !matches!(class, FailureClass::Auth | FailureClass::Unavailable);
     let deadline = Instant::now() + plan.after;
     loop {
@@ -625,7 +846,29 @@ async fn targets(
         .collect())
 }
 
-fn prepare(carry: &mut Carry, sample: &tesla_owner_api::StreamSample) -> Option<StreamFix> {
+fn consider_sample(
+    debug: &DebugBoard,
+    target: &Target,
+    carry: &mut Carry,
+    sample: &StreamSample,
+) -> Option<StreamFix> {
+    if !raw_signal(sample) {
+        debug.record_owner(OwnerNote {
+            db_id: target.db_id,
+            stream_tag: target.stream_tag,
+            direction: "note",
+            kind: "drop",
+            keepalive: false,
+            incoming: false,
+            text: "sample dropped: all fields empty",
+            count: OwnerCount::Drop,
+        });
+        return None;
+    }
+    prepare(carry, sample)
+}
+
+fn prepare(carry: &mut Carry, sample: &StreamSample) -> Option<StreamFix> {
     if sample.shift_state.is_some() {
         carry.shift.clone_from(&sample.shift_state);
     }
@@ -768,7 +1011,10 @@ async fn wait_stop(stop: &mut watch::Receiver<bool>, limit: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Carry, OwnerSession, StreamBoard, Target, prepare, vehicle_loop};
+    use super::{
+        Carry, OwnerSession, StreamBoard, Target, consider_sample, note_stream_event, prepare,
+        vehicle_loop,
+    };
     use tesla_owner_api::StreamSample;
 
     fn blank() -> StreamSample {
@@ -903,6 +1149,7 @@ mod tests {
         let board = StreamBoard::default();
         board.set_mode(true, true).await;
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let debug = crate::debug::DebugBoard::new(crate::logs::LogBuffer::new(32));
         let task = tokio::spawn(vehicle_loop(
             Target {
                 db_id: 1,
@@ -913,9 +1160,11 @@ mod tests {
                 client: OwnerClient::new(OwnerRegion::Global).unwrap(),
                 store,
                 lock: tokio::sync::Mutex::new(()),
+                debug: debug.clone(),
             }),
             archive,
             board.clone(),
+            debug.clone(),
             format!("ws://{addr}/streaming/"),
             stop_rx,
         ));
@@ -933,6 +1182,11 @@ mod tests {
             }
         })
         .await;
+        let console = debug.joined();
+        assert!(console.contains("tag=99"), "{console}");
+        assert!(console.contains("data:subscribe_oauth"), "{console}");
+        assert!(!console.contains("stream-access-token"), "{console}");
+        assert!(!console.contains("5YJ3E1EA7KF000001"), "{console}");
         if connected.is_err() {
             let snapshot = board.snapshot().await;
             let (status, detail) = snapshot.for_vehicle(1);
@@ -945,5 +1199,47 @@ mod tests {
         let _ = stop_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
         server.abort();
+    }
+
+    #[test]
+    fn empty_sample_emits_a_debug_drop() {
+        let debug = crate::debug::DebugBoard::new(crate::logs::LogBuffer::new(4));
+        let target = Target {
+            db_id: 3,
+            vin: "5YJ3E1EA7KF000001".to_owned(),
+            stream_tag: 9,
+        };
+        assert!(consider_sample(&debug, &target, &mut Carry::default(), &blank()).is_none());
+        let text = debug.joined();
+        assert!(text.contains("sample dropped: all fields empty"), "{text}");
+        assert!(!text.contains(&target.vin), "{text}");
+    }
+
+    #[test]
+    fn parse_failure_emits_a_debug_event() {
+        use tesla_owner_api::{StreamEvent, StreamTrace};
+
+        let debug = crate::debug::DebugBoard::new(crate::logs::LogBuffer::new(4));
+        let target = Target {
+            db_id: 3,
+            vin: "5YJ3E1EA7KF000001".to_owned(),
+            stream_tag: 9,
+        };
+        note_stream_event(
+            &debug,
+            &target,
+            &StreamEvent::Trace(StreamTrace::ParseFailed {
+                reason: "too many columns",
+                msg_type: Some("data:update".to_owned()),
+            }),
+        );
+        let text = debug.joined();
+        assert!(
+            text.contains("frame received but failed to parse"),
+            "{text}"
+        );
+        assert!(text.contains("too many columns"), "{text}");
+        assert!(text.contains("data:update"), "{text}");
+        assert!(!text.contains(&target.vin), "{text}");
     }
 }

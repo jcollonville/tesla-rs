@@ -11,6 +11,7 @@ use sqlx::PgPool;
 use tokio::sync::{broadcast, watch};
 
 use crate::config::Config;
+use crate::debug::DebugBoard;
 use crate::error::redact_secrets;
 use crate::persist::LiveEvent;
 
@@ -18,19 +19,24 @@ pub(crate) async fn run(
     config: &Config,
     db: PgPool,
     mut events: broadcast::Receiver<LiveEvent>,
+    debug: DebugBoard,
     mut shutdown: watch::Receiver<bool>,
 ) {
     if !config.mqtt_enabled {
+        debug.set_mqtt("disabled", None);
         return;
     }
     loop {
         if *shutdown.borrow() {
             break;
         }
-        match session(config, &db, &mut events, &mut shutdown).await {
+        debug.set_mqtt("connecting", None);
+        match session(config, &db, &mut events, &debug, &mut shutdown).await {
             Ok(()) => break,
             Err(err) => {
-                tracing::warn!(error = %redact_secrets(&err), "mqtt session ended");
+                let err = redact_secrets(&err);
+                debug.set_mqtt("error", Some(err.clone()));
+                tracing::warn!(error = %err, "mqtt session ended");
                 tokio::select! {
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() {
@@ -48,6 +54,7 @@ async fn session(
     config: &Config,
     db: &PgPool,
     events: &mut broadcast::Receiver<LiveEvent>,
+    debug: &DebugBoard,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), String> {
     let mut options = MqttOptions::new("tesla-logger", config.mqtt_host.as_str(), config.mqtt_port);
@@ -73,6 +80,9 @@ async fn session(
             }
             polled = eventloop.poll() => {
                 match polled {
+                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_))) => {
+                        debug.set_mqtt("connected", None);
+                    }
                     Ok(_) => {}
                     Err(err) => return Err(err.to_string()),
                 }

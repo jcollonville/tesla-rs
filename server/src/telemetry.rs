@@ -24,6 +24,7 @@ use tesla_fleet_telemetry::{
 use tokio::sync::watch;
 
 use crate::config::Config;
+use crate::debug::DebugBoard;
 use crate::error::AppError;
 use crate::ingest::{Archive, apply_for_vin};
 use crate::persist::{VehicleIdentity, resting_observation};
@@ -33,9 +34,11 @@ use crate::units::{miles_to_km, speed_to_kmh};
 pub(crate) async fn run(
     config: &Config,
     archive: Arc<Archive>,
+    debug: DebugBoard,
     mut shutdown: watch::Receiver<bool>,
 ) {
     if !config.telemetry_enabled {
+        debug.set_telemetry("disabled", None);
         return;
     }
     let (Some(cert_path), Some(key_path)) = (
@@ -45,12 +48,20 @@ pub(crate) async fn run(
         tracing::error!(
             "telemetry is enabled but TELEMETRY_CERT_PATH or TELEMETRY_KEY_PATH is missing"
         );
+        debug.set_telemetry(
+            "error",
+            Some("telemetry certificate or key path is missing".to_owned()),
+        );
         return;
     };
     let certificate_pem = match std::fs::read_to_string(cert_path) {
         Ok(pem) => pem,
         Err(err) => {
             tracing::error!(error = %err, "could not read the telemetry certificate");
+            debug.set_telemetry(
+                "error",
+                Some("telemetry certificate could not be read".to_owned()),
+            );
             return;
         }
     };
@@ -58,6 +69,10 @@ pub(crate) async fn run(
         Ok(pem) => pem,
         Err(err) => {
             tracing::error!(error = %err, "could not read the telemetry private key");
+            debug.set_telemetry(
+                "error",
+                Some("telemetry private key could not be read".to_owned()),
+            );
             return;
         }
     };
@@ -68,10 +83,12 @@ pub(crate) async fn run(
         Ok(server) => server,
         Err(err) => {
             tracing::error!(error = %err, "telemetry listener failed");
+            debug.set_telemetry("error", Some("telemetry listener failed".to_owned()));
             return;
         }
     };
     tracing::info!(addr = %server.local_addr(), "fleet telemetry listening");
+    debug.set_telemetry("listening", None);
     let mut folded: HashMap<String, Observation> = HashMap::new();
     loop {
         tokio::select! {

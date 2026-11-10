@@ -21,6 +21,7 @@ use tesla_fleet_api::{
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::time::{Instant, sleep};
 
+use crate::debug::DebugBoard;
 use crate::error::{AppError, fleet_error};
 use crate::geocode::Geocoder;
 use crate::persist::{
@@ -205,12 +206,29 @@ pub(crate) async fn apply_stream_for_vin(
 /// Fleet API poller. It never calls `wake_up`.
 pub(crate) struct FleetPoll<T> {
     client: FleetClient<T>,
+    debug: DebugBoard,
 }
 
 impl<T: AccessTokenProvider> FleetPoll<T> {
     #[allow(dead_code)]
     pub(crate) fn new(client: FleetClient<T>) -> Self {
-        Self { client }
+        Self::with_debug(client, DebugBoard::new(crate::logs::LogBuffer::new(8)))
+    }
+
+    pub(crate) fn with_debug(client: FleetClient<T>, debug: DebugBoard) -> Self {
+        Self { client, debug }
+    }
+
+    fn note_http(
+        &self,
+        method: &str,
+        path: &str,
+        status: Option<u16>,
+        started: Instant,
+        summary: &str,
+    ) {
+        self.debug
+            .record_poll(method, path, status, started.elapsed(), summary);
     }
 }
 
@@ -221,57 +239,170 @@ where
     pub(crate) fn connect(
         region: tesla_auth::Region,
         session: Arc<Session<S>>,
+        debug: DebugBoard,
     ) -> Result<Self, AppError> {
-        let client =
-            FleetClient::for_region(region, RefreshingToken(session)).map_err(fleet_error)?;
-        Ok(Self { client })
+        let client = FleetClient::for_region(
+            region,
+            RefreshingToken {
+                session,
+                debug: debug.clone(),
+            },
+        )
+        .map_err(fleet_error)?;
+        Ok(Self { client, debug })
     }
 }
 
 /// Session wrapper that satisfies [`AccessTokenProvider`].
 #[derive(Clone)]
-pub(crate) struct RefreshingToken<S>(pub Arc<Session<S>>);
+pub(crate) struct RefreshingToken<S> {
+    session: Arc<Session<S>>,
+    debug: DebugBoard,
+}
 
 impl<S: TokenStore> AccessTokenProvider for RefreshingToken<S> {
     async fn access_token(&self) -> Result<secrecy::SecretString, FleetError> {
-        Session::access_token(&self.0)
-            .await
-            .map_err(FleetError::from)
+        match Session::access_token(&self.session).await {
+            Ok(token) => Ok(token),
+            Err(err) => {
+                if !matches!(err, tesla_auth::AuthError::NotAuthenticated) {
+                    self.debug.token_failed("fleet", &err.to_string());
+                }
+                Err(FleetError::from(err))
+            }
+        }
     }
 }
 
 impl<T: AccessTokenProvider> IngestSource for FleetPoll<T> {
     async fn discover(&self) -> Result<Vec<Summary>, AppError> {
-        let vehicles = self
-            .client
-            .list_all_vehicles(100, 20)
-            .await
-            .map_err(fleet_error)?;
-        Ok(vehicles.into_iter().map(summary_from_vehicle).collect())
+        let started = Instant::now();
+        match self.client.list_all_vehicles(100, 20).await {
+            Ok(vehicles) => {
+                let count = vehicles.len();
+                self.note_http(
+                    "GET",
+                    "/api/1/vehicles",
+                    Some(200),
+                    started,
+                    &format!("vehicles={count}"),
+                );
+                Ok(vehicles.into_iter().map(summary_from_vehicle).collect())
+            }
+            Err(err) => {
+                self.note_http(
+                    "GET",
+                    "/api/1/vehicles",
+                    fleet_http_status(&err),
+                    started,
+                    &err.to_string(),
+                );
+                Err(fleet_error(err))
+            }
+        }
     }
 
     async fn observe(&self, vin: &str) -> Result<ObserveResult, AppError> {
         let tag = VehicleTag::new(vin).map_err(|_| AppError::message("vehicle vin is invalid"))?;
+        let started = Instant::now();
         let vehicle = match self.client.vehicle(&tag).await {
-            Ok(vehicle) => vehicle,
+            Ok(vehicle) => {
+                let state = vehicle
+                    .state
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_owned());
+                self.note_http(
+                    "GET",
+                    "/api/1/vehicles/{id}",
+                    Some(200),
+                    started,
+                    &format!("state={state}"),
+                );
+                vehicle
+            }
             Err(err) if err.is_device_unavailable() => {
+                self.note_http(
+                    "GET",
+                    "/api/1/vehicles/{id}",
+                    fleet_http_status(&err),
+                    started,
+                    "vehicle unavailable",
+                );
                 return Ok(ObserveResult::Resting(Presence::Asleep));
             }
-            Err(err) => return map_rate(err),
+            Err(err) => {
+                self.note_http(
+                    "GET",
+                    "/api/1/vehicles/{id}",
+                    fleet_http_status(&err),
+                    started,
+                    &err.to_string(),
+                );
+                return map_rate(err);
+            }
         };
         if !vehicle.is_online() || vehicle.in_service == Some(true) {
             return Ok(ObserveResult::Resting(Presence::from_fleet(
                 vehicle.state.as_deref(),
             )));
         }
+        let started = Instant::now();
         let data = match self.client.vehicle_data(&tag, LIVE_ENDPOINTS).await {
-            Ok(data) => data,
+            Ok(data) => {
+                let drive = if data.drive_state.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                };
+                self.note_http(
+                    "GET",
+                    "/api/1/vehicles/{id}/vehicle_data",
+                    Some(200),
+                    started,
+                    &format!("drive_state={drive}"),
+                );
+                data
+            }
             Err(err) if err.is_device_unavailable() => {
+                self.note_http(
+                    "GET",
+                    "/api/1/vehicles/{id}/vehicle_data",
+                    fleet_http_status(&err),
+                    started,
+                    "vehicle unavailable",
+                );
                 return Ok(ObserveResult::Resting(Presence::Asleep));
             }
-            Err(err) => return map_rate(err),
+            Err(err) => {
+                self.note_http(
+                    "GET",
+                    "/api/1/vehicles/{id}/vehicle_data",
+                    fleet_http_status(&err),
+                    started,
+                    &err.to_string(),
+                );
+                return map_rate(err);
+            }
         };
         Ok(ObserveResult::Live(observation_from_vehicle_data(data)))
+    }
+}
+
+fn fleet_http_status(err: &FleetError) -> Option<u16> {
+    match err {
+        FleetError::Unauthorized { .. } => Some(401),
+        FleetError::PaymentRequired => Some(402),
+        FleetError::Forbidden { .. } => Some(403),
+        FleetError::NotFound { .. } => Some(404),
+        FleetError::DeviceUnavailable { .. } => Some(408),
+        FleetError::PreconditionFailed { .. } => Some(412),
+        FleetError::IncorrectRegion { .. } => Some(421),
+        FleetError::InvalidResource { .. } => Some(422),
+        FleetError::Locked => Some(423),
+        FleetError::RateLimited(_) => Some(429),
+        FleetError::UnavailableForLegalReasons { .. } => Some(451),
+        FleetError::Api { status, .. } => Some(*status),
+        _ => None,
     }
 }
 
@@ -550,7 +681,11 @@ async fn handle_summary(
         drop(guard);
         let obs = resting_observation(Utc::now(), presence);
         if let Err(err) = apply_existing(archive, &vin, obs, false).await {
-            tracing::warn!(vin = %vin, error = %err, "could not record resting state");
+            tracing::warn!(
+                vehicle_id = summary.tesla_id,
+                error = %crate::logs::redact_line(&err.to_string(), &[]),
+                "could not record resting state"
+            );
             let _ = record_error(&archive.db, vehicle_id, &err.to_string()).await;
         }
         return Ok(CycleControl::Wait(plan.wait));
@@ -703,6 +838,46 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert!(!requests[0].url.path().contains("wake_up"));
         assert!(!requests[0].url.path().contains("vehicle_data"));
+    }
+
+    #[tokio::test]
+    async fn vehicle_data_poll_is_logged_without_the_vin_or_body() {
+        let vin = "TEST00000000VIN01";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/1/vehicles/{vin}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"response":{{"id":1,"vehicle_id":99,"vin":"{vin}","state":"online"}}}}"#
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/1/vehicles/{vin}/vehicle_data")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"response":{{"id":1,"vin":"{vin}","drive_state":{{"shift_state":"D","latitude":48.1,"longitude":2.3}}}}}}"#
+            )))
+            .mount(&server)
+            .await;
+        let client = FleetClient::builder(&server.uri(), BearerToken::new("fleet-secret-token"))
+            .unwrap()
+            .build()
+            .unwrap();
+        let debug = crate::debug::DebugBoard::new(crate::logs::LogBuffer::new(8));
+        let observed = FleetPoll::with_debug(client, debug.clone())
+            .observe(vin)
+            .await
+            .unwrap();
+        assert!(matches!(observed, super::ObserveResult::Live(_)));
+        let text = debug.joined();
+        assert!(
+            text.contains("GET /api/1/vehicles/{id}/vehicle_data"),
+            "{text}"
+        );
+        assert!(text.contains("status=200"), "{text}");
+        assert!(text.contains("drive_state=yes"), "{text}");
+        assert!(!text.contains(vin), "{text}");
+        assert!(!text.contains("fleet-secret-token"), "{text}");
+        assert!(!text.contains("latitude"), "{text}");
     }
 
     #[test]

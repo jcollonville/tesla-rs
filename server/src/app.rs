@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::config::Config;
 use crate::crypto::{SharedTokenStore, TokenFile, read_public_key};
+use crate::debug::DebugBoard;
 use crate::error::AppError;
 use crate::geocode::Geocoder;
 use crate::http;
@@ -45,6 +46,7 @@ pub(crate) struct Inner {
     pub stream_board: StreamBoard,
     pub owner_tokens: watch::Sender<u64>,
     pub logs: LogBuffer,
+    pub debug: DebugBoard,
 }
 
 pub(crate) struct UiSession {
@@ -74,6 +76,7 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
         let fleet = match FleetPoll::connect(
             poll_state.inner.config.region,
             Arc::clone(&poll_state.inner.session),
+            poll_state.inner.debug.clone(),
         ) {
             Ok(fleet) => fleet,
             Err(err) => {
@@ -96,6 +99,7 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
         telemetry::run(
             &telemetry_state.inner.config,
             Arc::clone(&telemetry_state.inner.archive),
+            telemetry_state.inner.debug.clone(),
             telemetry_rx,
         )
         .await;
@@ -107,6 +111,7 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
             &mqtt_state.inner.config,
             mqtt_state.inner.db.clone(),
             mqtt_state.inner.events.subscribe(),
+            mqtt_state.inner.debug.clone(),
             mqtt_rx,
         )
         .await;
@@ -118,6 +123,7 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
             &owner_state.inner.config,
             Arc::clone(&owner_state.inner.archive),
             owner_state.inner.stream_board.clone(),
+            owner_state.inner.debug.clone(),
             owner_state.inner.owner_tokens.subscribe(),
             owner_rx,
         )
@@ -161,6 +167,12 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
     let (events, _) = broadcast::channel(256);
     let (stream_kick, _) = broadcast::channel(32);
     let (owner_tokens, _) = watch::channel(0_u64);
+    let debug = DebugBoard::new(logs.clone());
+    debug.apply_config(&config);
+    let debug_saved = debug.clone();
+    store.on_saved(std::sync::Arc::new(move |expires| {
+        debug_saved.token_saved("fleet", expires);
+    }));
     let geocoder = Geocoder::from_config(&config)?;
     let archive = Arc::new(Archive {
         db: db.clone(),
@@ -185,6 +197,7 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
             stream_board: StreamBoard::default(),
             owner_tokens,
             logs,
+            debug,
         }),
     })
 }
@@ -296,6 +309,8 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
     let (owner_tokens, _) = watch::channel(0_u64);
     let logs = LogBuffer::new(50);
     logs.install_config(&config);
+    let debug = DebugBoard::new(logs.clone());
+    debug.apply_config(&config);
     let geocoder = Geocoder::disabled();
     let archive = Arc::new(Archive {
         db: pool.clone(),
@@ -320,6 +335,7 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
             stream_board: StreamBoard::default(),
             owner_tokens,
             logs,
+            debug,
         }),
     }
 }

@@ -31,6 +31,7 @@ const JSON_KEYS: &[&str] = &[
     "password",
     "token",
     "code",
+    "vin",
 ];
 
 const ASSIGNMENT_KEYS: &[&str] = &[
@@ -42,11 +43,13 @@ const ASSIGNMENT_KEYS: &[&str] = &[
     "password",
     "token",
     "code",
+    "vin",
 ];
 
 /// One stored log line. The text has already been redacted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LogLine {
+    pub seq: u64,
     pub at: DateTime<Utc>,
     pub level: String,
     pub text: String,
@@ -61,6 +64,7 @@ struct BufferState {
     lines: VecDeque<LogLine>,
     secrets: Vec<String>,
     cap: usize,
+    next_seq: u64,
 }
 
 impl LogBuffer {
@@ -71,8 +75,28 @@ impl LogBuffer {
                 lines: VecDeque::with_capacity(cap),
                 secrets: Vec::new(),
                 cap,
+                next_seq: 1,
             })),
         }
+    }
+
+    pub(crate) fn secret_list(&self) -> Vec<String> {
+        lock(&self.inner).secrets.clone()
+    }
+
+    pub(crate) fn since(&self, seq: u64) -> Vec<LogLine> {
+        let guard = lock(&self.inner);
+        guard
+            .lines
+            .iter()
+            .filter(|line| line.seq > seq)
+            .map(|line| LogLine {
+                seq: line.seq,
+                at: line.at,
+                level: line.level.clone(),
+                text: redact_line(&line.text, &guard.secrets),
+            })
+            .collect()
     }
 
     pub(crate) fn install_config(&self, config: &Config) {
@@ -102,7 +126,10 @@ impl LogBuffer {
         if guard.lines.len() >= guard.cap {
             guard.lines.pop_front();
         }
+        let seq = guard.next_seq;
+        guard.next_seq = guard.next_seq.saturating_add(1);
         guard.lines.push_back(LogLine {
+            seq,
             at: Utc::now(),
             level: level.to_owned(),
             text,
@@ -115,6 +142,7 @@ impl LogBuffer {
             .lines
             .iter()
             .map(|line| LogLine {
+                seq: line.seq,
                 at: line.at,
                 level: line.level.clone(),
                 text: redact_line(&line.text, &guard.secrets),
@@ -186,8 +214,23 @@ impl Visit for FieldVisitor {
 }
 
 pub(crate) fn redact_line(text: &str, secrets: &[String]) -> String {
+    redact_common(text, secrets, true)
+}
+
+/// Redacts a debug-console string.
+///
+/// A subscribe frame is replaced with msg_type, tag, and columns before anything is stored.
+/// The OAuth token field is not copied. Bare VINs and long opaque tokens are removed as well.
+pub(crate) fn redact_debug_text(text: &str, secrets: &[String]) -> String {
+    let text = summarize_subscribe(text);
+    scrub_opaque(&redact_common(&text, secrets, false))
+}
+
+fn redact_common(text: &str, secrets: &[String], subscribe_frames: bool) -> String {
     let mut text = redact_secrets(text);
-    text = redact_subscribe_frames(&text);
+    if subscribe_frames {
+        text = redact_subscribe_frames(&text);
+    }
     text = redact_json_secrets(&text);
     text = redact_authorization(&text);
     text = redact_assignments(&text);
@@ -196,7 +239,61 @@ pub(crate) fn redact_line(text: &str, secrets: &[String]) -> String {
     for secret in ordered {
         text = replace_secret(&text, secret);
     }
-    text
+    redact_bare_vins(&text)
+}
+
+fn summarize_subscribe(text: &str) -> String {
+    if !text.contains("data:subscribe_oauth") {
+        return text.to_owned();
+    }
+    let Some(start) = text.find('{') else {
+        return text.to_owned();
+    };
+    let Some(end) = matching_brace(text, start) else {
+        return "msg_type=data:subscribe_oauth [subscribe frame redacted]".to_owned();
+    };
+    let summary = summary_of_subscribe_json(&text[start..end]);
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..start]);
+    out.push_str(&summary);
+    out.push_str(&text[end..]);
+    if out.contains("data:subscribe_oauth") && out.contains('{') {
+        return "msg_type=data:subscribe_oauth [subscribe frame redacted]".to_owned();
+    }
+    out
+}
+
+fn summary_of_subscribe_json(json: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return "msg_type=data:subscribe_oauth [subscribe frame redacted]".to_owned();
+    };
+    let tag = value
+        .get("tag")
+        .map(|tag| match tag {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Number(number) => number.to_string(),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
+    if !numeric_tag(&tag) {
+        return "msg_type=data:subscribe_oauth [subscribe frame redacted]".to_owned();
+    }
+    let columns = value
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !columns
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == ',' || ch == '_')
+    {
+        return format!("msg_type=data:subscribe_oauth tag={tag} columns=[redacted]");
+    }
+    format!("msg_type=data:subscribe_oauth tag={tag} columns={columns}")
+}
+
+fn numeric_tag(value: &str) -> bool {
+    let value = value.strip_prefix('-').unwrap_or(value);
+    !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn push_secret(secrets: &mut Vec<String>, value: &str) {
@@ -478,6 +575,66 @@ fn is_ident(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+fn redact_bare_vins(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if is_vin_char(bytes[index]) && (index == 0 || !is_vin_char(bytes[index - 1])) {
+            let start = index;
+            while index < bytes.len() && is_vin_char(bytes[index]) {
+                index += 1;
+            }
+            let word = &text[start..index];
+            if word.len() == 17
+                && word.bytes().any(|byte| byte.is_ascii_digit())
+                && word.bytes().any(|byte| byte.is_ascii_alphabetic())
+            {
+                out.push_str("***");
+            } else {
+                out.push_str(word);
+            }
+            continue;
+        }
+        let ch = text[index..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+fn is_vin_char(byte: u8) -> bool {
+    matches!(byte, b'A'..=b'H' | b'J'..=b'N' | b'P' | b'R'..=b'Z' | b'0'..=b'9')
+}
+
+fn scrub_opaque(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if is_opaque_char(bytes[index]) {
+            let start = index;
+            while index < bytes.len() && is_opaque_char(bytes[index]) {
+                index += 1;
+            }
+            if index - start >= 32 {
+                out.push_str("***");
+            } else {
+                out.push_str(&text[start..index]);
+            }
+            continue;
+        }
+        let ch = text[index..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+fn is_opaque_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+}
+
 fn replace_secret(text: &str, secret: &str) -> String {
     if secret.len() < 4 {
         return text.to_owned();
@@ -545,6 +702,77 @@ mod tests {
     }
 
     #[test]
+    fn authorization_bearer_lines_stay_redacted() {
+        let line = "request failed Authorization: Bearer bearer-secret-value";
+        let redacted = redact_line(line, &[]);
+        assert!(!redacted.contains("bearer-secret-value"), "{redacted}");
+        assert!(redacted.contains("Authorization: ***"), "{redacted}");
+    }
+
+    #[test]
+    fn redacts_vin_assignments_and_bare_vins() {
+        let vin = "5YJ3E1EA7KF000001";
+        let text = format!("vin={vin} parked {vin}");
+        let redacted = redact_line(&text, &[]);
+        assert!(!redacted.contains(vin), "{redacted}");
+        assert!(redacted.contains("parked"), "{redacted}");
+    }
+
+    #[test]
+    fn owner_stream_status_line_drops_the_vin() {
+        let vin = "5YJ3E1EA7KF000001";
+        let line =
+            format!("owner stream status vin={vin} status=error class=transport retry_secs=2");
+        let redacted = redact_line(&line, &[]);
+        assert!(!redacted.contains(vin), "{redacted}");
+        assert!(redacted.contains("class=transport"), "{redacted}");
+        assert!(redacted.contains("retry_secs=2"), "{redacted}");
+        assert!(redacted.contains("vin=***"), "{redacted}");
+    }
+
+    #[test]
+    fn tracing_vin_field_is_redacted_in_the_ring_buffer() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let vin = "5YJ3E1EA7KF000001";
+        let buffer = LogBuffer::new(8);
+        let layer = super::CaptureLayer::new(buffer.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                vin = vin,
+                status = "error",
+                class = "transport",
+                retry_secs = 2,
+                "owner stream status"
+            );
+        });
+        let text = buffer
+            .lines()
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("owner stream status"), "{text}");
+        assert!(text.contains("class=transport"), "{text}");
+        assert!(!text.contains(vin), "{text}");
+    }
+
+    #[test]
+    fn debug_text_keeps_subscribe_tag_and_drops_the_token() {
+        let token = "subscribe-token-value";
+        let frame = format!(
+            "{{\"msg_type\":\"data:subscribe_oauth\",\"token\":\"{token}\",\"value\":\"speed,odometer,soc\",\"tag\":\"42\"}}"
+        );
+        let redacted = super::redact_debug_text(&frame, &[]);
+        assert!(!redacted.contains(token), "{redacted}");
+        assert!(!redacted.contains("\"token\""), "{redacted}");
+        assert!(redacted.contains("data:subscribe_oauth"), "{redacted}");
+        assert!(redacted.contains("tag=42"), "{redacted}");
+        assert!(redacted.contains("speed,odometer,soc"), "{redacted}");
+    }
+
+    #[test]
     fn buffer_keeps_a_bounded_redacted_history() {
         let buffer = LogBuffer::new(2);
         buffer.record("INFO", "owner stream is up");
@@ -594,6 +822,9 @@ mod tests {
         let denied = call(&state, "GET", "/logs", None, None).await;
         assert_eq!(denied.status(), axum::http::StatusCode::SEE_OTHER);
         assert_eq!(denied.headers().get("location").unwrap(), "/");
+        let denied_events = call(&state, "GET", "/logs/events", None, None).await;
+        assert_eq!(denied_events.status(), axum::http::StatusCode::SEE_OTHER);
+        assert_eq!(denied_events.headers().get("location").unwrap(), "/");
         let denied_body = body_text(denied).await;
         assert!(!denied_body.contains("owner stream is up"));
         assert_secret_free(&denied_body);
@@ -619,9 +850,29 @@ mod tests {
         )
         .await;
         assert_eq!(page.status(), axum::http::StatusCode::OK);
+        let events = call(
+            &state,
+            "GET",
+            "/logs/events",
+            Some(&format!("tl_session={session}")),
+            None,
+        )
+        .await;
+        assert_eq!(events.status(), axum::http::StatusCode::OK);
+        let kind = events
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(kind.starts_with("text/event-stream"), "{kind}");
+        drop(events);
         assert_eq!(page.headers().get("cache-control").unwrap(), "no-store");
         let html = body_text(page).await;
         assert!(html.contains("owner stream is up"), "{html}");
+        assert!(html.contains("Owner stream"));
+        assert!(html.contains("Connection history"));
+        assert!(html.contains(">Debug</h1>") || html.contains("Debug</h1>"));
         assert!(html.contains("href=\"/auth/owner\""));
         assert!(html.contains("href=\"/\""));
         assert!(html.contains("&lt;note&gt;"));

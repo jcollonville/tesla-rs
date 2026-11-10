@@ -34,6 +34,7 @@ tesla-fleet-api = { workspace = true }
 tesla-fleet-telemetry = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "io-util", "fs"] }
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { workspace = true }

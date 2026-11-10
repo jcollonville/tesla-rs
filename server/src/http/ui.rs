@@ -4,7 +4,7 @@
 use axum::Router;
 use std::fmt::Write;
 
-use axum::extract::{Form, Path, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -30,6 +30,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/tokens", post(create_token))
         .route("/tokens/{id}/revoke", post(revoke_token))
         .route("/logs", get(logs))
+        .route("/logs/events", get(logs_events))
 }
 
 #[derive(Deserialize)]
@@ -53,51 +54,61 @@ async fn logs(State(app): State<AppState>, headers: HeaderMap) -> Response {
     if ui_session(&app, &headers).await.is_none() {
         return Redirect::to("/").into_response();
     }
-    let mut response = Html(logs_markup(&app.inner.logs.lines())).into_response();
+    crate::debug::probe(&app).await;
+    let console = app.inner.debug.console(&app.inner.logs.lines());
+    let body = format!(
+        "<div id=\"debug-root\" data-frames=\"{}\" data-logs=\"{}\">\
+         <header class=\"toolbar\"><div><p class=\"kicker\"><a href=\"/\">tesla-logger</a></p>\
+         <h1 class=\"title\">{}Debug</h1></div>\
+         <div class=\"toolbar-actions\">\
+         <span class=\"chip\" id=\"live\">connecting</span>\
+         <button class=\"ghost\" type=\"button\" id=\"pause\" aria-pressed=\"false\">Pause</button>\
+         <a class=\"button ghost\" href=\"/auth/owner\">{}Streaming</a>\
+         <a class=\"button ghost\" href=\"/\">{}Dashboard</a></div></header>\
+         <p class=\"muted\">Processes, websocket frames, and recent log lines from this process. They stay in memory and reset on restart. Tokens, passwords, and VINs are removed.</p>\
+         {}</div>",
+        console.frames_cursor,
+        console.logs_cursor,
+        icon(ICON_LOGS),
+        icon(ICON_STREAM),
+        icon(ICON_ARROW),
+        console.body
+    );
+    let mut response = Html(page_wide(&body)).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
-fn logs_markup(lines: &[crate::logs::LogLine]) -> String {
-    let mut items = String::new();
-    if lines.is_empty() {
-        items.push_str("<p class=\"muted\">No log lines yet.</p>");
-    } else {
-        items.push_str("<ol class=\"logs\">");
-        for line in lines {
-            let _ = write!(
-                items,
-                "<li><time>{}</time> <span class=\"{}\">{}</span> {}</li>",
-                escape(&line.at.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
-                level_class(&line.level),
-                escape(&line.level),
-                escape(&line.text)
-            );
-        }
-        items.push_str("</ol>");
+async fn logs_events(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Query(cursor): Query<LogCursor>,
+) -> Response {
+    if ui_session(&app, &headers).await.is_none() {
+        return Redirect::to("/").into_response();
     }
-    page(&format!(
-        "<header class=\"toolbar\"><div><p class=\"kicker\"><a href=\"/\">tesla-logger</a></p>\
-         <h1 class=\"title\">{}Logs</h1></div>\
-         <div class=\"toolbar-actions\">\
-         <a class=\"button ghost\" href=\"/auth/owner\">{}Streaming</a>\
-         <a class=\"button ghost\" href=\"/\">{}Dashboard</a></div></header>\
-         <p class=\"muted\">Recent lines from this process. They stay in memory and reset on restart. Passwords, tokens, and subscribe frames are removed.</p>\
-         <section class=\"card\">{items}</section>",
-        icon(ICON_LOGS),
-        icon(ICON_STREAM),
-        icon(ICON_ARROW)
-    ))
+    let stream = crate::debug::event_stream(app, cursor.frames, cursor.logs);
+    let mut response = axum::response::sse::Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response
 }
 
-fn level_class(level: &str) -> &'static str {
-    match level.to_ascii_uppercase().as_str() {
-        "ERROR" => "bad",
-        "WARN" | "WARNING" => "warn",
-        _ => "info",
-    }
+#[derive(Deserialize)]
+struct LogCursor {
+    #[serde(default)]
+    frames: u64,
+    #[serde(default)]
+    logs: u64,
 }
 
 async fn status(State(app): State<AppState>, headers: HeaderMap) -> Response {
@@ -437,7 +448,7 @@ fn render_status(
          <div class=\"toolbar-actions\">{connect}\
          <form method=\"post\" action=\"/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"ghost\" type=\"submit\">{}Sign out</button></form></div></header>\
          {global}\
-         <div class=\"meta\">{account}{stream}<a class=\"button ghost\" href=\"/auth/owner\">{}Set up streaming</a><a class=\"button ghost\" href=\"/logs\">Logs</a></div>\
+         <div class=\"meta\">{account}{stream}<a class=\"button ghost\" href=\"/auth/owner\">{}Set up streaming</a><a class=\"button ghost\" href=\"/logs\">Debug</a></div>\
          <section><h2>Vehicles</h2><div class=\"vehicles\">{cards}</div></section>\
          <section class=\"card\"><h2>API tokens</h2>{revealed}\
          <form class=\"stack\" method=\"post\" action=\"/tokens\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
@@ -609,6 +620,10 @@ pub(super) fn page(body: &str) -> String {
     html.push_str(body);
     html.push_str(FOOT);
     html
+}
+
+fn page_wide(body: &str) -> String {
+    page(body).replacen("<main class=\"shell\">", "<main class=\"shell wide\">", 1)
 }
 
 #[cfg(test)]

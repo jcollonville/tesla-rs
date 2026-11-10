@@ -295,7 +295,7 @@ fn owner_markup(view: &OwnerView<'_>) -> String {
     ui::page(&format!(
         "<header class=\"toolbar\"><div><p class=\"kicker\"><a href=\"/\">tesla-logger</a></p>\
          <h1 class=\"title\">{}Owner API streaming</h1></div>\
-         <div class=\"toolbar-actions\"><a class=\"button ghost\" href=\"/logs\">{}Logs</a>\
+         <div class=\"toolbar-actions\"><a class=\"button ghost\" href=\"/logs\">{}Debug</a>\
          <a class=\"button ghost\" href=\"/\">{}Back</a></div></header>\
          {error}{notice}\
          <p>This uses Tesla's legacy Owner API and streaming socket. They are unofficial and Tesla may shut them down. Fleet API polling stays the source for everything else. The stream adds about one position per second while driving.</p>\

@@ -2982,6 +2982,7 @@ dependencies = [
  "tesla-owner-api",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tower",
  "tracing",
@@ -3178,6 +3179,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
