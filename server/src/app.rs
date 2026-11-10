@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -43,7 +43,6 @@ pub(crate) struct Inner {
     pub pending: Mutex<HashMap<String, PendingAuthorization>>,
     pub public_key_pem: String,
     pub events: broadcast::Sender<LiveEvent>,
-    pub ui_sessions: Mutex<HashMap<String, UiSession>>,
     pub revealed: Mutex<HashMap<String, String>>,
     pub archive: Arc<Archive>,
     pub owner_pending: Mutex<Option<(OwnerLogin, Instant)>>,
@@ -51,12 +50,6 @@ pub(crate) struct Inner {
     pub owner_tokens: watch::Sender<u64>,
     pub logs: LogBuffer,
     pub debug: DebugBoard,
-}
-
-pub(crate) struct UiSession {
-    pub expires: Instant,
-    /// Last vehicle opened in this login. A vehicle id, not a credential.
-    pub last_vehicle: Option<i64>,
 }
 
 pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
@@ -153,6 +146,7 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
         .connect(&config.database_url)
         .await?;
     sqlx::migrate!("./migrations").run(&db).await?;
+    crate::identity::bootstrap(&db, &config).await?;
     let imported = accounts::import_token_files(&db, &config).await?;
     let fleet_store = Arc::new(DbTokenStore::open(
         db.clone(),
@@ -182,6 +176,10 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
     fleet_store.on_saved(std::sync::Arc::new(move |expires| {
         debug_saved.token_saved("fleet", expires);
     }));
+    let owner_saved = debug.clone();
+    owner_store.on_saved(std::sync::Arc::new(move |expires| {
+        owner_saved.token_saved("owner", expires);
+    }));
     let geocoder = Geocoder::from_config(&config)?;
     let mut archive = Archive::new(db.clone(), geocoder, events.clone(), stream_kick, gps);
     archive.fleet_account_id = Some(imported.fleet_id);
@@ -199,7 +197,6 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
             pending: Mutex::new(HashMap::new()),
             public_key_pem,
             events,
-            ui_sessions: Mutex::new(HashMap::new()),
             revealed: Mutex::new(HashMap::new()),
             archive,
             owner_pending: Mutex::new(None),
@@ -245,10 +242,6 @@ async fn shutdown_signal() {
     {
         let _ = ctrl_c.await;
     }
-}
-
-pub(crate) fn session_ttl() -> Duration {
-    Duration::from_secs(12 * 60 * 60)
 }
 
 #[cfg(test)]
@@ -350,7 +343,6 @@ pub(crate) async fn test_state_with(pool: PgPool, energy_price_per_kwh: Option<f
             pending: Mutex::new(HashMap::new()),
             public_key_pem,
             events,
-            ui_sessions: Mutex::new(HashMap::new()),
             revealed: Mutex::new(HashMap::new()),
             archive,
             owner_pending: Mutex::new(None),

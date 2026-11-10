@@ -10,17 +10,18 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use serde::Deserialize;
-use tesla_auth::{CallbackParams, ExposeSecret, TokenStore};
+use tesla_auth::{CallbackParams, TokenStore};
 
 use super::markup::{
-    Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview, Party, SettingRow,
-    TokenLine, VehicleTab, connection_page, debug_page, fleet_page, login_page, missing_page,
-    overview_page, placeholder_page, security_page, settings_page, system_page,
+    AccessLine, AuditLine, Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview,
+    Party, SessionLine, SettingRow, TokenLine, VehicleTab, connection_page, debug_page, fleet_page,
+    login_page, missing_page, overview_page, placeholder_page, security_page, settings_page,
+    setup_page, system_page,
 };
 use super::{cookie, ui_session};
 use crate::accounts::{self, TokenPublic};
-use crate::app::{AppState, session_ttl};
-use crate::crypto::{password_matches, public_key_fingerprint, random_token, sha256_hex};
+use crate::app::AppState;
+use crate::crypto::{public_key_fingerprint, random_token, sha256_hex};
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
@@ -36,6 +37,14 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/debug", get(debug_page_handler))
         .route("/system", get(system))
         .route("/security", get(security))
+        .route("/security/setup", get(security_setup))
+        .route("/security/password", post(change_password))
+        .route("/security/totp", post(enroll_totp))
+        .route("/security/totp/confirm", post(confirm_totp))
+        .route("/sudo", post(sudo))
+        .route("/users", post(create_user))
+        .route("/vehicle-access", post(set_access))
+        .route("/sessions/{id}/revoke", post(revoke_session))
         .route("/logs", get(logs_redirect))
         .route("/logs/events", get(logs_events))
         .route("/auth/login", get(oauth_start))
@@ -58,6 +67,10 @@ pub(crate) fn routes() -> Router<AppState> {
 struct LoginForm {
     password: String,
     csrf: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    totp: String,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +84,12 @@ pub(super) struct CsrfForm {
 struct TokenForm {
     csrf: String,
     name: String,
+    #[serde(default)]
+    scopes: String,
+    #[serde(default)]
+    expires_days: String,
+    #[serde(default)]
+    vehicle_ids: String,
 }
 
 #[derive(Clone, sqlx::FromRow)]
@@ -91,6 +110,8 @@ struct Page {
     cookie: Option<HeaderValue>,
     vehicles: Vec<VehicleRow>,
     remembered: Option<i64>,
+    admin: bool,
+    username: String,
 }
 
 async fn home(State(app): State<AppState>, headers: HeaderMap) -> Response {
@@ -443,6 +464,203 @@ fn fmt_scopes(scopes: &[String]) -> String {
     }
 }
 
+async fn security_setup(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(_principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    let Some(page) = signed_page(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    html_page(setup_page(&page.csrf, None), page.cookie)
+}
+
+async fn change_password(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<PasswordForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) {
+        return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
+    }
+    if let Err(err) =
+        crate::identity::change_password(&app.inner.db, principal.user_id, &form.password).await
+    {
+        let Some(page) = signed_page(&app, &headers).await else {
+            return Redirect::to("/").into_response();
+        };
+        return html_page(setup_page(&page.csrf, Some(&err.to_string())), page.cookie);
+    }
+    Redirect::to("/security/setup").into_response()
+}
+
+async fn enroll_totp(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) {
+        return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
+    }
+    match crate::identity::enroll_totp(&app, principal.user_id).await {
+        Ok(enrollment) => {
+            let Some(page) = signed_page(&app, &headers).await else {
+                return Redirect::to("/").into_response();
+            };
+            let mut body = setup_page(&page.csrf, None);
+            let extra = format!(
+                "<section class=\"card\"><h2>Secret TOTP</h2><code>{}</code><p>{}</p></section></main>",
+                enrollment.secret,
+                enrollment.recovery.join(" ")
+            );
+            body = body.replacen("</main>", &extra, 1);
+            html_page(body, page.cookie)
+        }
+        Err(_) => Redirect::to("/security/setup").into_response(),
+    }
+}
+
+async fn confirm_totp(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<TotpForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) {
+        return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
+    }
+    let ok = crate::identity::confirm_totp(&app, principal.user_id, &form.code)
+        .await
+        .unwrap_or(false);
+    if ok {
+        Redirect::to("/").into_response()
+    } else {
+        let Some(page) = signed_page(&app, &headers).await else {
+            return Redirect::to("/").into_response();
+        };
+        html_page(
+            setup_page(&page.csrf, Some("Code TOTP refusé")),
+            page.cookie,
+        )
+    }
+}
+
+async fn create_user(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<UserForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) || !principal.is_admin() || !principal.sudo_active() {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
+    }
+    let _ = crate::identity::create_user(
+        &app.inner.db,
+        principal.user_id,
+        &form.username,
+        &form.password,
+        &form.role,
+    )
+    .await;
+    Redirect::to("/security").into_response()
+}
+
+async fn set_access(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AccessForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) || !principal.is_admin() || !principal.sudo_active() {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
+    }
+    let role = if form.role.is_empty() {
+        None
+    } else {
+        Some(form.role.as_str())
+    };
+    let _ = crate::identity::set_vehicle_access(
+        &app.inner.db,
+        principal.user_id,
+        form.user_id,
+        form.vehicle_id,
+        role,
+    )
+    .await;
+    Redirect::to("/security").into_response()
+}
+
+async fn revoke_session(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) || !principal.is_admin() {
+        return (StatusCode::FORBIDDEN, "admin required").into_response();
+    }
+    let _ = crate::identity::revoke_session(&app.inner.db, principal.user_id, &id).await;
+    Redirect::to("/security").into_response()
+}
+
+#[derive(Deserialize)]
+struct UserForm {
+    csrf: String,
+    username: String,
+    password: String,
+    role: String,
+}
+
+#[derive(Deserialize)]
+struct AccessForm {
+    csrf: String,
+    user_id: i64,
+    vehicle_id: i64,
+    #[serde(default)]
+    role: String,
+}
+
+async fn sudo(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<PasswordForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) {
+        return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
+    }
+    let _ = crate::identity::grant_sudo(&app.inner.db, &principal, &form.password).await;
+    Redirect::to("/security").into_response()
+}
+
+#[derive(Deserialize)]
+struct PasswordForm {
+    csrf: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct TotpForm {
+    csrf: String,
+    code: String,
+}
+
 async fn settings(State(app): State<AppState>, headers: HeaderMap) -> Response {
     let Some(page) = signed_page(&app, &headers).await else {
         return Redirect::to("/").into_response();
@@ -450,7 +668,7 @@ async fn settings(State(app): State<AppState>, headers: HeaderMap) -> Response {
     let rows = app
         .inner
         .config
-        .public_settings()
+        .public_settings(page.admin)
         .into_iter()
         .map(|row| SettingRow {
             label: row.label,
@@ -482,7 +700,7 @@ async fn security(State(app): State<AppState>, headers: HeaderMap) -> Response {
         return Redirect::to("/").into_response();
     };
     let tokens = token_rows(&app).await.unwrap_or_default();
-    let revealed = if let Some(session) = cookie(&headers, "tl_session") {
+    let revealed = if let Some(session) = cookie(&headers, crate::identity::SESSION_COOKIE) {
         app.inner.revealed.lock().await.remove(session)
     } else {
         None
@@ -493,13 +711,21 @@ async fn security(State(app): State<AppState>, headers: HeaderMap) -> Response {
             id: token.id,
             name: token.name.clone(),
             active: token.revoked_at.is_none(),
+            scopes: token.scopes.join(" "),
         })
         .collect::<Vec<_>>();
+    let access = access_lines(&app).await;
+    let sessions = session_lines(&app).await;
+    let audit = audit_lines(&app).await;
     html_page(
         security_page(
             &chrome(&page, None, None, GlobalTab::Security, false),
             &lines,
             revealed.as_deref(),
+            &page.username,
+            &access,
+            &sessions,
+            &audit,
         ),
         page.cookie,
     )
@@ -530,10 +756,12 @@ async fn logs_redirect(State(app): State<AppState>, headers: HeaderMap) -> Respo
 }
 
 async fn owner_redirect(State(app): State<AppState>, headers: HeaderMap) -> Response {
-    if ui_session(&app, &headers).await.is_none() {
+    let Some(principal) = ui_session(&app, &headers).await else {
         return Redirect::to("/").into_response();
-    }
-    let vehicles = vehicle_rows(&app).await.unwrap_or_default();
+    };
+    let vehicles = vehicle_rows(&app, principal.user_id)
+        .await
+        .unwrap_or_default();
     if vehicles.len() == 1 {
         Redirect::to(&format!("/v/{}/connection", vehicles[0].id)).into_response()
     } else {
@@ -579,26 +807,32 @@ async fn login(
     if !csrf_ok(&headers, &form.csrf) {
         return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
     }
-    let expected = app.inner.config.ui_password.expose_secret();
-    if !password_matches(expected, &form.password) {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        return login_page_response(&app, &headers, Some("Mot de passe incorrect"));
-    }
-    let Ok(id) = random_token() else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "entropy failed").into_response();
+    let ip = crate::identity::client_ip(&headers);
+    let outcome =
+        match crate::identity::login(&app, &form.username, &form.password, &form.totp, &ip).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::warn!(error = %err, "login failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "login failed").into_response();
+            }
+        };
+    let id = match outcome {
+        crate::identity::LoginResult::Session(issued) => issued.id,
+        crate::identity::LoginResult::Locked => {
+            return login_page_response(&app, &headers, Some("Compte temporairement bloqué"));
+        }
+        crate::identity::LoginResult::Rejected => {
+            return login_page_response(&app, &headers, Some("Mot de passe incorrect"));
+        }
     };
-    app.inner.ui_sessions.lock().await.insert(
-        id.clone(),
-        crate::app::UiSession {
-            expires: std::time::Instant::now() + session_ttl(),
-            last_vehicle: None,
-        },
-    );
     let mut response = Redirect::to("/").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_str(&session_cookie(&app, &id))
-            .unwrap_or(HeaderValue::from_static("tl_session=; HttpOnly")),
+        HeaderValue::from_str(&crate::identity::session_cookie(&id)).unwrap_or(
+            HeaderValue::from_static(
+                "__Host-tl_session=; HttpOnly; Secure; Path=/; Max-Age=0; SameSite=Strict",
+            ),
+        ),
     );
     response
 }
@@ -611,13 +845,18 @@ async fn logout(
     if !csrf_ok(&headers, &form.csrf) {
         return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
     }
-    if let Some(id) = cookie(&headers, "tl_session") {
-        app.inner.ui_sessions.lock().await.remove(id);
+    if let Some(principal) = ui_session(&app, &headers).await {
+        let _ = crate::identity::revoke_session(
+            &app.inner.db,
+            principal.user_id,
+            &crate::crypto::sha256_hex(&principal.raw_id),
+        )
+        .await;
     }
     let mut response = Redirect::to("/").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_static("tl_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax"),
+        HeaderValue::from_static(crate::identity::clear_session_cookie()),
     );
     response
 }
@@ -677,8 +916,11 @@ async fn disconnect(
     headers: HeaderMap,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    if ui_session(&app, &headers).await.is_none() || !csrf_ok(&headers, &form.csrf) {
+    let Some(principal) = ui_session(&app, &headers).await else {
         return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) || !principal.sudo_active() {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
     }
     if let Err(err) = app.inner.fleet_store.clear().await {
         tracing::warn!(
@@ -698,42 +940,14 @@ async fn fleet_refresh(
         return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
     }
     let failed = |message: &str| message.to_owned();
-    let outcome = match app.inner.fleet_store.load().await {
-        Ok(Some(tokens)) => {
-            let refresh = tokens.refresh_token().cloned();
-            drop(tokens);
-            match refresh {
-                Some(refresh) => match app.inner.session.client().refresh(&refresh).await {
-                    Ok(updated) => match app.inner.fleet_store.save(&updated).await {
-                        Ok(()) => None,
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %crate::logs::redact_line(&err.to_string(), &[]),
-                                "fleet token could not be stored"
-                            );
-                            Some(failed(
-                                "Le jeton Fleet rafraîchi n'a pas pu être enregistré.",
-                            ))
-                        }
-                    },
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %crate::logs::redact_line(&err.to_string(), &[]),
-                            "fleet token refresh failed"
-                        );
-                        Some(failed("Le rafraîchissement Fleet a été refusé."))
-                    }
-                },
-                None => Some(failed("Ce jeton Fleet ne contient pas de refresh token.")),
-            }
-        }
-        Ok(None) => Some(failed("Aucun jeton Fleet n'est enregistré.")),
+    let outcome = match app.inner.session.force_refresh().await {
+        Ok(_) => None,
         Err(err) => {
             tracing::warn!(
                 error = %crate::logs::redact_line(&err.to_string(), &[]),
-                "fleet token could not be read"
+                "fleet token refresh failed"
             );
-            Some(failed("Le jeton Fleet est illisible."))
+            Some(failed("Le rafraîchissement Fleet a été refusé."))
         }
     };
     if let Some(message) = outcome {
@@ -750,6 +964,9 @@ async fn create_token(
     let Some(session) = ui_session(&app, &headers).await else {
         return Redirect::to("/").into_response();
     };
+    if !session.is_admin() || !session.sudo_active() {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
+    }
     if !csrf_ok(&headers, &form.csrf) {
         return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
     }
@@ -762,9 +979,43 @@ async fn create_token(
     };
     let stored = format!("tl_{token}");
     let hash = sha256_hex(&stored);
-    if let Err(err) = sqlx::query("INSERT INTO api_tokens (name, token_hash) VALUES ($1, $2)")
-        .bind(name)
-        .bind(hash)
+    let scopes = form
+        .scopes
+        .split_whitespace()
+        .filter(|scope| matches!(*scope, "read" | "read:live" | "write" | "admin"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let scopes = if scopes.is_empty() {
+        vec!["read".to_owned(), "read:live".to_owned()]
+    } else {
+        scopes
+    };
+    let vehicle_ids = form
+        .vehicle_ids
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter_map(|part| part.parse::<i64>().ok())
+        .collect::<Vec<_>>();
+    let vehicle_ids = if vehicle_ids.is_empty() {
+        None
+    } else {
+        Some(vehicle_ids)
+    };
+    let expires_days = form
+        .expires_days
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|days| *days > 0);
+    if let Err(err) = sqlx::query(
+        "INSERT INTO api_tokens (name, token_hash, user_id, scopes, expires_at, vehicle_ids)
+         VALUES ($1, $2, $3, $4, CASE WHEN $5::bigint IS NULL THEN NULL ELSE now() + make_interval(days => $5::int) END, $6)",
+    )
+    .bind(name)
+    .bind(hash)
+    .bind(session.user_id)
+    .bind(&scopes)
+    .bind(expires_days)
+    .bind(vehicle_ids.as_deref())
         .execute(&app.inner.db)
         .await
     {
@@ -774,7 +1025,19 @@ async fn create_token(
         );
         return (StatusCode::INTERNAL_SERVER_ERROR, "could not store token").into_response();
     }
-    app.inner.revealed.lock().await.insert(session, stored);
+    app.inner
+        .revealed
+        .lock()
+        .await
+        .insert(session.raw_id, stored);
+    crate::identity::audit(
+        &app.inner.db,
+        Some(session.user_id),
+        "token.create",
+        "ok",
+        "{}",
+    )
+    .await;
     Redirect::to("/security").into_response()
 }
 
@@ -836,13 +1099,6 @@ pub(super) fn csrf_ok(headers: &HeaderMap, form: &str) -> bool {
     cookie(headers, "tl_csrf").is_some_and(|cookie| cookie == form && !form.is_empty())
 }
 
-fn session_cookie(app: &AppState, id: &str) -> String {
-    format!(
-        "tl_session={id}; HttpOnly; Path=/; Max-Age=43200; SameSite=Lax{}",
-        secure_flag(app)
-    )
-}
-
 pub(super) fn secure_flag(app: &AppState) -> &'static str {
     if app.inner.config.public_base_url.starts_with("https://") {
         "; Secure"
@@ -859,16 +1115,14 @@ pub(super) fn connection_location(vehicle_id: Option<i64>) -> String {
 }
 
 async fn signed_page(app: &AppState, headers: &HeaderMap) -> Option<Page> {
-    let session_id = ui_session(app, headers).await?;
-    let remembered = app
-        .inner
-        .ui_sessions
-        .lock()
-        .await
-        .get(&session_id)
-        .and_then(|session| session.last_vehicle);
+    let principal = ui_session(app, headers).await?;
+    let session_id = principal.raw_id.clone();
+    let remembered = principal.last_vehicle;
+    let user_id = principal.user_id;
+    let admin = principal.is_admin();
+    let username = principal.username;
     let csrf = ensure_csrf(app, headers).ok()?;
-    let vehicles = match vehicle_rows(app).await {
+    let vehicles = match vehicle_rows(app, user_id).await {
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!(
@@ -884,13 +1138,13 @@ async fn signed_page(app: &AppState, headers: &HeaderMap) -> Option<Page> {
         cookie: csrf.1,
         vehicles,
         remembered,
+        admin,
+        username,
     })
 }
 
 async fn remember_vehicle(app: &AppState, session_id: &str, id: i64) {
-    if let Some(session) = app.inner.ui_sessions.lock().await.get_mut(session_id) {
-        session.last_vehicle = Some(id);
-    }
+    crate::identity::remember_vehicle(&app.inner.db, session_id, id).await;
 }
 
 fn chrome(
@@ -918,7 +1172,7 @@ fn html_page(body: String, set_cookie: Option<HeaderValue>) -> Response {
     response
 }
 
-async fn vehicle_rows(app: &AppState) -> Result<Vec<VehicleRow>, sqlx::Error> {
+async fn vehicle_rows(app: &AppState, user_id: i64) -> Result<Vec<VehicleRow>, sqlx::Error> {
     sqlx::query_as(
         "SELECT v.id,
                 COALESCE(NULLIF(v.name, ''), 'Véhicule ' || v.id::text) AS name,
@@ -930,8 +1184,10 @@ async fn vehicle_rows(app: &AppState) -> Result<Vec<VehicleRow>, sqlx::Error> {
                 s.last_error
          FROM vehicles v
          LEFT JOIN vehicle_state s ON s.vehicle_id = v.id
+         WHERE v.id IN (SELECT vehicle_id FROM vehicle_access WHERE user_id = $1)
          ORDER BY v.id",
     )
+    .bind(user_id)
     .fetch_all(&app.inner.db)
     .await
 }
@@ -1015,12 +1271,70 @@ struct TokenRow {
     id: i64,
     name: String,
     revoked_at: Option<DateTime<Utc>>,
+    scopes: Vec<String>,
 }
 
 async fn token_rows(app: &AppState) -> Result<Vec<TokenRow>, sqlx::Error> {
-    sqlx::query_as("SELECT id, name, revoked_at FROM api_tokens ORDER BY id DESC LIMIT 20")
+    sqlx::query_as("SELECT id, name, revoked_at, scopes FROM api_tokens ORDER BY id DESC LIMIT 20")
         .fetch_all(&app.inner.db)
         .await
+}
+
+async fn access_lines(app: &AppState) -> Vec<AccessLine> {
+    sqlx::query_as::<_, (String, String, String)>(
+        "SELECT u.username, COALESCE(v.name, v.id::text), a.role
+         FROM vehicle_access a
+         JOIN users u ON u.id = a.user_id
+         JOIN vehicles v ON v.id = a.vehicle_id
+         ORDER BY u.username, v.id",
+    )
+    .fetch_all(&app.inner.db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(user, vehicle, role)| AccessLine {
+        user,
+        vehicle,
+        role,
+    })
+    .collect()
+}
+
+async fn session_lines(app: &AppState) -> Vec<SessionLine> {
+    sqlx::query_as::<_, (String, String, DateTime<Utc>)>(
+        "SELECT s.id_hash, u.username, s.last_seen_at
+         FROM sessions s
+         JOIN users u ON u.id = s.user_id
+         WHERE s.revoked_at IS NULL AND s.expires_at > now()
+         ORDER BY s.last_seen_at DESC
+         LIMIT 20",
+    )
+    .fetch_all(&app.inner.db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(id_hash, user, seen)| SessionLine {
+        id_hash,
+        user,
+        seen: seen.format("%Y-%m-%d %H:%M UTC").to_string(),
+    })
+    .collect()
+}
+
+async fn audit_lines(app: &AppState) -> Vec<AuditLine> {
+    sqlx::query_as::<_, (DateTime<Utc>, String, String)>(
+        "SELECT at, action, outcome FROM audit_log ORDER BY id DESC LIMIT 40",
+    )
+    .fetch_all(&app.inner.db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(at, action, outcome)| AuditLine {
+        at: at.format("%Y-%m-%d %H:%M UTC").to_string(),
+        action,
+        outcome,
+    })
+    .collect()
 }
 
 fn nav_from(page: &Page, current: Option<i64>) -> Vec<NavVehicle> {

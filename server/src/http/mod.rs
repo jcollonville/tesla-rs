@@ -8,8 +8,6 @@ mod owner;
 pub(crate) mod stats;
 mod ui;
 
-use std::time::Instant;
-
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
@@ -20,7 +18,7 @@ use axum::{Json, Router};
 use serde::Serialize;
 
 use crate::app::AppState;
-use crate::crypto::{random_token, sha256_hex};
+use crate::crypto::random_token;
 use crate::error::redact_secrets;
 
 pub(crate) fn router(state: AppState) -> Router {
@@ -98,6 +96,18 @@ async fn security_headers(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let path_for_setup = request.uri().path().to_owned();
+    let headers_for_setup = request.headers().clone();
+    if needs_setup(&app, &headers_for_setup, &path_for_setup).await {
+        return axum::response::Redirect::to("/security/setup").into_response();
+    }
+    if !crate::identity::origin_allowed(
+        request.method(),
+        request.headers(),
+        &app.inner.config.public_base_url,
+    ) {
+        return (StatusCode::FORBIDDEN, "cross-origin request rejected").into_response();
+    }
     let path = request.uri().path().to_owned();
     let method = request.method().clone();
     let https = request_is_https(&request, &app.inner.config.public_base_url);
@@ -137,6 +147,29 @@ async fn security_headers(
     response
 }
 
+async fn needs_setup(app: &AppState, headers: &HeaderMap, path: &str) -> bool {
+    if path.starts_with("/api/")
+        || path.starts_with("/static/")
+        || path == "/security/setup"
+        || path == "/security/password"
+        || path == "/security/totp"
+        || path == "/security/totp/confirm"
+        || path == "/logout"
+        || path == "/healthz"
+        || assets::is_static(path)
+    {
+        return false;
+    }
+    let Some(id) = cookie(headers, crate::identity::SESSION_COOKIE).map(str::to_owned) else {
+        return false;
+    };
+    crate::identity::load_session(&app.inner.db, &id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|principal| principal.needs_setup())
+}
+
 fn request_is_https(request: &Request<Body>, public_base: &str) -> bool {
     if public_base.starts_with("https://") || request.uri().scheme_str() == Some("https") {
         return true;
@@ -162,31 +195,56 @@ async fn require_bearer(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let Some(token) = bearer_token(&request) else {
+    let path = request.uri().path().to_owned();
+    let Some((token, from_query)) = bearer_token(&request) else {
         return Err(ApiError::Unauthorized);
     };
-    let hash = sha256_hex(&token);
-    let row = sqlx::query_as::<_, (i64,)>(
-        "SELECT id FROM api_tokens WHERE token_hash = $1 AND revoked_at IS NULL",
-    )
-    .bind(&hash)
-    .fetch_optional(&app.inner.db)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %redact_secrets(&err.to_string()), "token lookup failed");
-        ApiError::Internal
-    })?;
-    let Some((id,)) = row else {
+    if from_query && path != "/api/v1/ws" {
+        return Err(ApiError::Unauthorized);
+    }
+    let Some(record) = crate::identity::authenticate_token(&app.inner.db, &token)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %redact_secrets(&err.to_string()), "token lookup failed");
+            ApiError::Internal
+        })?
+    else {
         return Err(ApiError::Unauthorized);
     };
-    let _ = sqlx::query("UPDATE api_tokens SET last_used_at = now() WHERE id = $1")
-        .bind(id)
-        .execute(&app.inner.db)
-        .await;
-    Ok(next.run(request).await)
+    let scopes = &record.scopes;
+    let allowed = if from_query {
+        scope_has(scopes, "read:live")
+    } else if path == "/api/v1/ws" {
+        scope_has(scopes, "read") || scope_has(scopes, "read:live")
+    } else {
+        scope_has(scopes, "read")
+    };
+    if !allowed {
+        return Err(ApiError::Unauthorized);
+    }
+    let vehicles = match record.user_id {
+        None => None,
+        Some(user_id) => {
+            let mut ids = crate::identity::accessible_vehicles(&app.inner.db, user_id)
+                .await
+                .map_err(|_| ApiError::Internal)?;
+            if let Some(limit) = record.vehicle_ids {
+                ids.retain(|id| limit.contains(id));
+            }
+            Some(ids)
+        }
+    };
+    let grant = ApiGrant { vehicles };
+    Ok(API_GRANT.scope(grant, next.run(request)).await)
 }
 
-fn bearer_token(request: &Request<Body>) -> Option<String> {
+fn scope_has(scopes: &[String], needed: &str) -> bool {
+    scopes
+        .iter()
+        .any(|scope| scope == needed || scope == "admin")
+}
+
+fn bearer_token(request: &Request<Body>) -> Option<(String, bool)> {
     if let Some(header) = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -197,13 +255,13 @@ fn bearer_token(request: &Request<Body>) -> Option<String> {
             .or_else(|| header.strip_prefix("bearer "))?;
         let token = token.trim();
         if !token.is_empty() {
-            return Some(token.to_owned());
+            return Some((token.to_owned(), false));
         }
     }
     let query = request.uri().query()?;
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         if key == "access_token" && !value.is_empty() {
-            return Some(value.into_owned());
+            return Some((value.into_owned(), true));
         }
     }
     None
@@ -220,15 +278,29 @@ pub(crate) fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> 
     None
 }
 
-pub(crate) async fn ui_session(app: &AppState, headers: &HeaderMap) -> Option<String> {
-    let id = cookie(headers, "tl_session")?;
-    let mut sessions = app.inner.ui_sessions.lock().await;
-    let session = sessions.get(id)?;
-    if session.expires <= Instant::now() {
-        sessions.remove(id);
-        return None;
-    }
-    Some(id.to_owned())
+tokio::task_local! {
+    static API_GRANT: ApiGrant;
+}
+
+struct ApiGrant {
+    vehicles: Option<Vec<i64>>,
+}
+
+pub(crate) fn vehicle_visible(id: i64) -> bool {
+    API_GRANT
+        .try_with(|grant| grant.vehicles.as_ref().is_none_or(|ids| ids.contains(&id)))
+        .unwrap_or(true)
+}
+
+pub(crate) async fn ui_session(
+    app: &AppState,
+    headers: &HeaderMap,
+) -> Option<crate::identity::Principal> {
+    let id = cookie(headers, crate::identity::SESSION_COOKIE)?;
+    crate::identity::load_session(&app.inner.db, id)
+        .await
+        .ok()
+        .flatten()
 }
 
 #[derive(Debug)]

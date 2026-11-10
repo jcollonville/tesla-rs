@@ -192,23 +192,6 @@ pub(crate) fn public_key_fingerprint(pem: &str) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(pem.as_bytes())))
 }
 
-pub(crate) fn ct_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (left, right) in left.iter().zip(right.iter()) {
-        diff |= left ^ right;
-    }
-    diff == 0
-}
-
-pub(crate) fn password_matches(expected: &str, presented: &str) -> bool {
-    let left = Sha256::digest(expected.as_bytes());
-    let right = Sha256::digest(presented.as_bytes());
-    ct_eq(&left, &right)
-}
-
 pub(crate) fn derive_key(material: &str) -> Result<[u8; 32], AppError> {
     if material.len() == 64 && material.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         let mut key = [0u8; 32];

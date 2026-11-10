@@ -108,6 +108,25 @@ pub(super) struct TokenLine {
     pub id: i64,
     pub name: String,
     pub active: bool,
+    pub scopes: String,
+}
+
+pub(super) struct AccessLine {
+    pub user: String,
+    pub vehicle: String,
+    pub role: String,
+}
+
+pub(super) struct SessionLine {
+    pub id_hash: String,
+    pub user: String,
+    pub seen: String,
+}
+
+pub(super) struct AuditLine {
+    pub at: String,
+    pub action: String,
+    pub outcome: String,
 }
 
 pub(super) fn login_page(csrf: &str, error: Option<&str>) -> String {
@@ -123,11 +142,54 @@ pub(super) fn login_page(csrf: &str, error: Option<&str>) -> String {
                 }
                 form class="stack" method="post" action="/" {
                     input type="hidden" name="csrf" value=(csrf);
+                    label class="field" for="username" {
+                        "Nom"
+                        input id="username" name="username" value="admin" autocomplete="username" required;
+                    }
                     label class="field" for="password" {
                         "Mot de passe"
                         input id="password" type="password" name="password" autocomplete="current-password" required;
                     }
+                    label class="field" for="totp" {
+                        "Code TOTP"
+                        input id="totp" name="totp" inputmode="numeric" autocomplete="one-time-code";
+                    }
                     button type="submit" { "Se connecter" }
+                }
+            }
+        },
+    )
+}
+
+pub(super) fn setup_page(csrf: &str, error: Option<&str>) -> String {
+    document(
+        false,
+        html! {
+            section class="card" {
+                h1 { "Première connexion" }
+                p class="muted" { "Changez le mot de passe, puis activez un code TOTP. Les codes de secours ne sont affichés qu'une fois." }
+                @if let Some(error) = error {
+                    div class="banner bad" role="alert" { p { (error) } }
+                }
+                form class="stack" method="post" action="/security/password" {
+                    input type="hidden" name="csrf" value=(csrf);
+                    label class="field" for="new-password" {
+                        "Nouveau mot de passe"
+                        input id="new-password" type="password" name="password" autocomplete="new-password" minlength="12" required;
+                    }
+                    button type="submit" { "Enregistrer le mot de passe" }
+                }
+                form class="stack" method="post" action="/security/totp" {
+                    input type="hidden" name="csrf" value=(csrf);
+                    button class="tonal" type="submit" { "Générer un secret TOTP" }
+                }
+                form class="stack" method="post" action="/security/totp/confirm" {
+                    input type="hidden" name="csrf" value=(csrf);
+                    label class="field" for="setup-totp" {
+                        "Code de l'application"
+                        input id="setup-totp" name="code" inputmode="numeric" autocomplete="one-time-code" required;
+                    }
+                    button type="submit" { "Activer TOTP" }
                 }
             }
         },
@@ -399,12 +461,98 @@ pub(super) fn security_page(
     chrome: &Chrome,
     tokens: &[TokenLine],
     revealed: Option<&str>,
+    account: &str,
+    access: &[AccessLine],
+    sessions: &[SessionLine],
+    audit: &[AuditLine],
 ) -> String {
     let body = html! {
         (toolbar(chrome, "Sécurité"))
         section class="card" {
+            h2 { "Compte" }
+            p { "Connecté en tant que " (account) "." }
+            form class="stack" method="post" action="/sudo" {
+                input type="hidden" name="csrf" value=(&chrome.csrf);
+                label class="field" for="sudo-password" {
+                    "Mot de passe pour les actions sensibles"
+                    input id="sudo-password" type="password" name="password" autocomplete="current-password" required;
+                }
+                button class="tonal" type="submit" { "Confirmer pour 5 minutes" }
+            }
+        }
+        section class="card" {
+            h2 { "Utilisateurs et véhicules" }
+            ul class="list" {
+                @for row in access {
+                    li { span { (row.user) " · " (row.vehicle) } span class="chip" { (row.role) } }
+                }
+            }
+            form class="stack" method="post" action="/users" {
+                input type="hidden" name="csrf" value=(&chrome.csrf);
+                label class="field" for="new-user" {
+                    "Nouvel utilisateur"
+                    input id="new-user" name="username" required maxlength="80";
+                }
+                label class="field" for="new-user-password" {
+                    "Mot de passe"
+                    input id="new-user-password" type="password" name="password" required minlength="12";
+                }
+                label class="field" for="new-user-role" {
+                    "Rôle"
+                    select id="new-user-role" name="role" {
+                        option value="user" { "user" }
+                        option value="admin" { "admin" }
+                    }
+                }
+                button type="submit" { "Créer l'utilisateur" }
+            }
+            form class="stack" method="post" action="/vehicle-access" {
+                input type="hidden" name="csrf" value=(&chrome.csrf);
+                label class="field" for="access-user" {
+                    "Utilisateur (id)"
+                    input id="access-user" name="user_id" required;
+                }
+                label class="field" for="access-vehicle" {
+                    "Véhicule (id)"
+                    input id="access-vehicle" name="vehicle_id" required;
+                }
+                label class="field" for="access-role" {
+                    "Accès"
+                    select id="access-role" name="role" {
+                        option value="viewer" { "viewer" }
+                        option value="owner" { "owner" }
+                        option value="" { "retirer" }
+                    }
+                }
+                button class="tonal" type="submit" { "Mettre à jour l'accès" }
+            }
+        }
+        section class="card" {
+            h2 { "Sessions" }
+            ul class="list" {
+                @for session in sessions {
+                    li {
+                        span { (session.user) " · " (session.seen) }
+                        form method="post" action=(format!("/sessions/{}/revoke", session.id_hash)) {
+                            input type="hidden" name="csrf" value=(&chrome.csrf);
+                            button class="ghost" type="submit" { "Révoquer" }
+                        }
+                    }
+                }
+            }
+        }
+        section class="card" {
+            h2 { "Journal d'audit" }
+            p class="muted" { "Ajouts seulement. Rien ne se supprime depuis l'interface." }
+            ul class="list" {
+                @for row in audit {
+                    li { span { (row.at) " · " (row.action) } span class="chip" { (row.outcome) } }
+                }
+            }
+        }
+        section class="card" {
             h2 { "Jetons API" }
-            p class="muted" { "Les comptes, les sessions et le journal d'audit arrivent ensuite. Les jetons API existants restent gérés ici." }
+            p class="muted" { "Un jeton ne voit pas plus que son créateur. Il n'est affiché qu'une fois." }
             @if let Some(token) = revealed {
                 div class="banner note" role="status" {
                     p { "Nouveau jeton API, affiché une seule fois." }
@@ -417,12 +565,24 @@ pub(super) fn security_page(
                     "Nom"
                     input id="token-name" name="name" required maxlength="80" autocomplete="off";
                 }
+                label class="field" for="token-scopes" {
+                    "Scopes (read, read:live, write, admin)"
+                    input id="token-scopes" name="scopes" value="read read:live";
+                }
+                label class="field" for="token-days" {
+                    "Expiration en jours, vide pour aucune"
+                    input id="token-days" name="expires_days";
+                }
+                label class="field" for="token-vehicles" {
+                    "Véhicules, vide pour ceux du créateur"
+                    input id="token-vehicles" name="vehicle_ids";
+                }
                 button type="submit" { "Créer un jeton" }
             }
             ul class="list" {
                 @for token in tokens {
                     li {
-                        span { (token.name) }
+                        span { (token.name) " · " (token.scopes) }
                         span class="row" {
                             @if token.active {
                                 span class="chip ok" { "actif" }
@@ -772,7 +932,15 @@ mod tests {
             ("system", system_page(&page(GlobalTab::System))),
             (
                 "security",
-                security_page(&page(GlobalTab::Security), &[] as &[TokenLine], None),
+                security_page(
+                    &page(GlobalTab::Security),
+                    &[] as &[TokenLine],
+                    None,
+                    "admin",
+                    &[],
+                    &[],
+                    &[],
+                ),
             ),
         ]
     }
@@ -1154,6 +1322,10 @@ mod tests {
                     },
                     &[],
                     None,
+                    "admin",
+                    &[],
+                    &[],
+                    &[],
                 ),
             ),
             ("missing", missing_page(&chrome())),

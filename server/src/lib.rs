@@ -20,6 +20,7 @@ mod error;
 mod geocode;
 mod geofence;
 mod http;
+mod identity;
 mod import;
 mod ingest;
 mod logs;

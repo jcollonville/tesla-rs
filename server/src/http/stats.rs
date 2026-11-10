@@ -38,6 +38,9 @@ pub(crate) async fn series(
     Path(id): Path<i64>,
     Query(query): Query<PeriodQuery>,
 ) -> Result<Json<SeriesResponse>, ApiError> {
+    if !super::vehicle_visible(id) {
+        return Err(super::ApiError::NotFound);
+    }
     let (period, count) = resolve_period(query.period.as_deref(), query.count)?;
     let window = stats_window(period, count, &app.inner.config.timezone, Utc::now())?;
     let cache_key = SeriesCacheKey {
@@ -81,6 +84,9 @@ pub(crate) async fn consumption_by_temp(
     Path(id): Path<i64>,
     Query(query): Query<PeriodQuery>,
 ) -> Result<Json<Vec<TempBin>>, ApiError> {
+    if !super::vehicle_visible(id) {
+        return Err(super::ApiError::NotFound);
+    }
     let (period, count) = resolve_period(query.period.as_deref(), query.count)?;
     let window = stats_window(period, count, &app.inner.config.timezone, Utc::now())?;
     let rows = sqlx::query_as::<_, TempRow>(&consumption_query_sql(&window))

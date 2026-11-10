@@ -793,17 +793,44 @@ async fn note_rate_limit(archive: &Archive, account_id: Option<i64>, wait: Durat
 }
 
 pub(crate) async fn account_pause(archive: &Archive, account_id: i64) -> Option<Duration> {
-    let guard = archive.account_backoff.lock().await;
-    let until = *guard.get(&account_id)?;
-    let now = Instant::now();
-    if until <= now {
-        None
-    } else {
-        Some(until.saturating_duration_since(now))
+    {
+        let guard = archive.account_backoff.lock().await;
+        if let Some(until) = guard.get(&account_id).copied() {
+            let now = Instant::now();
+            if until > now {
+                return Some(until.saturating_duration_since(now));
+            }
+        }
     }
+    let row: Option<(chrono::DateTime<chrono::Utc>,)> = sqlx::query_as(
+        "SELECT paused_until FROM tesla_accounts WHERE id = $1 AND paused_until > now()",
+    )
+    .bind(account_id)
+    .fetch_optional(&archive.db)
+    .await
+    .ok()
+    .flatten();
+    let until = row?.0;
+    let wait = (until - chrono::Utc::now()).to_std().ok()?;
+    note_account_pause_memory(archive, account_id, wait).await;
+    Some(wait)
 }
 
 pub(crate) async fn note_account_pause(archive: &Archive, account_id: i64, wait: Duration) {
+    note_account_pause_memory(archive, account_id, wait).await;
+    let until = chrono::Utc::now() + chrono::Duration::from_std(wait).unwrap_or_default();
+    let _ = sqlx::query(
+        "UPDATE tesla_accounts
+         SET paused_until = $2
+         WHERE id = $1 AND (paused_until IS NULL OR paused_until < $2)",
+    )
+    .bind(account_id)
+    .bind(until)
+    .execute(&archive.db)
+    .await;
+}
+
+async fn note_account_pause_memory(archive: &Archive, account_id: i64, wait: Duration) {
     let until = Instant::now() + wait;
     let mut guard = archive.account_backoff.lock().await;
     guard

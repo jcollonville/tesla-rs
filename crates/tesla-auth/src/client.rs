@@ -625,6 +625,32 @@ impl<S: TokenStore> Session<S> {
         Ok(access)
     }
 
+    /// Rotates the refresh token under the same lock as [`Self::access_token`].
+    ///
+    /// Manual refresh and background polling share this lock so a single-use refresh
+    /// token is not presented twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::NotAuthenticated`] when the store is empty,
+    /// [`AuthError::LoginRequired`] when no refresh token is stored, or the token-endpoint error.
+    pub async fn force_refresh(&self) -> Result<TokenSet, AuthError> {
+        let _guard = self.refresh_lock.lock().await;
+        let Some(tokens) = self.store.load().await? else {
+            return Err(AuthError::NotAuthenticated);
+        };
+        let refresh = tokens
+            .refresh_token()
+            .map(|token| SecretString::from(token.expose_secret().to_owned()));
+        drop(tokens);
+        let Some(refresh) = refresh else {
+            return Err(AuthError::LoginRequired { description: None });
+        };
+        let refreshed = self.client.refresh(&refresh).await?;
+        self.store.save(&refreshed).await?;
+        Ok(refreshed)
+    }
+
     /// Borrows the underlying client, for partner-token calls that must not overwrite user tokens.
     #[must_use]
     pub fn client(&self) -> &AuthClient {
