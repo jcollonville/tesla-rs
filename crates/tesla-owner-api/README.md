@@ -8,8 +8,8 @@ The streaming socket is what TeslaMate uses for about one position per second wh
 
 ## What it does
 
-* Authorization-code login with PKCE for the public `ownerapi` client, including the `https://auth.tesla.com/void/callback` redirect TeslaMate uses.
-* Refresh-token grant. The request sends `client_id=ownerapi` and does not send a client secret.
+* Authorization-code login with PKCE for the public `ownerapi` client. The registered redirect is `tesla://auth/callback` on both `auth.tesla.com` and `auth.tesla.cn`. A normal browser cannot open that scheme. The operator copies the full `tesla://auth/callback?code=…&state=…` URL from the address bar (or the failed navigation in the Network tab) and pastes it back. A bare query string is also accepted.
+* Token exchange and refresh are `application/x-www-form-urlencoded`. The request sends `client_id=ownerapi` and does not send a client secret. The HTTP client is `reqwest` with rustls and HTTP/2. Keep HTTP/2 enabled: refreshing over HTTP/1.1 can return an access token that the Owner API rejects.
 * `GET /api/1/vehicles` to resolve the streaming `vehicle_id` (the `tag`). This is not the REST `id`.
 * Subscribe frame `data:subscribe_oauth` and parsers for `data:update`, `data:error`, and `control:hello`.
 * Reconnect delays for timeout, disconnect, vehicle errors, auth failures, and an endpoint that has gone away.

@@ -14,6 +14,11 @@ use crate::vehicles::OwnerVehicle;
 const CLIENT_ID: &str = "ownerapi";
 const SCOPES: &str = "openid email offline_access";
 const DEFAULT_EXPIRES_SECS: u64 = 8 * 60 * 60;
+/// Registered redirect for the public `ownerapi` client, on both auth hosts.
+///
+/// Tesla no longer accepts `https://auth.tesla.com/void/callback`. A browser cannot
+/// navigate to this scheme; the operator pastes the `tesla://auth/callback?...` URL.
+const REDIRECT_URI: &str = "tesla://auth/callback";
 
 /// Which Tesla account host to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,20 +40,18 @@ struct Endpoints {
 
 impl OwnerRegion {
     fn endpoints(self) -> Result<Endpoints, OwnerError> {
-        let (authorize, token, api, stream, redirect) = match self {
+        let (authorize, token, api, stream) = match self {
             Self::Global => (
                 "https://auth.tesla.com/oauth2/v3/authorize",
                 "https://auth.tesla.com/oauth2/v3/token",
                 "https://owner-api.teslamotors.com",
                 "wss://streaming.vn.teslamotors.com/streaming/",
-                "https://auth.tesla.com/void/callback",
             ),
             Self::China => (
                 "https://auth.tesla.cn/oauth2/v3/authorize",
                 "https://auth.tesla.cn/oauth2/v3/token",
                 "https://owner-api.vn.cloud.tesla.cn",
                 "wss://streaming.vn.cloud.tesla.cn/streaming/",
-                "https://auth.tesla.cn/void/callback",
             ),
         };
         Ok(Endpoints {
@@ -56,7 +59,7 @@ impl OwnerRegion {
             token: Url::parse(token)?,
             api_base: Url::parse(api)?,
             stream: stream.to_owned(),
-            redirect_uri: redirect.to_owned(),
+            redirect_uri: REDIRECT_URI.to_owned(),
         })
     }
 }
@@ -191,6 +194,10 @@ impl std::fmt::Debug for OwnerClient {
 impl OwnerClient {
     /// Client for the region's Owner API and streaming hosts.
     ///
+    /// Token calls use the workspace `reqwest` client (rustls, HTTP/2). TLS 1.3 is
+    /// negotiated when the auth host offers it. Refreshing the Owner API token over
+    /// HTTP/1.1 can return an access token that `owner-api` later rejects.
+    ///
     /// # Errors
     ///
     /// Returns [`OwnerError::Transport`] when the HTTP client cannot be built.
@@ -213,7 +220,7 @@ impl OwnerClient {
             token: Url::parse(&format!("{origin}/oauth2/v3/token"))?,
             api_base: Url::parse(&format!("{origin}/"))?,
             stream: "wss://streaming.vn.teslamotors.com/streaming/".to_owned(),
-            redirect_uri: "https://auth.tesla.com/void/callback".to_owned(),
+            redirect_uri: REDIRECT_URI.to_owned(),
         };
         Self::build(endpoints, None)
     }
@@ -238,7 +245,7 @@ impl OwnerClient {
         Ok(OwnerLogin { url, state, pkce })
     }
 
-    /// Exchanges the pasted `void/callback` URL for tokens.
+    /// Exchanges a pasted `tesla://auth/callback?...` URL, or a bare query string, for tokens.
     ///
     /// # Errors
     ///
@@ -254,18 +261,18 @@ impl OwnerClient {
         if !pkce::constant_time_eq(&callback.state, &login.state) {
             return Err(OwnerError::StateMismatch);
         }
-        let mut code = callback.code.expose_secret().to_owned();
-        let mut verifier = login.pkce.verifier().to_owned();
-        let body = serde_json::json!({
-            "grant_type": "authorization_code",
-            "client_id": CLIENT_ID,
-            "code": code,
-            "code_verifier": verifier,
-            "redirect_uri": self.endpoints.redirect_uri,
-        });
-        let result = self.token_request(body).await;
-        code.zeroize();
-        verifier.zeroize();
+        let mut form = vec![
+            ("grant_type".to_owned(), "authorization_code".to_owned()),
+            ("client_id".to_owned(), CLIENT_ID.to_owned()),
+            ("code".to_owned(), callback.code.expose_secret().to_owned()),
+            ("code_verifier".to_owned(), login.pkce.verifier().to_owned()),
+            (
+                "redirect_uri".to_owned(),
+                self.endpoints.redirect_uri.clone(),
+            ),
+        ];
+        let result = self.token_request(&form).await;
+        zeroize_form(&mut form);
         result
     }
 
@@ -275,18 +282,22 @@ impl OwnerClient {
     ///
     /// Returns [`OwnerError::LoginRequired`] when Tesla rejects the refresh token.
     pub async fn refresh(&self, refresh_token: &SecretString) -> Result<OwnerTokens, OwnerError> {
-        let mut refresh = refresh_token.expose_secret().to_owned();
-        let body = serde_json::json!({
-            "grant_type": "refresh_token",
-            "client_id": CLIENT_ID,
-            "refresh_token": refresh,
-            "scope": SCOPES,
-        });
-        let mut tokens = self.token_request(body).await;
-        if let Ok(tokens) = tokens.as_mut() {
+        let mut form = vec![
+            ("grant_type".to_owned(), "refresh_token".to_owned()),
+            ("client_id".to_owned(), CLIENT_ID.to_owned()),
+            (
+                "refresh_token".to_owned(),
+                refresh_token.expose_secret().to_owned(),
+            ),
+            ("scope".to_owned(), SCOPES.to_owned()),
+        ];
+        let mut tokens = self.token_request(&form).await;
+        if let Ok(tokens) = tokens.as_mut()
+            && let Some((_, refresh)) = form.iter().find(|(key, _)| key == "refresh_token")
+        {
             tokens.keep_refresh_token(SecretString::from(refresh.clone()));
         }
-        refresh.zeroize();
+        zeroize_form(&mut form);
         tokens
     }
 
@@ -337,6 +348,7 @@ impl OwnerClient {
                     env!("CARGO_PKG_VERSION"),
                     " (unofficial)"
                 ))
+                // ALPN offers h2. Do not disable the workspace `http2` feature.
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(30))
                 .connect_timeout(Duration::from_secs(10))
@@ -346,12 +358,12 @@ impl OwnerClient {
         Ok(Self { http, endpoints })
     }
 
-    async fn token_request(&self, body: Value) -> Result<OwnerTokens, OwnerError> {
+    async fn token_request(&self, form: &[(String, String)]) -> Result<OwnerTokens, OwnerError> {
         ensure_http(&self.endpoints.token)?;
         let response = self
             .http
             .post(self.endpoints.token.clone())
-            .json(&body)
+            .form(form)
             .send()
             .await
             .map_err(OwnerError::Transport)?;
@@ -369,6 +381,16 @@ struct CallbackParts {
     state: String,
 }
 
+fn zeroize_form(form: &mut [(String, String)]) {
+    for (key, value) in form {
+        key.zeroize();
+        value.zeroize();
+    }
+}
+
+/// Accepts `tesla://auth/callback?code=…&state=…` and a bare `code=…&state=…` query.
+///
+/// The `url` crate parses the custom scheme. An https host is not required.
 fn parse_callback(pasted: &str) -> Result<CallbackParts, OwnerError> {
     let pasted = pasted.trim();
     if pasted.is_empty() || pasted.len() > 8_192 {
@@ -515,7 +537,7 @@ pub(crate) fn host_is_loopback(url: &Url) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{OwnerClient, OwnerError, OwnerRegion, OwnerTokens};
+    use super::{OwnerClient, OwnerError, OwnerRegion, OwnerTokens, parse_callback};
     use secrecy::SecretString;
     use std::time::{Duration, SystemTime};
 
@@ -527,7 +549,8 @@ mod tests {
         assert!(url.starts_with("https://auth.tesla.com/oauth2/v3/authorize?"));
         assert!(url.contains("client_id=ownerapi"));
         assert!(url.contains("code_challenge_method=S256"));
-        assert!(url.contains("redirect_uri=https%3A%2F%2Fauth.tesla.com%2Fvoid%2Fcallback"));
+        assert!(url.contains("redirect_uri=tesla%3A%2F%2Fauth%2Fcallback"));
+        assert!(!url.contains("void/callback"));
         assert!(!url.contains("client_secret"));
         let rendered = format!("{login:?}");
         assert!(!rendered.contains("code_verifier"));
@@ -566,11 +589,20 @@ mod tests {
         assert!(!rendered.contains("refresh-secret"));
         assert!(!rendered.contains("should not echo"));
         let requests = server.received_requests().await.unwrap();
+        let content_type = requests[0]
+            .headers
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(content_type.starts_with("application/x-www-form-urlencoded"));
         let body = String::from_utf8_lossy(&requests[0].body);
-        assert!(body.contains("ownerapi"));
-        assert!(body.contains("refresh_token"));
-        assert!(body.contains("refresh-secret"));
+        assert!(body.contains("grant_type=refresh_token"));
+        assert!(body.contains("client_id=ownerapi"));
+        assert!(body.contains("refresh_token=refresh-secret"));
+        assert!(body.contains("scope=openid+email+offline_access"));
         assert!(!body.contains("client_secret"));
+        assert!(!body.starts_with('{'));
     }
 
     #[tokio::test]
@@ -593,20 +625,38 @@ mod tests {
             .find(|(key, _)| key == "state")
             .unwrap()
             .1;
-        let pasted = format!("https://auth.tesla.com/void/callback?code=auth-code&state={state}");
+        let pasted = format!(
+            "tesla://auth/callback?code=auth-code&state={state}&issuer=https://auth.tesla.com/oauth2/v3"
+        );
         let tokens = client.exchange(&login, &pasted).await.unwrap();
         assert_eq!(tokens.access_token().expose_secret(), "access-1");
+        let bare = client
+            .exchange(&login, &format!("code=auth-code&state={state}"))
+            .await
+            .unwrap();
+        assert_eq!(bare.access_token().expose_secret(), "access-1");
         let requests = server.received_requests().await.unwrap();
-        let body = String::from_utf8_lossy(&requests[0].body);
-        assert!(body.contains("authorization_code"));
-        assert!(body.contains("auth-code"));
-        assert!(body.contains("code_verifier"));
-        assert!(!body.contains("client_secret"));
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            let content_type = request
+                .headers
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(content_type.starts_with("application/x-www-form-urlencoded"));
+            let body = String::from_utf8_lossy(&request.body);
+            assert!(body.contains("grant_type=authorization_code"));
+            assert!(body.contains("client_id=ownerapi"));
+            assert!(body.contains("code=auth-code"));
+            assert!(body.contains("code_verifier="));
+            assert!(body.contains("redirect_uri=tesla%3A%2F%2Fauth%2Fcallback"));
+            assert!(!body.contains("client_secret"));
+            assert!(!body.contains("void/callback"));
+            assert!(!body.starts_with('{'));
+        }
         let mismatch = client
-            .exchange(
-                &login,
-                "https://auth.tesla.com/void/callback?code=x&state=other",
-            )
+            .exchange(&login, "tesla://auth/callback?code=x&state=other")
             .await
             .unwrap_err();
         assert!(matches!(mismatch, OwnerError::StateMismatch));
@@ -642,15 +692,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_callback_accepts_the_custom_scheme_and_a_bare_query() {
+        use secrecy::ExposeSecret;
+
+        let custom = parse_callback(
+            "  tesla://auth/callback?code=auth-code&state=state-1&issuer=https://auth.tesla.com/oauth2/v3  ",
+        )
+        .unwrap();
+        assert_eq!(custom.code.expose_secret(), "auth-code");
+        assert_eq!(custom.state, "state-1");
+        let bare = parse_callback("?code=auth-code&state=state-1").unwrap();
+        assert_eq!(bare.code.expose_secret(), "auth-code");
+        assert_eq!(bare.state, "state-1");
+        assert!(matches!(
+            parse_callback("tesla://auth/callback"),
+            Err(OwnerError::MissingCode)
+        ));
+        assert!(matches!(
+            parse_callback("code=only"),
+            Err(OwnerError::StateMismatch)
+        ));
+    }
+
+    #[test]
     fn china_uses_the_china_hosts() {
         let client = OwnerClient::new(OwnerRegion::China).unwrap();
         let login = client.begin_login().unwrap();
-        assert!(
-            login
-                .authorize_url()
-                .as_str()
-                .starts_with("https://auth.tesla.cn/oauth2/v3/authorize?")
-        );
+        let url = login.authorize_url().as_str();
+        assert!(url.starts_with("https://auth.tesla.cn/oauth2/v3/authorize?"));
+        assert!(url.contains("redirect_uri=tesla%3A%2F%2Fauth%2Fcallback"));
+        assert!(!url.contains("void/callback"));
         assert_eq!(
             client.stream_url(),
             "wss://streaming.vn.cloud.tesla.cn/streaming/"

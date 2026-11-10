@@ -52,12 +52,13 @@ Enable it from the status page:
 1. Open the logger and sign in with `TESLA_LOGGER_UI_PASSWORD`.
 2. Connect the Fleet API account if it is not connected yet. Polling does not use the Owner API token.
 3. Open **Set up streaming**.
-4. Choose **Prepare Tesla sign-in**, open the Tesla link, and sign in with the Tesla account that owns the car.
-5. Tesla redirects to `https://auth.tesla.com/void/callback?...` (China accounts use `auth.tesla.cn`). Copy that full URL from the address bar.
-6. Paste it into **Redirect URL** and choose **Save sign-in**. The page returns to the vehicle table. The password field is only so the authorization code is not displayed.
-7. The **Stream** column and `GET /api/v1/vehicles/{id}/state` field `stream_status` become `connected` while the socket is up, `error` while it is reconnecting, and `disabled` when no Owner token is stored. `stream_error` is a short class such as `timeout` or `auth` and never contains a token. The log line is `owner stream status`.
+4. Choose **Prepare Tesla sign-in**, open the Tesla link, and sign in with the Tesla account that owns the car. The authorize host is `auth.tesla.com` (China accounts use `auth.tesla.cn`).
+5. After login, the browser cannot open `tesla://auth/callback`. It may say the address is not understood, the site cannot be reached, or offer to open the Tesla app. Do not open the Tesla app.
+6. Copy the full URL from the address bar. It starts with `tesla://auth/callback?`. If Chrome drops the address, the Network tab in developer tools still shows the failed navigation. Copy that URL.
+7. Paste it into **Redirect URL** and choose **Save sign-in**. The page returns to the vehicle table. The password field is only so the authorization code is not displayed.
+8. The stream chip and `GET /api/v1/vehicles/{id}/state` field `stream_status` become `connected` while the socket is up, `error` while it is reconnecting, and `disabled` when no Owner token is stored. `stream_error` is a short class such as `timeout` or `auth` and never contains a token. The log line is `owner stream status`.
 
-A refresh token generated for this logger can be pasted instead of the redirect URL. Do not paste the refresh token TeslaMate is using. Tesla rotates refresh tokens, and using TeslaMate's token here can sign TeslaMate out. Each program should have its own Owner API login. The Fleet API login is a third one and is unchanged.
+A refresh token generated for this logger can be pasted into **Owner API refresh token** instead of the redirect URL. Do not paste the refresh token TeslaMate is using. Tesla rotates refresh tokens, and using TeslaMate's token here can sign TeslaMate out. Each program should have its own Owner API login. The Fleet API login is a third one and is unchanged.
 
 `TESLA_TOKEN_ENCRYPTION_KEY` encrypts `owner-tokens.json` with the same AES-256-GCM format as the Fleet API token file. With Docker Compose the file is `/data/owner-tokens.json` on the `logger-data` volume. No restart is required after saving or disconnecting. Set `OWNER_STREAM_ENABLED=false` to stop connecting without deleting the token.
 
