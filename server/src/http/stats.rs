@@ -7,10 +7,23 @@
 //! Drive energy prefers `drives.energy_used_kwh` when it is already stored (native trips and
 //! TeslaMate imports). Otherwise it uses the same basis as [`crate::state::range_energy`]:
 //! rated range lost times vehicle efficiency, then ideal range lost times efficiency.
+//!
+//! The series statement does not read `positions` or `charge_samples`. Those tables are
+//! range-partitioned by month (hundreds of partitions). Window bounds are timestamp
+//! literals, computed before the query, so the planner sees constants. Rows are grouped
+//! with `date_trunc` and joined to buckets on that key.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{
+    DateTime, Datelike, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc,
+    Weekday,
+};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
 use super::ApiError;
@@ -18,6 +31,7 @@ use crate::app::AppState;
 use crate::error::redact_secrets;
 
 const MAX_BUCKETS: i64 = 120;
+const SERIES_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 pub(crate) async fn series(
     State(app): State<AppState>,
@@ -25,11 +39,21 @@ pub(crate) async fn series(
     Query(query): Query<PeriodQuery>,
 ) -> Result<Json<SeriesResponse>, ApiError> {
     let (period, count) = resolve_period(query.period.as_deref(), query.count)?;
-    let rows = sqlx::query_as::<_, SeriesRow>(&series_sql())
+    let window = stats_window(period, count, &app.inner.config.timezone, Utc::now())?;
+    let cache_key = SeriesCacheKey {
+        state: std::sync::Arc::as_ptr(&app.inner) as usize,
+        vehicle_id: id,
+        period: period.to_owned(),
+        count,
+        timezone: app.inner.config.timezone.clone(),
+        price_bits: app.inner.config.energy_price_per_kwh.map(f64::to_bits),
+        window_start_ms: window.start.timestamp_millis(),
+    };
+    if let Some(hit) = cache_get(&cache_key, Instant::now()) {
+        return Ok(Json(hit));
+    }
+    let rows = sqlx::query_as::<_, SeriesRow>(&series_query_sql(&window))
         .bind(id)
-        .bind(app.inner.config.timezone.as_str())
-        .bind(period)
-        .bind(count)
         .bind(app.inner.config.energy_price_per_kwh)
         .fetch_all(&app.inner.db)
         .await
@@ -44,10 +68,12 @@ pub(crate) async fn series(
     for row in rows {
         buckets.push(row.into_bucket()?);
     }
-    Ok(Json(SeriesResponse {
+    let response = SeriesResponse {
         period: period.to_owned(),
         buckets,
-    }))
+    };
+    cache_insert(cache_key, response.clone(), Instant::now());
+    Ok(Json(response))
 }
 
 pub(crate) async fn consumption_by_temp(
@@ -56,11 +82,9 @@ pub(crate) async fn consumption_by_temp(
     Query(query): Query<PeriodQuery>,
 ) -> Result<Json<Vec<TempBin>>, ApiError> {
     let (period, count) = resolve_period(query.period.as_deref(), query.count)?;
-    let rows = sqlx::query_as::<_, TempRow>(&consumption_sql())
+    let window = stats_window(period, count, &app.inner.config.timezone, Utc::now())?;
+    let rows = sqlx::query_as::<_, TempRow>(&consumption_query_sql(&window))
         .bind(id)
-        .bind(app.inner.config.timezone.as_str())
-        .bind(period)
-        .bind(count)
         .fetch_all(&app.inner.db)
         .await
         .map_err(map_query)?;
@@ -119,6 +143,121 @@ fn map_query(err: sqlx::Error) -> ApiError {
     ApiError::Internal
 }
 
+/// Bucket edges for `[now - (count-1) periods, now]`, oldest first.
+/// `start` is inclusive and `end` is exclusive, both in UTC.
+pub(crate) struct StatsWindow {
+    unit: &'static str,
+    tz: String,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    buckets: Vec<BucketEdge>,
+}
+
+struct BucketEdge {
+    start_at: DateTime<Utc>,
+    local_start: NaiveDateTime,
+    offset_seconds: i32,
+}
+
+pub(crate) fn stats_window(
+    period: &str,
+    count: i32,
+    timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<StatsWindow, ApiError> {
+    let tz: Tz = timezone
+        .parse()
+        .map_err(|_| ApiError::BadRequest("timezone is not recognized"))?;
+    let unit = match period {
+        "week" => "week",
+        "month" => "month",
+        "year" => "year",
+        _ => return Err(ApiError::BadRequest("period must be week, month, or year")),
+    };
+    let local_now = now.with_timezone(&tz);
+    let current = match unit {
+        "week" => {
+            let iso = local_now.date_naive().iso_week();
+            NaiveDate::from_isoywd_opt(iso.year(), iso.week(), Weekday::Mon)
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .ok_or(ApiError::Internal)?
+        }
+        "month" => NaiveDate::from_ymd_opt(local_now.year(), local_now.month(), 1)
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .ok_or(ApiError::Internal)?,
+        _ => NaiveDate::from_ymd_opt(local_now.year(), 1, 1)
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .ok_or(ApiError::Internal)?,
+    };
+    let mut locals = Vec::with_capacity(usize::try_from(count).unwrap_or(1));
+    for index in 0..count {
+        let back = count - 1 - index;
+        locals.push(shift_local(unit, current, back)?);
+    }
+    let mut buckets = Vec::with_capacity(locals.len());
+    for local_start in locals {
+        let (start_at, offset_seconds) = localize(tz, local_start)?;
+        buckets.push(BucketEdge {
+            start_at,
+            local_start,
+            offset_seconds,
+        });
+    }
+    let next_local = shift_local(unit, current, -1)?;
+    let (end, _) = localize(tz, next_local)?;
+    let start = buckets.first().ok_or(ApiError::Internal)?.start_at;
+    Ok(StatsWindow {
+        unit,
+        tz: timezone.to_owned(),
+        start,
+        end,
+        buckets,
+    })
+}
+
+fn shift_local(unit: &str, current: NaiveDateTime, back: i32) -> Result<NaiveDateTime, ApiError> {
+    match unit {
+        "week" => Ok(current - chrono::Duration::days(i64::from(back) * 7)),
+        "month" => shift_months(current, -back),
+        _ => {
+            let year = current.year() - back;
+            NaiveDate::from_ymd_opt(year, 1, 1)
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .ok_or(ApiError::Internal)
+        }
+    }
+}
+
+fn shift_months(current: NaiveDateTime, delta: i32) -> Result<NaiveDateTime, ApiError> {
+    let month = i32::try_from(current.month()).map_err(|_| ApiError::Internal)?;
+    let total = current.year() * 12 + (month - 1) + delta;
+    let year = total.div_euclid(12);
+    let month = total.rem_euclid(12) + 1;
+    NaiveDate::from_ymd_opt(year, u32::try_from(month).unwrap_or(1), 1)
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .ok_or(ApiError::Internal)
+}
+
+fn localize(tz: Tz, local_start: NaiveDateTime) -> Result<(DateTime<Utc>, i32), ApiError> {
+    let zoned = match tz.from_local_datetime(&local_start) {
+        LocalResult::Single(dt) => dt,
+        LocalResult::Ambiguous(earliest, _) => earliest,
+        LocalResult::None => {
+            let shifted = local_start + chrono::Duration::hours(1);
+            match tz.from_local_datetime(&shifted) {
+                LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
+                LocalResult::None => {
+                    return Err(ApiError::BadRequest("timezone is not recognized"));
+                }
+            }
+        }
+    };
+    Ok((
+        zoned.with_timezone(&Utc),
+        zoned.offset().fix().local_minus_utc(),
+    ))
+}
+
 fn drive_energy_expr(drive: &str, vehicle: &str) -> String {
     format!(
         "COALESCE({drive}.energy_used_kwh, \
@@ -143,149 +282,132 @@ fn charge_is_fast_expr(charge: &str) -> String {
     )
 }
 
-/// Shared `params` / `buckets` prefix. `$1` vehicle, `$2` timezone, `$3` unit, `$4` count.
-fn buckets_cte() -> &'static str {
-    "params AS (
-        SELECT
-            $1::bigint AS vehicle_id,
-            $2::text AS tz,
-            $3::text AS unit,
-            $4::int AS bucket_count,
-            CASE $3
-                WHEN 'week' THEN interval '1 week'
-                WHEN 'month' THEN interval '1 month'
-                ELSE interval '1 year'
-            END AS step
-    ),
-    buckets AS (
-        SELECT
-            gs AS local_start,
-            (gs AT TIME ZONE p.tz) AS start_at,
-            ((gs + p.step) AT TIME ZONE p.tz) AS end_at,
-            EXTRACT(EPOCH FROM (
-                gs - ((gs AT TIME ZONE p.tz) AT TIME ZONE 'UTC')
-            ))::integer AS offset_seconds,
-            p.tz,
-            p.vehicle_id
-        FROM params p
-        CROSS JOIN LATERAL generate_series(
-            date_trunc(p.unit, timezone(p.tz, now())) - (p.bucket_count - 1) * p.step,
-            date_trunc(p.unit, timezone(p.tz, now())),
-            p.step
-        ) AS gs
-    )"
+fn endpoint_proj(range: &str, soc: &str) -> String {
+    format!(
+        "CASE WHEN {soc} > 10 AND {soc} <= 100 AND {range} > 0 \
+         THEN {range} / {soc} * 100.0 ELSE NULL END"
+    )
 }
 
-fn series_sql() -> String {
+fn bucket_of(window: &StatsWindow, timestamp_sql: &str) -> String {
+    format!(
+        "date_trunc('{unit}', timezone('{tz}', {timestamp_sql}))",
+        unit = window.unit,
+        tz = window.tz,
+    )
+}
+
+fn timestamptz_literal(ts: DateTime<Utc>) -> String {
+    format!("TIMESTAMPTZ '{}'", ts.format("%Y-%m-%d %H:%M:%S+00"))
+}
+
+fn timestamp_literal(ts: NaiveDateTime) -> String {
+    format!("TIMESTAMP '{}'", ts.format("%Y-%m-%d %H:%M:%S"))
+}
+
+fn bucket_values(window: &StatsWindow) -> String {
+    window
+        .buckets
+        .iter()
+        .map(|bucket| {
+            format!(
+                "({}, {}, {}::integer)",
+                timestamptz_literal(bucket.start_at),
+                timestamp_literal(bucket.local_start),
+                bucket.offset_seconds,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Series statement. `$1` is the vehicle id and `$2` is the optional energy price.
+/// Time bounds are literals so a prepared plan can prune at plan time.
+pub(crate) fn series_query_sql(window: &StatsWindow) -> String {
     let energy = drive_energy_expr("d", "v");
     let fast = charge_is_fast_expr("c");
+    let drive_bucket = bucket_of(window, "d.start_at");
+    let charge_bucket = bucket_of(window, "c.start_at");
+    let idle_bucket = bucket_of(window, "i.parked_start");
+    let start = timestamptz_literal(window.start);
+    let end = timestamptz_literal(window.end);
+    let drive_start = endpoint_proj("d.start_rated_range_km", "d.start_battery_level");
+    let drive_end = endpoint_proj("d.end_rated_range_km", "d.end_battery_level");
+    let charge_end = endpoint_proj("c.end_rated_range_km", "c.end_battery_level");
+    let charge_start = endpoint_proj("c.start_rated_range_km", "c.start_battery_level");
     format!(
-        "WITH {buckets},
+        "WITH buckets AS (
+            SELECT start_at, local_start, offset_seconds
+            FROM (VALUES {values}) AS v(start_at, local_start, offset_seconds)
+        ),
         drive_rows AS (
             SELECT
+                {drive_bucket} AS local_start,
                 d.id,
-                d.start_at,
                 COALESCE(d.distance_km, 0) AS distance_km,
                 COALESCE(d.duration_s, 0) AS duration_s,
-                {energy} AS energy_kwh
+                {energy} AS energy_kwh,
+                CASE
+                    WHEN ({drive_start}) IS NOT NULL AND ({drive_end}) IS NOT NULL
+                    THEN (({drive_start}) + ({drive_end})) / 2.0
+                    ELSE COALESCE({drive_end}, {drive_start})
+                END AS range_at_100
             FROM drives d
             JOIN vehicles v ON v.id = d.vehicle_id
             WHERE d.vehicle_id = $1
               AND d.end_at IS NOT NULL
-              AND d.start_at >= (SELECT min(start_at) FROM buckets)
-              AND d.start_at < (SELECT max(end_at) FROM buckets)
+              AND d.start_at >= {start}
+              AND d.start_at < {end}
         ),
         drive_agg AS (
             SELECT
-                b.local_start,
-                COUNT(d.id)::bigint AS drive_count,
-                COALESCE(SUM(d.distance_km), 0)::float8 AS distance_km,
-                COALESCE(SUM(d.duration_s), 0)::bigint AS drive_duration_s,
-                CASE
-                    WHEN COUNT(d.id) = 0 THEN 0::float8
-                    ELSE SUM(d.energy_kwh)::float8
-                END AS energy_used_kwh
-            FROM buckets b
-            LEFT JOIN drive_rows d
-              ON d.start_at >= b.start_at AND d.start_at < b.end_at
-            GROUP BY b.local_start
+                local_start,
+                COUNT(id)::bigint AS drive_count,
+                COALESCE(SUM(distance_km), 0)::float8 AS distance_km,
+                COALESCE(SUM(duration_s), 0)::bigint AS drive_duration_s,
+                SUM(energy_kwh)::float8 AS energy_used_kwh
+            FROM drive_rows
+            GROUP BY local_start
         ),
         charge_rows AS (
             SELECT
-                c.start_at,
+                {charge_bucket} AS local_start,
                 c.energy_added_kwh,
                 c.cost,
-                {fast} AS fast
+                {fast} AS fast,
+                COALESCE({charge_end}, {charge_start}) AS range_at_100
             FROM charges c
             WHERE c.vehicle_id = $1
               AND c.end_at IS NOT NULL
-              AND c.start_at >= (SELECT min(start_at) FROM buckets)
-              AND c.start_at < (SELECT max(end_at) FROM buckets)
+              AND c.start_at >= {start}
+              AND c.start_at < {end}
         ),
         charge_agg AS (
             SELECT
-                b.local_start,
-                COALESCE(SUM(c.energy_added_kwh) FILTER (WHERE NOT c.fast), 0)::float8 AS ac_energy_kwh,
-                COALESCE(SUM(c.energy_added_kwh) FILTER (WHERE c.fast), 0)::float8 AS dc_energy_kwh,
+                local_start,
+                COALESCE(SUM(energy_added_kwh) FILTER (WHERE NOT fast), 0)::float8 AS ac_energy_kwh,
+                COALESCE(SUM(energy_added_kwh) FILTER (WHERE fast), 0)::float8 AS dc_energy_kwh,
                 SUM(
                     COALESCE(
-                        c.cost,
+                        cost,
                         CASE
-                            WHEN $5::float8 IS NOT NULL AND c.energy_added_kwh IS NOT NULL
-                            THEN c.energy_added_kwh * $5::float8
+                            WHEN $2::float8 IS NOT NULL AND energy_added_kwh IS NOT NULL
+                            THEN energy_added_kwh * $2::float8
                             ELSE NULL
                         END
                     )
                 )::float8 AS charge_cost
-            FROM buckets b
-            LEFT JOIN charge_rows c
-              ON c.start_at >= b.start_at AND c.start_at < b.end_at
-            GROUP BY b.local_start
-        ),
-        soc_rows AS (
-            SELECT recorded_at, battery_level, rated_range_km
-            FROM positions
-            WHERE vehicle_id = $1
-              AND recorded_at >= (SELECT min(start_at) FROM buckets)
-              AND recorded_at < (SELECT max(end_at) FROM buckets)
-              AND battery_level > 10 AND battery_level <= 100
-              AND rated_range_km > 0
-            UNION ALL
-            SELECT cs.recorded_at, cs.battery_level, cs.rated_range_km
-            FROM charge_samples cs
-            JOIN charges ch ON ch.id = cs.charge_id
-            WHERE ch.vehicle_id = $1
-              AND cs.recorded_at >= (SELECT min(start_at) FROM buckets)
-              AND cs.recorded_at < (SELECT max(end_at) FROM buckets)
-              AND cs.battery_level > 10 AND cs.battery_level <= 100
-              AND cs.rated_range_km > 0
-            UNION ALL
-            SELECT c.start_at, c.start_battery_level, c.start_rated_range_km
-            FROM charges c
-            WHERE c.vehicle_id = $1
-              AND c.end_at IS NOT NULL
-              AND c.start_at >= (SELECT min(start_at) FROM buckets)
-              AND c.start_at < (SELECT max(end_at) FROM buckets)
-              AND c.start_battery_level > 10 AND c.start_battery_level <= 100
-              AND c.start_rated_range_km > 0
-            UNION ALL
-            SELECT c.end_at, c.end_battery_level, c.end_rated_range_km
-            FROM charges c
-            WHERE c.vehicle_id = $1
-              AND c.end_at IS NOT NULL
-              AND c.end_at >= (SELECT min(start_at) FROM buckets)
-              AND c.end_at < (SELECT max(end_at) FROM buckets)
-              AND c.end_battery_level > 10 AND c.end_battery_level <= 100
-              AND c.end_rated_range_km > 0
+            FROM charge_rows
+            GROUP BY local_start
         ),
         soc_agg AS (
-            SELECT
-                b.local_start,
-                AVG(s.rated_range_km / s.battery_level * 100.0)::float8 AS range_at_100_km
-            FROM buckets b
-            LEFT JOIN soc_rows s
-              ON s.recorded_at >= b.start_at AND s.recorded_at < b.end_at
-            GROUP BY b.local_start
+            SELECT local_start, AVG(range_at_100)::float8 AS range_at_100_km
+            FROM (
+                SELECT local_start, range_at_100 FROM drive_rows WHERE range_at_100 IS NOT NULL
+                UNION ALL
+                SELECT local_start, range_at_100 FROM charge_rows WHERE range_at_100 IS NOT NULL
+            ) points
+            GROUP BY local_start
         ),
         activities AS (
             SELECT
@@ -298,7 +420,7 @@ fn series_sql() -> String {
             FROM drives
             WHERE vehicle_id = $1
               AND end_at IS NOT NULL
-              AND end_at >= (SELECT min(start_at) FROM buckets)
+              AND end_at >= {start}
             UNION ALL
             SELECT
                 start_at,
@@ -310,7 +432,7 @@ fn series_sql() -> String {
             FROM charges
             WHERE vehicle_id = $1
               AND end_at IS NOT NULL
-              AND end_at >= (SELECT min(start_at) FROM buckets)
+              AND end_at >= {start}
         ),
         parked AS (
             SELECT
@@ -331,6 +453,8 @@ fn series_sql() -> String {
             FROM parked
             WHERE parked_start IS NOT NULL
               AND parked_end > parked_start
+              AND parked_start >= {start}
+              AND parked_start < {end}
               AND range_before IS NOT NULL
               AND range_after IS NOT NULL
               AND range_before >= range_after
@@ -342,7 +466,7 @@ fn series_sql() -> String {
         ),
         idle_agg AS (
             SELECT
-                b.local_start,
+                {idle_bucket} AS local_start,
                 CASE
                     WHEN COALESCE(SUM(i.seconds), 0) > 0
                     THEN (SUM(i.range_loss_km) / (SUM(i.seconds) / 86400.0))::float8
@@ -358,58 +482,59 @@ fn series_sql() -> String {
                     )::float8
                     ELSE NULL
                 END AS idle_energy_loss_kwh_per_day
-            FROM buckets b
-            LEFT JOIN idle_rows i
-              ON i.parked_start >= b.start_at AND i.parked_start < b.end_at
-            GROUP BY b.local_start
+            FROM idle_rows i
+            GROUP BY 1
         )
         SELECT
             (SELECT EXISTS (SELECT 1 FROM vehicles WHERE id = $1)) AS vehicle_exists,
             b.start_at,
             b.offset_seconds,
-            d.distance_km,
-            d.energy_used_kwh,
+            COALESCE(d.distance_km, 0)::float8 AS distance_km,
             CASE
-                WHEN d.distance_km > 0 AND d.energy_used_kwh IS NOT NULL
+                WHEN COALESCE(d.drive_count, 0) = 0 THEN 0::float8
+                ELSE d.energy_used_kwh
+            END AS energy_used_kwh,
+            CASE
+                WHEN COALESCE(d.distance_km, 0) > 0 AND d.energy_used_kwh IS NOT NULL
                 THEN d.energy_used_kwh * 1000.0 / d.distance_km
                 ELSE NULL
             END AS wh_per_km,
-            (c.ac_energy_kwh + c.dc_energy_kwh) AS energy_charged_kwh,
-            d.drive_duration_s,
-            d.drive_count,
+            (COALESCE(c.ac_energy_kwh, 0) + COALESCE(c.dc_energy_kwh, 0)) AS energy_charged_kwh,
+            COALESCE(d.drive_duration_s, 0)::bigint AS drive_duration_s,
+            COALESCE(d.drive_count, 0)::bigint AS drive_count,
             s.range_at_100_km,
-            c.ac_energy_kwh,
-            c.dc_energy_kwh,
+            COALESCE(c.ac_energy_kwh, 0)::float8 AS ac_energy_kwh,
+            COALESCE(c.dc_energy_kwh, 0)::float8 AS dc_energy_kwh,
             CASE
-                WHEN (c.ac_energy_kwh + c.dc_energy_kwh) > 0
-                THEN c.dc_energy_kwh / (c.ac_energy_kwh + c.dc_energy_kwh) * 100.0
+                WHEN (COALESCE(c.ac_energy_kwh, 0) + COALESCE(c.dc_energy_kwh, 0)) > 0
+                THEN COALESCE(c.dc_energy_kwh, 0)
+                     / (COALESCE(c.ac_energy_kwh, 0) + COALESCE(c.dc_energy_kwh, 0)) * 100.0
                 ELSE NULL
             END AS dc_share_pct,
             c.charge_cost,
             CASE
-                WHEN c.charge_cost IS NOT NULL AND d.distance_km > 0
+                WHEN c.charge_cost IS NOT NULL AND COALESCE(d.distance_km, 0) > 0
                 THEN c.charge_cost / d.distance_km
                 ELSE NULL
             END AS cost_per_km,
             i.idle_range_loss_km_per_day,
             i.idle_energy_loss_kwh_per_day
         FROM buckets b
-        JOIN drive_agg d ON d.local_start = b.local_start
-        JOIN charge_agg c ON c.local_start = b.local_start
-        JOIN soc_agg s ON s.local_start = b.local_start
-        JOIN idle_agg i ON i.local_start = b.local_start
+        LEFT JOIN drive_agg d ON d.local_start = b.local_start
+        LEFT JOIN charge_agg c ON c.local_start = b.local_start
+        LEFT JOIN soc_agg s ON s.local_start = b.local_start
+        LEFT JOIN idle_agg i ON i.local_start = b.local_start
         ORDER BY b.start_at",
-        buckets = buckets_cte(),
-        energy = energy,
-        fast = fast,
+        values = bucket_values(window),
     )
 }
 
-fn consumption_sql() -> String {
+pub(crate) fn consumption_query_sql(window: &StatsWindow) -> String {
     let energy = drive_energy_expr("d", "v");
+    let start = timestamptz_literal(window.start);
+    let end = timestamptz_literal(window.end);
     format!(
-        "WITH {buckets},
-        bins AS (
+        "WITH bins AS (
             SELECT
                 (floor(d.outside_temp_avg_c / 5.0) * 5)::integer AS temp_c_bucket,
                 SUM(d.distance_km)::float8 AS distance_km,
@@ -421,8 +546,8 @@ fn consumption_sql() -> String {
               AND d.outside_temp_avg_c IS NOT NULL
               AND d.distance_km > 0
               AND {energy} IS NOT NULL
-              AND d.start_at >= (SELECT min(start_at) FROM buckets)
-              AND d.start_at < (SELECT max(end_at) FROM buckets)
+              AND d.start_at >= {start}
+              AND d.start_at < {end}
             GROUP BY 1
         )
         SELECT
@@ -432,10 +557,48 @@ fn consumption_sql() -> String {
             bins.distance_km
         FROM (SELECT EXISTS (SELECT 1 FROM vehicles WHERE id = $1) AS ok) AS present
         LEFT JOIN bins ON present.ok
-        ORDER BY bins.temp_c_bucket",
-        buckets = buckets_cte(),
-        energy = energy,
+        ORDER BY bins.temp_c_bucket"
     )
+}
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct SeriesCacheKey {
+    state: usize,
+    vehicle_id: i64,
+    period: String,
+    count: i32,
+    timezone: String,
+    price_bits: Option<u64>,
+    window_start_ms: i64,
+}
+
+static SERIES_CACHE: Mutex<Option<HashMap<SeriesCacheKey, (Instant, SeriesResponse)>>> =
+    Mutex::new(None);
+
+fn cache_map()
+-> std::sync::MutexGuard<'static, Option<HashMap<SeriesCacheKey, (Instant, SeriesResponse)>>> {
+    SERIES_CACHE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn cache_get(key: &SeriesCacheKey, now: Instant) -> Option<SeriesResponse> {
+    let mut guard = cache_map();
+    let map = guard.get_or_insert_with(HashMap::new);
+    let fresh = map.get(key).and_then(|(stored, value)| {
+        (now.saturating_duration_since(*stored) < SERIES_CACHE_TTL).then(|| value.clone())
+    });
+    if fresh.is_none() {
+        map.remove(key);
+    }
+    fresh
+}
+
+fn cache_insert(key: SeriesCacheKey, value: SeriesResponse, now: Instant) {
+    let mut guard = cache_map();
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.retain(|_, (stored, _)| now.saturating_duration_since(*stored) < SERIES_CACHE_TTL);
+    map.insert(key, (now, value));
 }
 
 #[derive(Deserialize)]
@@ -444,13 +607,13 @@ pub(crate) struct PeriodQuery {
     count: Option<i64>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct SeriesResponse {
     pub period: String,
     pub buckets: Vec<Bucket>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct Bucket {
     pub start: DateTime<FixedOffset>,
     pub distance_km: f64,
@@ -532,7 +695,11 @@ struct TempRow {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_period;
+    use super::{
+        SeriesCacheKey, SeriesResponse, cache_get, cache_insert, resolve_period, stats_window,
+    };
+    use chrono::{DateTime, Utc};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn period_defaults_and_rejects_bad_input() {
@@ -544,5 +711,57 @@ mod tests {
         assert!(resolve_period(None, None).is_err());
         assert!(resolve_period(Some("month"), Some(0)).is_err());
         assert!(resolve_period(Some("month"), Some(121)).is_err());
+    }
+
+    #[test]
+    fn paris_buckets_match_local_midnights_across_dst() {
+        let now = DateTime::parse_from_rfc3339("2026-11-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let window = stats_window("month", 2, "Europe/Paris", now).unwrap();
+        assert_eq!(window.buckets.len(), 2);
+        assert_eq!(
+            window.buckets[0].local_start.to_string(),
+            "2026-10-01 00:00:00"
+        );
+        assert_eq!(window.buckets[0].offset_seconds, 2 * 3600);
+        assert_eq!(
+            window.buckets[1].local_start.to_string(),
+            "2026-11-01 00:00:00"
+        );
+        assert_eq!(window.buckets[1].offset_seconds, 3600);
+        assert_eq!(
+            window.buckets[1].start_at,
+            DateTime::parse_from_rfc3339("2026-10-31T23:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+        let week = stats_window("week", 1, "Europe/Paris", now).unwrap();
+        assert_eq!(
+            week.buckets[0].local_start.to_string(),
+            "2026-11-09 00:00:00"
+        );
+        assert!(stats_window("month", 1, "Not/AZone", now).is_err());
+    }
+
+    #[test]
+    fn series_cache_keeps_a_hit_for_five_minutes() {
+        let key = SeriesCacheKey {
+            state: usize::MAX,
+            vehicle_id: -1,
+            period: "month".to_owned(),
+            count: 1,
+            timezone: "Europe/Paris".to_owned(),
+            price_bits: None,
+            window_start_ms: 0,
+        };
+        let value = SeriesResponse {
+            period: "month".to_owned(),
+            buckets: Vec::new(),
+        };
+        let now = Instant::now();
+        cache_insert(key.clone(), value, now);
+        assert!(cache_get(&key, now + Duration::from_secs(299)).is_some());
+        assert!(cache_get(&key, now + Duration::from_secs(301)).is_none());
     }
 }

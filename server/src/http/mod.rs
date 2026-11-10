@@ -3,7 +3,7 @@
 
 pub(crate) mod api;
 mod owner;
-mod stats;
+pub(crate) mod stats;
 mod ui;
 
 use std::time::Instant;
