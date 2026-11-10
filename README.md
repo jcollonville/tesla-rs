@@ -249,6 +249,8 @@ Optional:
 | `TELEMETRY_CERT_PATH` | unset | PEM certificate chain. Required for telemetry to start |
 | `TELEMETRY_KEY_PATH` | unset | PEM private key. Required for telemetry to start |
 | `RUST_LOG` | `info,sqlx=warn,hyper=warn,h2=warn,rumqttc=warn,reqwest=warn` | stderr filter. Leave `sqlx` off `trace`; query logs can include bound values |
+| `TESLA_TIMEZONE` | `Europe/Paris` | IANA zone for `/api/v1/vehicles/{id}/stats/series` bucket boundaries. ISO weeks start on Monday |
+| `ENERGY_PRICE_PER_KWH` | unset | Used as `charges.cost` when that column is null, for `charge_cost` and `cost_per_km` |
 
 `POSTGRES_PASSWORD` is read by Docker Compose, not by `tesla-logger`. `TESLAMATE_DATABASE_URL` is read only by the `import-teslamate` subcommand.
 

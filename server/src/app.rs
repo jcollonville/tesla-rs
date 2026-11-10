@@ -246,6 +246,12 @@ pub(crate) fn session_ttl() -> Duration {
 
 #[cfg(test)]
 pub(crate) async fn test_state(pool: PgPool) -> AppState {
+    test_state_with(pool, None).await
+}
+
+#[cfg(test)]
+#[allow(clippy::unused_async)]
+pub(crate) async fn test_state_with(pool: PgPool, energy_price_per_kwh: Option<f64>) -> AppState {
     use std::collections::BTreeMap;
 
     use p256::SecretKey;
@@ -289,6 +295,9 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
         "test-key".to_owned(),
     );
     map.insert("NOMINATIM_ENABLED".to_owned(), "false".to_owned());
+    if let Some(price) = energy_price_per_kwh {
+        map.insert("ENERGY_PRICE_PER_KWH".to_owned(), price.to_string());
+    }
     let config = Config::from_map(&map).unwrap();
     let public_key_pem = read_public_key(&config.private_key_path).unwrap();
     let store = Arc::new(
