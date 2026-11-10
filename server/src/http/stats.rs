@@ -42,22 +42,45 @@ pub(crate) async fn series(
         return Err(super::ApiError::NotFound);
     }
     let (period, count) = resolve_period(query.period.as_deref(), query.count)?;
-    let window = stats_window(period, count, &app.inner.config.timezone, Utc::now())?;
+    Ok(Json(load_series(&app, id, period, count).await?))
+}
+
+pub(crate) async fn load_series(
+    app: &AppState,
+    id: i64,
+    period: &str,
+    count: i32,
+) -> Result<SeriesResponse, ApiError> {
+    let timezone = crate::settings::text_or(
+        &app.inner.db,
+        Some(id),
+        "TESLA_TIMEZONE",
+        &app.inner.config.timezone,
+    )
+    .await;
+    let price = crate::settings::f64_or(
+        &app.inner.db,
+        Some(id),
+        "ENERGY_PRICE_PER_KWH",
+        app.inner.config.energy_price_per_kwh,
+    )
+    .await;
+    let window = stats_window(period, count, &timezone, Utc::now())?;
     let cache_key = SeriesCacheKey {
         state: std::sync::Arc::as_ptr(&app.inner) as usize,
         vehicle_id: id,
         period: period.to_owned(),
         count,
-        timezone: app.inner.config.timezone.clone(),
-        price_bits: app.inner.config.energy_price_per_kwh.map(f64::to_bits),
+        timezone: timezone.clone(),
+        price_bits: price.map(f64::to_bits),
         window_start_ms: window.start.timestamp_millis(),
     };
     if let Some(hit) = cache_get(&cache_key, Instant::now()) {
-        return Ok(Json(hit));
+        return Ok(hit);
     }
     let rows = sqlx::query_as::<_, SeriesRow>(&series_query_sql(&window))
         .bind(id)
-        .bind(app.inner.config.energy_price_per_kwh)
+        .bind(price)
         .fetch_all(&app.inner.db)
         .await
         .map_err(map_query)?;
@@ -76,7 +99,7 @@ pub(crate) async fn series(
         buckets,
     };
     cache_insert(cache_key, response.clone(), Instant::now());
-    Ok(Json(response))
+    Ok(response)
 }
 
 pub(crate) async fn consumption_by_temp(
@@ -704,6 +727,242 @@ struct TempRow {
     distance_km: Option<f64>,
 }
 
+pub(super) async fn console_page(
+    app: &AppState,
+    chrome: &super::markup::Chrome,
+    id: i64,
+    period: &str,
+    count: i32,
+) -> String {
+    use super::markup::{document, toolbar, vehicle_tabs};
+    use maud::html;
+    let series = load_series(app, id, period, count).await.ok();
+    let bins = load_bins(app, id, period, count).await.unwrap_or_default();
+    let quality = quality(app, id).await;
+    let body = html! {
+        (toolbar(chrome, "Stats"))
+        (vehicle_tabs(chrome))
+        div role="tabpanel" {
+            form class="filters" method="get" action=(format!("/v/{id}/stats")) {
+                label class="field" for="period" {
+                    "Période"
+                    select id="period" name="period" {
+                        option value="week" { "semaine" }
+                        option value="month" { "mois" }
+                        option value="year" { "année" }
+                    }
+                }
+                label class="field" for="count" { "Nombre" input id="count" name="count" value=(count.to_string()); }
+                button class="tonal" type="submit" { "Afficher" }
+                a href=(format!("/v/{id}/stats.csv?period={period}&count={count}")) { "CSV" }
+            }
+            @if let Some(series) = series {
+                p { "Total distance " (sum_distance(&series)) " km · coût/km " (first_cost(&series)) }
+                (bars(id, "Wh/km", &series, |bucket| bucket.wh_per_km.unwrap_or(0.0)))
+                (bars(id, "Distance", &series, |bucket| bucket.distance_km))
+                (bars(id, "Énergie chargée", &series, |bucket| bucket.energy_charged_kwh))
+                (bars(id, "Autonomie à 100 %", &series, |bucket| bucket.range_at_100_km.unwrap_or(0.0)))
+                (bars(id, "Part DC", &series, |bucket| bucket.dc_share_pct.unwrap_or(0.0)))
+                (bars(id, "Coût/km", &series, |bucket| bucket.cost_per_km.unwrap_or(0.0)))
+                (bars(id, "Perte à l'arrêt", &series, |bucket| bucket.idle_range_loss_km_per_day.unwrap_or(0.0)))
+                section class="card" {
+                    h2 { "Tableau" }
+                    table class="settings" {
+                        thead { tr { th { "Début" } th { "km" } th { "Wh/km" } th { "Coût/km" } } }
+                        tbody {
+                            @for bucket in &series.buckets {
+                                tr {
+                                    td { a href=(bucket_href(id, &series.period, bucket.start)) { (bucket.start.format("%Y-%m-%d").to_string()) } }
+                                    td { (format!("{:.1}", bucket.distance_km)) }
+                                    td { (bucket.wh_per_km.map_or_else(|| "—".into(), |value| format!("{value:.0}"))) }
+                                    td { (bucket.cost_per_km.map_or_else(|| "—".into(), |value| format!("{value:.3}"))) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            section class="card" {
+                h2 { "Consommation par température" }
+                (temp_bars(id, &bins))
+            }
+            section class="card" {
+                h2 { "Qualité" }
+                dl class="facts" {
+                    div { dt { "Trajets sans énergie" } dd { (quality.drives_without_energy) } }
+                    div { dt { "Charges sans énergie utilisée" } dd { (quality.charges_without_energy) } }
+                    div { dt { "Jours sans point GPS" } dd { (quality.gap_days) } }
+                    @for (source, count) in &quality.points {
+                        div { dt { (source) } dd { (count) } }
+                    }
+                }
+            }
+        }
+    };
+    document(chrome.debug_script, body)
+}
+
+struct Quality {
+    drives_without_energy: i64,
+    charges_without_energy: i64,
+    gap_days: i64,
+    points: Vec<(String, i64)>,
+}
+
+async fn quality(app: &AppState, id: i64) -> Quality {
+    let drives_without_energy: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM drives WHERE vehicle_id = $1 AND deleted_at IS NULL AND end_at IS NOT NULL AND energy_used_kwh IS NULL",
+    ).bind(id).fetch_one(&app.inner.db).await.unwrap_or(0);
+    let charges_without_energy: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM charges WHERE vehicle_id = $1 AND deleted_at IS NULL AND end_at IS NOT NULL AND energy_used_kwh IS NULL",
+    ).bind(id).fetch_one(&app.inner.db).await.unwrap_or(0);
+    let gap_days: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM generate_series((now() - interval '30 days')::date, now()::date, '1 day') AS day
+         WHERE NOT EXISTS (
+            SELECT 1 FROM positions
+            WHERE vehicle_id = $1 AND recorded_at >= day AND recorded_at < day + interval '1 day'
+         )",
+    ).bind(id).fetch_one(&app.inner.db).await.unwrap_or(0);
+    let points = sqlx::query_as(
+        "SELECT source, COUNT(*)::bigint FROM positions
+         WHERE vehicle_id = $1 AND recorded_at >= now() - interval '30 days'
+         GROUP BY source ORDER BY source",
+    )
+    .bind(id)
+    .fetch_all(&app.inner.db)
+    .await
+    .unwrap_or_default();
+    Quality {
+        drives_without_energy,
+        charges_without_energy,
+        gap_days,
+        points,
+    }
+}
+
+async fn load_bins(
+    app: &AppState,
+    id: i64,
+    period: &str,
+    count: i32,
+) -> Result<Vec<TempBin>, ApiError> {
+    let timezone = crate::settings::text_or(
+        &app.inner.db,
+        Some(id),
+        "TESLA_TIMEZONE",
+        &app.inner.config.timezone,
+    )
+    .await;
+    let window = stats_window(period, count, &timezone, Utc::now())?;
+    let rows = sqlx::query_as::<_, TempRow>(&consumption_query_sql(&window))
+        .bind(id)
+        .fetch_all(&app.inner.db)
+        .await
+        .map_err(map_query)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Some(TempBin {
+                temp_c_bucket: row.temp_c_bucket?,
+                wh_per_km: row.wh_per_km,
+                distance_km: row.distance_km.unwrap_or(0.0),
+            })
+        })
+        .collect())
+}
+
+fn bars(
+    id: i64,
+    title: &str,
+    series: &SeriesResponse,
+    value: impl Fn(&Bucket) -> f64,
+) -> maud::Markup {
+    use maud::html;
+    let max = series
+        .buckets
+        .iter()
+        .map(&value)
+        .fold(0.0_f64, f64::max)
+        .max(1e-9);
+    let width = u32::try_from(series.buckets.len().max(1)).unwrap_or(1) * 8;
+    html! {
+        section class="card" {
+            h2 { (title) }
+            svg class="chart" viewBox=(format!("0 0 {width} 40")) width="640" height="180" role="img" aria-label=(title) {
+                @for (index, bucket) in series.buckets.iter().enumerate() {
+                    @let height = (value(bucket) / max) * 36.0;
+                    @let x = u32::try_from(index).unwrap_or(0) * 8;
+                    a href=(bucket_href(id, &series.period, bucket.start)) {
+                        rect x=(x) y=(format!("{:.2}", 38.0 - height)) width="6" height=(format!("{height:.2}")) fill="currentColor" {}
+                    }
+                }
+            }
+            ol class="chart-labels" {
+                @for bucket in &series.buckets {
+                    li { a href=(bucket_href(id, &series.period, bucket.start)) { (bucket.start.format("%d/%m").to_string()) } }
+                }
+            }
+        }
+    }
+}
+
+fn temp_bars(id: i64, bins: &[TempBin]) -> maud::Markup {
+    use maud::html;
+    let max = bins
+        .iter()
+        .filter_map(|bin| bin.wh_per_km)
+        .fold(0.0_f64, f64::max)
+        .max(1e-9);
+    html! {
+        svg class="chart" viewBox=(format!("0 0 {} 40", bins.len().max(1) * 8)) width="640" height="180" role="img" aria-label="Consommation par température" {
+            @for (index, bin) in bins.iter().enumerate() {
+                @let height = bin.wh_per_km.unwrap_or(0.0) / max * 36.0;
+                a href=(format!("/v/{id}/drives")) {
+                    rect x=(u32::try_from(index).unwrap_or(0) * 8) y=(format!("{:.2}", 38.0 - height)) width="6" height=(format!("{height:.2}")) fill="currentColor" {}
+                }
+            }
+        }
+        ol class="chart-labels" {
+            @for bin in bins {
+                li { (bin.temp_c_bucket) " °C" }
+            }
+        }
+    }
+}
+
+fn bucket_href(id: i64, period: &str, start: DateTime<FixedOffset>) -> String {
+    let days = match period {
+        "year" => 366,
+        "week" => 7,
+        _ => 31,
+    };
+    let end = start + chrono::Duration::days(days);
+    format!(
+        "/v/{id}/drives?from={}&to={}",
+        start.format("%Y-%m-%d"),
+        end.format("%Y-%m-%d")
+    )
+}
+
+fn sum_distance(series: &SeriesResponse) -> String {
+    format!(
+        "{:.1}",
+        series
+            .buckets
+            .iter()
+            .map(|bucket| bucket.distance_km)
+            .sum::<f64>()
+    )
+}
+
+fn first_cost(series: &SeriesResponse) -> String {
+    series
+        .buckets
+        .iter()
+        .find_map(|bucket| bucket.cost_per_km)
+        .map_or_else(|| "—".into(), |value| format!("{value:.3}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -774,5 +1033,78 @@ mod tests {
         cache_insert(key.clone(), value, now);
         assert!(cache_get(&key, now + Duration::from_secs(299)).is_some());
         assert!(cache_get(&key, now + Duration::from_secs(301)).is_none());
+    }
+
+    #[tokio::test]
+    async fn stored_kwh_price_changes_cost_per_km() {
+        let Some(db) = crate::test_util::TestDb::migrated("price").await else {
+            return;
+        };
+        let state = crate::app::test_state(db.pool.clone()).await;
+        let vehicle: i64 = sqlx::query_scalar(
+            "INSERT INTO vehicles (vin, name) VALUES ('5YJ30000000000055', 'Prix') RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let start = chrono::Utc::now() - chrono::Duration::hours(2);
+        sqlx::query(
+            "INSERT INTO drives (vehicle_id, start_at, end_at, distance_km, energy_used_kwh, source)
+             VALUES ($1, $2, $3, 100, 10, 'poll')",
+        )
+        .bind(vehicle)
+        .bind(start)
+        .bind(start + chrono::Duration::minutes(30))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO charges (vehicle_id, start_at, end_at, energy_added_kwh, source)
+             VALUES ($1, $2, $3, 10, 'poll')",
+        )
+        .bind(vehicle)
+        .bind(start)
+        .bind(start + chrono::Duration::hours(1))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        crate::settings::set(&db.pool, None, "ENERGY_PRICE_PER_KWH", "0.20")
+            .await
+            .unwrap();
+        let series = super::load_series(&state, vehicle, "month", 1)
+            .await
+            .unwrap();
+        let cost = series
+            .buckets
+            .iter()
+            .find_map(|bucket| bucket.cost_per_km)
+            .expect("cost");
+        assert!((cost - 0.02).abs() < 0.0001, "{cost}");
+        let page = super::console_page(
+            &state,
+            &crate::http::ui::chrome(
+                &crate::http::ui::Page {
+                    session_id: "s".into(),
+                    csrf: "c".into(),
+                    cookie: None,
+                    vehicles: Vec::new(),
+                    remembered: None,
+                    admin: true,
+                    username: "admin".into(),
+                },
+                Some(vehicle),
+                Some(crate::http::markup::VehicleTab::Stats),
+                crate::http::markup::GlobalTab::None,
+                false,
+            ),
+            vehicle,
+            "month",
+            1,
+        )
+        .await;
+        assert!(page.contains("class=\"chart\""));
+        assert!(page.contains("height=\"180\""));
+        assert!(page.contains("chart-labels"));
+        assert!(!page.contains("<text"));
     }
 }
