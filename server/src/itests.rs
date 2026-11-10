@@ -351,7 +351,7 @@ async fn stream_points_follow_one_drive_and_yield_to_a_poll() {
         legacy_vehicle_id: Some(99),
         name: Some("Red"),
     };
-    let base = Utc.with_ymd_and_hms(2024, 6, 1, 10, 0, 0).unwrap();
+    let base = Utc::now();
     let mut charging = Observation::at(base - chrono::Duration::minutes(30), Presence::Online);
     charging.shift_state = Some("P".to_owned());
     charging.charging_state = Some("Charging".to_owned());
@@ -719,7 +719,7 @@ async fn short_drives_are_deleted_for_poll_and_stream() {
     assert_eq!(kept_stats["drive_count"], 1);
 
     // Stream: one position (park frame has no coordinates), then 0 km, 0.009 km, 0.01 km.
-    let t0 = base + chrono::Duration::hours(3);
+    let t0 = Utc::now();
     apply_stream_for_vin(
         &archive,
         stream_vin,
@@ -918,6 +918,43 @@ async fn vehicle_id(pool: &sqlx::PgPool, vin: &str) -> i64 {
     row.0
 }
 
+async fn open_drive_count(pool: &sqlx::PgPool, vin: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM drives d
+         JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE v.vin = $1 AND d.end_at IS NULL",
+    )
+    .bind(vin)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}
+
+async fn closed_drive_id(pool: &sqlx::PgPool, vin: &str) -> Option<i64> {
+    sqlx::query_as(
+        "SELECT d.id FROM drives d
+         JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE v.vin = $1 AND d.end_at IS NOT NULL
+         ORDER BY d.end_at DESC
+         LIMIT 1",
+    )
+    .bind(vin)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+    .map(|(id,): (i64,)| id)
+}
+
+async fn positions_on_drive(pool: &sqlx::PgPool, drive_id: i64) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM positions WHERE drive_id = $1")
+        .bind(drive_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
 async fn open_drive_id(pool: &sqlx::PgPool, vin: &str) -> Option<i64> {
     sqlx::query_as(
         "SELECT d.id FROM drives d
@@ -978,7 +1015,7 @@ async fn stream_event_keeps_polled_temperatures() {
         legacy_vehicle_id: Some(99),
         name: Some("Red"),
     };
-    let base = Utc.with_ymd_and_hms(2024, 6, 1, 10, 0, 0).unwrap();
+    let base = Utc::now();
     let mut poll = Observation::at(base, Presence::Online);
     poll.inside_temp_c = Some(21.5);
     poll.outside_temp_c = Some(9.0);
@@ -1057,6 +1094,206 @@ async fn stream_event_keeps_polled_temperatures() {
             .await
             .unwrap();
     assert_eq!(state, (Some(22.0), Some(8.0)));
+}
+
+/// A poll that parks the car closes the drive. Stream samples still buffered
+/// from that drive must join it, and a later fresh gear must be able to start
+/// the next one.
+#[tokio::test]
+async fn late_stream_samples_do_not_open_a_second_drive() {
+    let Some(db) = TestDb::migrated("late").await else {
+        return;
+    };
+    let archive = test_archive(db.pool.clone());
+    let vin = "5YJ3E1EA7KF000042";
+    let base = Utc.with_ymd_and_hms(2024, 11, 10, 12, 9, 0).unwrap();
+    apply_for_vin(
+        &archive,
+        vin,
+        car(vin),
+        shifted(base, "D", Some(100.0), 48.85, 2.35),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    apply_for_vin(
+        &archive,
+        vin,
+        car(vin),
+        shifted(
+            base + chrono::Duration::minutes(5),
+            "D",
+            Some(100.3),
+            48.86,
+            2.36,
+        ),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    apply_for_vin(
+        &archive,
+        vin,
+        car(vin),
+        shifted(
+            base + chrono::Duration::minutes(10),
+            "P",
+            Some(100.5),
+            48.87,
+            2.37,
+        ),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    let drive_id = closed_drive_id(&db.pool, vin).await.expect("closed drive");
+    assert_eq!(open_drive_count(&db.pool, vin).await, 0);
+
+    for (at, odometer, latitude) in [
+        (base - chrono::Duration::seconds(10), 99.98, 48.849),
+        (base + chrono::Duration::minutes(2), 100.1, 48.855),
+        (base + chrono::Duration::minutes(9), 100.4, 48.865),
+    ] {
+        apply_stream_for_vin(
+            &archive,
+            vin,
+            car(vin),
+            &stream_fix(at, Some("D"), Some(odometer), Some(latitude), Some(2.35)),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(open_drive_count(&db.pool, vin).await, 0);
+    assert_eq!(closed_drives(&db.pool, vin).await.0, 1);
+    assert_eq!(closed_drive_id(&db.pool, vin).await, Some(drive_id));
+    let attached = positions_on_drive(&db.pool, drive_id).await;
+    assert_eq!(attached, 6, "poll points plus late stream points");
+    let distance = closed_drives(&db.pool, vin).await.1.unwrap();
+    assert!(
+        (distance - 0.52).abs() < 1e-6,
+        "recomputed odometer distance {distance}"
+    );
+
+    apply_stream_for_vin(
+        &archive,
+        vin,
+        car(vin),
+        &stream_fix(
+            base - chrono::Duration::hours(2),
+            Some("D"),
+            Some(50.0),
+            Some(48.0),
+            Some(2.0),
+        ),
+    )
+    .await
+    .unwrap();
+    apply_stream_for_vin(
+        &archive,
+        vin,
+        car(vin),
+        &stream_fix(
+            Utc::now() - chrono::Duration::seconds(45),
+            Some("D"),
+            Some(150.0),
+            Some(49.0),
+            Some(3.0),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(open_drive_count(&db.pool, vin).await, 0);
+    assert_eq!(closed_drives(&db.pool, vin).await.0, 1);
+    assert_eq!(positions_on_drive(&db.pool, drive_id).await, attached);
+
+    let fresh = Utc::now();
+    apply_stream_for_vin(
+        &archive,
+        vin,
+        car(vin),
+        &stream_fix(fresh, Some("D"), Some(200.0), Some(49.1), Some(3.1)),
+    )
+    .await
+    .unwrap();
+    apply_stream_for_vin(
+        &archive,
+        vin,
+        car(vin),
+        &stream_fix(
+            fresh + chrono::Duration::seconds(4),
+            Some("D"),
+            Some(200.2),
+            Some(49.2),
+            Some(3.2),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(open_drive_count(&db.pool, vin).await, 1);
+    assert_eq!(closed_drives(&db.pool, vin).await.0, 1);
+    assert_eq!(closed_drive_id(&db.pool, vin).await, Some(drive_id));
+}
+
+#[tokio::test]
+async fn stream_start_reuses_the_open_drive() {
+    let Some(db) = TestDb::migrated("reuse").await else {
+        return;
+    };
+    let archive = test_archive(db.pool.clone());
+    let vin = "5YJ3E1EA7KF000043";
+    let now = Utc::now();
+    apply_for_vin(
+        &archive,
+        vin,
+        car(vin),
+        shifted(now, "P", Some(10.0), 48.0, 2.0),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    let vehicle = vehicle_id(&db.pool, vin).await;
+    sqlx::query(
+        "INSERT INTO drives (
+            vehicle_id, start_at, start_latitude, start_longitude, start_odometer_km, source
+         ) VALUES ($1, $2, 48.0, 2.0, 10.0, 'poll')",
+    )
+    .bind(vehicle)
+    .bind(now)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let existing = open_drive_id(&db.pool, vin)
+        .await
+        .expect("seeded open drive");
+    apply_stream_for_vin(
+        &archive,
+        vin,
+        car(vin),
+        &stream_fix(
+            now + chrono::Duration::seconds(10),
+            Some("D"),
+            Some(10.2),
+            Some(48.01),
+            Some(2.01),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(open_drive_count(&db.pool, vin).await, 1);
+    assert_eq!(open_drive_id(&db.pool, vin).await, Some(existing));
+    assert!(positions_on_drive(&db.pool, existing).await >= 1);
+    let duplicate =
+        sqlx::query("INSERT INTO drives (vehicle_id, start_at, source) VALUES ($1, $2, 'stream')")
+            .bind(vehicle)
+            .bind(now)
+            .execute(&db.pool)
+            .await;
+    assert!(duplicate.is_err());
 }
 
 #[tokio::test]

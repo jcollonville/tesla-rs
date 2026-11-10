@@ -57,6 +57,8 @@ pub(super) struct Overview {
     pub last_poll: String,
     pub last_data: String,
     pub last_error: String,
+    pub stream_lag: String,
+    pub stream_queue: String,
     pub last_drive: String,
     pub last_charge: String,
 }
@@ -179,6 +181,8 @@ pub(super) fn overview_page(chrome: &Chrome, overview: &Overview) -> String {
                     div { dt { "Dernier poll" } dd { (overview.last_poll) } }
                     div { dt { "Dernière donnée" } dd { (overview.last_data) } }
                     div { dt { "Dernière erreur" } dd { (overview.last_error) } }
+                    div { dt { "Retard stream" } dd { (overview.stream_lag) } }
+                    div { dt { "File stream" } dd { (overview.stream_queue) } }
                 }
             }
             section class="card" id="dernier-trajet" {
@@ -776,6 +780,8 @@ mod tests {
                 last_poll: "jamais".to_owned(),
                 last_data: "jamais".to_owned(),
                 last_error: "—".to_owned(),
+                stream_lag: "3 s".to_owned(),
+                stream_queue: "0".to_owned(),
                 last_drive: "Aucun trajet".to_owned(),
                 last_charge: "Aucune charge".to_owned(),
             },
@@ -784,6 +790,7 @@ mod tests {
         assert!(html.contains("aria-selected=\"true\""));
         assert!(html.contains(">Aperçu<"));
         assert!(html.contains("hybrid"));
+        assert!(html.contains("Retard stream"));
         assert!(html.contains("href=\"/v/4/drives\""));
         assert!(html.contains("href=\"/v/4/connection\""));
         preview("overview.html", &html);

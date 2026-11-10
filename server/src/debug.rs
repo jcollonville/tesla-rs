@@ -115,6 +115,8 @@ struct OwnerSlot {
     errors: u64,
     parse_failures: u64,
     empty_drops: u64,
+    latest_sample_at: Option<DateTime<Utc>>,
+    queue_depth: usize,
 }
 
 struct FleetSlot {
@@ -173,6 +175,8 @@ impl OwnerSlot {
             errors: 0,
             parse_failures: 0,
             empty_drops: 0,
+            latest_sample_at: None,
+            queue_depth: 0,
         }
     }
 }
@@ -352,6 +356,42 @@ impl DebugBoard {
             slot.stream_tag = stream_tag;
             slot.last_error_class = Some(class);
             slot.last_error = Some(message);
+        }
+        self.notify();
+    }
+
+    /// Age of the newest stream sample is `now - sample_at`. `queue_depth` is unwritten samples.
+    pub(crate) fn note_ingestion(
+        &self,
+        db_id: i64,
+        stream_tag: i64,
+        sample_at: DateTime<Utc>,
+        queue_depth: usize,
+    ) {
+        {
+            let mut guard = self.lock();
+            let slot = guard
+                .owner
+                .vehicles
+                .entry(db_id)
+                .or_insert_with(|| OwnerSlot::new(stream_tag));
+            slot.stream_tag = stream_tag;
+            slot.latest_sample_at = Some(sample_at);
+            slot.queue_depth = queue_depth;
+        }
+        self.notify();
+    }
+
+    pub(crate) fn set_stream_queue(&self, db_id: i64, queue_depth: usize) {
+        {
+            let mut guard = self.lock();
+            let Some(slot) = guard.owner.vehicles.get_mut(&db_id) else {
+                return;
+            };
+            if slot.queue_depth == queue_depth {
+                return;
+            }
+            slot.queue_depth = queue_depth;
         }
         self.notify();
     }
@@ -807,6 +847,8 @@ fn render_owner(guard: &DebugState, now: DateTime<Utc>) -> String {
                 ("Reconnects", slot.reconnects.to_string()),
                 ("Last frame", fmt_ago(slot.last_frame_at, now)),
                 ("Last data:update", fmt_ago(slot.last_update_at, now)),
+                ("Ingestion lag", ingestion_lag(slot.latest_sample_at, now)),
+                ("Queue depth", slot.queue_depth.to_string()),
                 ("Position mode", slot.position_mode.clone()),
                 ("Counts", counts),
                 (
@@ -1110,6 +1152,13 @@ fn direction_label(direction: &str) -> &'static str {
     }
 }
 
+fn ingestion_lag(at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    let Some(at) = at else {
+        return "—".to_owned();
+    };
+    fmt_span((now - at).num_seconds().max(0))
+}
+
 fn fmt_ago(at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     let Some(at) = at else {
         return "never".to_owned();
@@ -1223,5 +1272,16 @@ mod tests {
         }
         let text = board.joined();
         assert!(text.contains("failed to parse"), "{text}");
+    }
+
+    #[test]
+    fn console_shows_ingestion_lag_and_queue_depth() {
+        use chrono::Utc;
+        let board = DebugBoard::new(LogBuffer::new(4));
+        board.note_ingestion(7, 99, Utc::now(), 4);
+        let html = board.console(&[]).body;
+        assert!(html.contains("<dt>Ingestion lag</dt>"), "{html}");
+        assert!(html.contains("<dt>Queue depth</dt><dd>4</dd>"), "{html}");
+        assert!(!html.contains("5YJ"), "{html}");
     }
 }

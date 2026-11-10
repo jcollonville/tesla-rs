@@ -142,12 +142,15 @@ pub(crate) enum CycleControl {
     Pause(Duration),
 }
 
+/// One vehicle's runtime. The map lock is only held to look this up.
+pub(crate) type SharedRuntime = Arc<Mutex<Runtime>>;
+
 /// Shared archive handles used by polling and telemetry.
 pub(crate) struct Archive {
     pub db: PgPool,
     pub geocoder: Geocoder,
     pub events: broadcast::Sender<LiveEvent>,
-    pub runtimes: Arc<Mutex<HashMap<String, Runtime>>>,
+    pub runtimes: Arc<Mutex<HashMap<String, SharedRuntime>>>,
     /// Wakes a backing-off Owner API stream when this VIN is seen online.
     pub stream_kick: broadcast::Sender<String>,
     /// Owner-stream GPS mode. Fallback wakes the poller through this board.
@@ -158,6 +161,7 @@ pub(crate) struct Archive {
     pub owner_account_id: Option<i64>,
     /// 429 pause deadlines keyed by Tesla account id.
     pub account_backoff: Arc<Mutex<HashMap<i64, Instant>>>,
+    pub fences: crate::persist::FenceCache,
 }
 
 impl Archive {
@@ -178,6 +182,7 @@ impl Archive {
             fleet_account_id: None,
             owner_account_id: None,
             account_backoff: Arc::new(Mutex::new(HashMap::new())),
+            fences: crate::persist::FenceCache::default(),
         }
     }
 }
@@ -191,49 +196,111 @@ pub(crate) async fn apply_for_vin(
     from_telemetry: bool,
 ) -> Result<(), AppError> {
     let vehicle_id = upsert_vehicle(&archive.db, identity, archive.fleet_account_id).await?;
-    let mut guard = archive.runtimes.lock().await;
-    if !guard.contains_key(vin) {
-        let runtime = load_runtime(&archive.db, vehicle_id, vin).await?;
-        guard.insert(vin.to_owned(), runtime);
-    }
-    let runtime = guard.get_mut(vin).expect("runtime inserted");
-    if from_telemetry {
-        runtime.last_telemetry = Some(Instant::now());
-    }
-    apply_observation(
-        &archive.db,
-        runtime,
-        &obs,
-        &archive.geocoder,
-        &archive.events,
-        live,
-        true,
-    )
-    .await
+    let slot = ensure_runtime(archive, vin, vehicle_id).await?;
+    write_observation(archive, &slot, &obs, live, true, from_telemetry).await
 }
 
 /// Writes one Owner API streaming sample onto the current drive.
+///
+/// The vehicle id is read from the cached runtime. `upsert_vehicle` runs only
+/// until that runtime exists. The socket writer uses [`apply_stream_batch`];
+/// integration tests call this directly.
+#[cfg(test)]
 pub(crate) async fn apply_stream_for_vin(
     archive: &Archive,
     vin: &str,
     identity: VehicleIdentity<'_>,
     sample: &crate::persist::StreamFix,
 ) -> Result<(), AppError> {
-    let vehicle_id = upsert_vehicle(&archive.db, identity, archive.fleet_account_id).await?;
-    let mut guard = archive.runtimes.lock().await;
-    if !guard.contains_key(vin) {
-        let runtime = load_runtime(&archive.db, vehicle_id, vin).await?;
-        guard.insert(vin.to_owned(), runtime);
+    let existing = archive.runtimes.lock().await.get(vin).cloned();
+    let slot = if let Some(slot) = existing {
+        slot
+    } else {
+        let vehicle_id = upsert_vehicle(&archive.db, identity, archive.fleet_account_id).await?;
+        ensure_runtime(archive, vin, vehicle_id).await?
+    };
+    write_stream(archive, &slot, std::slice::from_ref(sample)).await
+}
+
+/// Writes a batch of stream samples for a vehicle whose row id is already known.
+pub(crate) async fn apply_stream_batch(
+    archive: &Archive,
+    vin: &str,
+    vehicle_id: i64,
+    samples: &[crate::persist::StreamFix],
+) -> Result<(), AppError> {
+    let slot = ensure_runtime(archive, vin, vehicle_id).await?;
+    write_stream(archive, &slot, samples).await
+}
+
+async fn ensure_runtime(
+    archive: &Archive,
+    vin: &str,
+    vehicle_id: i64,
+) -> Result<SharedRuntime, AppError> {
+    if let Some(slot) = archive.runtimes.lock().await.get(vin).cloned() {
+        return Ok(slot);
     }
-    let runtime = guard.get_mut(vin).expect("runtime inserted");
-    crate::persist::apply_stream_sample(
-        &archive.db,
-        runtime,
-        sample,
-        &archive.geocoder,
-        &archive.events,
-    )
-    .await
+    let loaded = load_runtime(&archive.db, vehicle_id, vin).await?;
+    let mut guard = archive.runtimes.lock().await;
+    Ok(Arc::clone(
+        guard
+            .entry(vin.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(loaded))),
+    ))
+}
+
+async fn write_observation(
+    archive: &Archive,
+    slot: &SharedRuntime,
+    obs: &Observation,
+    live: bool,
+    store_position: bool,
+    from_telemetry: bool,
+) -> Result<(), AppError> {
+    let fences = archive.fences.get(&archive.db).await?;
+    let jobs = {
+        let mut runtime = slot.lock().await;
+        if from_telemetry {
+            runtime.last_telemetry = Some(Instant::now());
+        }
+        apply_observation(
+            &archive.db,
+            &mut runtime,
+            obs,
+            &fences,
+            &archive.events,
+            live,
+            store_position,
+        )
+        .await?
+    };
+    crate::persist::settle_addresses(&archive.db, &archive.geocoder, jobs).await;
+    Ok(())
+}
+
+async fn write_stream(
+    archive: &Archive,
+    slot: &SharedRuntime,
+    samples: &[crate::persist::StreamFix],
+) -> Result<(), AppError> {
+    if samples.is_empty() {
+        return Ok(());
+    }
+    let fences = archive.fences.get(&archive.db).await?;
+    let jobs = {
+        let mut runtime = slot.lock().await;
+        crate::persist::apply_stream_samples(
+            &archive.db,
+            &mut runtime,
+            samples,
+            &fences,
+            &archive.events,
+        )
+        .await?
+    };
+    crate::persist::settle_addresses(&archive.db, &archive.geocoder, jobs).await;
+    Ok(())
 }
 
 /// Fleet API poller. It never calls `wake_up`.
@@ -666,15 +733,14 @@ async fn run_cycle(
     let mut soonest = policy.backoff;
     let now = Instant::now();
     for summary in vehicles {
-        let due = {
-            let guard = archive.runtimes.lock().await;
-            guard
-                .get(&summary.vin)
-                .is_none_or(|runtime| runtime.next_due <= now)
+        let slot = archive.runtimes.lock().await.get(&summary.vin).cloned();
+        let due = match &slot {
+            None => true,
+            Some(slot) => slot.lock().await.next_due <= now,
         };
         if !due {
-            if let Some(runtime) = archive.runtimes.lock().await.get(&summary.vin) {
-                let remaining = runtime.next_due.saturating_duration_since(now);
+            if let Some(slot) = slot {
+                let remaining = slot.lock().await.next_due.saturating_duration_since(now);
                 if remaining < soonest {
                     soonest = remaining;
                 }
@@ -700,11 +766,9 @@ async fn run_cycle(
                     let _ =
                         crate::accounts::set_last_error(&archive.db, account_id, &message).await;
                 }
-                {
-                    let mut guard = archive.runtimes.lock().await;
-                    if let Some(runtime) = guard.get_mut(&summary.vin) {
-                        runtime.next_due = Instant::now() + policy.backoff;
-                    }
+                let slot = archive.runtimes.lock().await.get(&summary.vin).cloned();
+                if let Some(slot) = slot {
+                    slot.lock().await.next_due = Instant::now() + policy.backoff;
                 }
                 if policy.backoff < soonest {
                     soonest = policy.backoff;
@@ -782,15 +846,9 @@ async fn handle_summary(
         archive.fleet_account_id,
     )
     .await?;
+    let slot = ensure_runtime(archive, &summary.vin, vehicle_id).await?;
     let (activity, telemetry_fresh, parked_live_polls) = {
-        let mut guard = archive.runtimes.lock().await;
-        if !guard.contains_key(&summary.vin) {
-            guard.insert(
-                summary.vin.clone(),
-                load_runtime(&archive.db, vehicle_id, &summary.vin).await?,
-            );
-        }
-        let runtime = guard.get(&summary.vin).expect("runtime");
+        let runtime = slot.lock().await;
         (
             runtime.tracker.activity,
             runtime
@@ -820,11 +878,9 @@ async fn handle_summary(
     }
     if summary.presence != Presence::Online || !plan.observe {
         {
-            let mut guard = archive.runtimes.lock().await;
-            if let Some(runtime) = guard.get_mut(&summary.vin) {
-                runtime.parked_live_polls = 0;
-                runtime.next_due = Instant::now() + plan.wait;
-            }
+            let mut runtime = slot.lock().await;
+            runtime.parked_live_polls = 0;
+            runtime.next_due = Instant::now() + plan.wait;
         }
         let vin = summary.vin.clone();
         let presence = summary.presence;
@@ -842,12 +898,11 @@ async fn handle_summary(
     match source.observe(&summary.vin).await? {
         ObserveResult::RateLimited(wait) => Ok(CycleControl::Pause(wait)),
         ObserveResult::Resting(presence) => {
-            let mut guard = archive.runtimes.lock().await;
-            if let Some(runtime) = guard.get_mut(&summary.vin) {
+            {
+                let mut runtime = slot.lock().await;
                 runtime.parked_live_polls = 0;
                 runtime.next_due = Instant::now() + policy.asleep;
             }
-            drop(guard);
             let obs = resting_observation(Utc::now(), presence);
             apply_existing(archive, &summary.vin, obs, false, false).await?;
             Ok(CycleControl::Wait(policy.asleep))
@@ -867,8 +922,8 @@ async fn handle_summary(
             if store_position && driving {
                 archive.gps.mark_drive_position(vehicle_id, now).await;
             }
-            let mut guard = archive.runtimes.lock().await;
-            if let Some(runtime) = guard.get_mut(&summary.vin) {
+            {
+                let mut runtime = slot.lock().await;
                 if matches!(
                     runtime.tracker.activity,
                     Activity::Driving | Activity::Charging
@@ -891,20 +946,10 @@ async fn apply_existing(
     live: bool,
     store_position: bool,
 ) -> Result<(), AppError> {
-    let mut guard = archive.runtimes.lock().await;
-    let Some(runtime) = guard.get_mut(vin) else {
+    let Some(slot) = archive.runtimes.lock().await.get(vin).cloned() else {
         return Ok(());
     };
-    apply_observation(
-        &archive.db,
-        runtime,
-        &obs,
-        &archive.geocoder,
-        &archive.events,
-        live,
-        store_position,
-    )
-    .await
+    write_observation(archive, &slot, &obs, live, store_position, false).await
 }
 
 #[cfg(test)]

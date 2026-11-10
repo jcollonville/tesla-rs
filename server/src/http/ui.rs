@@ -148,6 +148,7 @@ async fn overview(
         );
     };
     let mode = app.inner.archive.gps.mode_name(id).await;
+    let (latest_sample, queue_depth) = app.inner.stream_board.snapshot().await.ingestion(id);
     let drive = last_drive(&app, id).await;
     let charge = last_charge(&app, id).await;
     let view = Overview {
@@ -161,6 +162,8 @@ async fn overview(
         last_poll: fmt_time(vehicle.last_poll_at),
         last_data: fmt_time(vehicle.last_data_at),
         last_error: vehicle.last_error.clone().unwrap_or_else(|| "—".to_owned()),
+        stream_lag: fmt_lag(latest_sample),
+        stream_queue: queue_depth.to_string(),
         last_drive: drive,
         last_charge: charge,
     };
@@ -177,6 +180,21 @@ async fn overview(
         ),
         page.cookie,
     )
+}
+
+/// Age of the newest Owner stream sample, `—` when none was seen.
+fn fmt_lag(at: Option<DateTime<Utc>>) -> String {
+    let Some(at) = at else {
+        return "—".to_owned();
+    };
+    let secs = (Utc::now() - at).num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs} s")
+    } else if secs < 3_600 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{} h", secs / 3_600)
+    }
 }
 
 async fn drives(State(app): State<AppState>, headers: HeaderMap, Path(id): Path<i64>) -> Response {
