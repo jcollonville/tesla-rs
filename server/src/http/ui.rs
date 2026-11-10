@@ -293,20 +293,28 @@ fn login_page(app: &AppState, headers: &HeaderMap, error: Option<&str>) -> Respo
     } else {
         csrf
     };
-    let error = error
-        .map(|text| format!("<p class=\"err\">{}</p>", escape(text)))
-        .unwrap_or_default();
-    let body = page(&format!(
-        "<h1>tesla-logger</h1>{error}<form method=\"post\" action=\"/\">\
-         <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
-         <label>Password <input type=\"password\" name=\"password\" autocomplete=\"current-password\" required></label>\
-         <button type=\"submit\">Sign in</button></form>"
-    ));
+    let body = login_markup(&csrf, error);
     let mut response = Html(body).into_response();
     if let Some(cookie) = set_cookie {
         response.headers_mut().insert(header::SET_COOKIE, cookie);
     }
     response
+}
+
+fn login_markup(csrf: &str, error: Option<&str>) -> String {
+    let error = error.map(|text| banner("bad", text)).unwrap_or_default();
+    page(&format!(
+        "<section class=\"card auth-card\">\
+         <p class=\"kicker\">tesla-logger</p>\
+         <h1>Sign in</h1>\
+         <p class=\"muted\">Password for this logger. This is not the Tesla account.</p>\
+         {error}\
+         <form class=\"stack\" method=\"post\" action=\"/\">\
+         <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+         <label class=\"field\">Password <input type=\"password\" name=\"password\" autocomplete=\"current-password\" required></label>\
+         <button type=\"submit\">{}Sign in</button></form></section>",
+        icon(ICON_KEY)
+    ))
 }
 
 fn render_status(
@@ -318,71 +326,75 @@ fn render_status(
     global: Option<&str>,
     streaming: &crate::owner_stream::StreamSnapshot,
 ) -> String {
-    let connected_text = if connected { "yes" } else { "no" };
-    let global = global
-        .map(|text| format!("<p class=\"err\">{}</p>", escape(text)))
-        .unwrap_or_default();
-    let mut rows = String::new();
+    let global = global.map(|text| banner("bad", text)).unwrap_or_default();
+    let account = if connected {
+        chip("Tesla connected", "ok")
+    } else {
+        chip("Tesla not connected", "neutral")
+    };
+    let stream_summary = streaming.summary();
+    let stream = chip(
+        &format!("Stream {stream_summary}"),
+        tone_for_stream(stream_summary),
+    );
+    let mut cards = String::new();
     if vehicles.is_empty() {
-        rows.push_str("<tr><td colspan=\"7\">No vehicles yet.</td></tr>");
+        cards.push_str("<p class=\"muted\">No vehicles yet.</p>");
     }
     for vehicle in vehicles {
-        let (stream_status, stream_error) = streaming.for_vehicle(vehicle.id);
-        let stream = match stream_error {
-            Some(error) => format!("{stream_status} ({error})"),
-            None => stream_status,
-        };
-        let _ = write!(
-            rows,
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            escape(vehicle.name.as_deref().unwrap_or(vehicle.vin.as_str())),
-            escape(&vehicle.vin),
-            escape(vehicle.activity.as_deref().unwrap_or("unknown")),
-            fmt_opt(vehicle.battery_level),
-            fmt_time(vehicle.last_poll_at),
-            escape(vehicle.last_error.as_deref().unwrap_or("")),
-            escape(&stream)
-        );
+        let _ = write!(cards, "{}", vehicle_card(vehicle, streaming));
     }
     let mut token_rows = String::new();
     for token in tokens {
-        let state = if token.revoked_at.is_some() {
-            "revoked"
+        let (label, tone) = if token.revoked_at.is_some() {
+            ("revoked", "neutral")
         } else {
-            "active"
+            ("active", "ok")
         };
         let _ = write!(
             token_rows,
-            "<tr><td>{}</td><td>{state}</td><td><form class=\"inline\" method=\"post\" action=\"/tokens/{}/revoke\">\
-             <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button type=\"submit\">Revoke</button></form></td></tr>",
+            "<li><span>{}</span><span class=\"row\">{}<form method=\"post\" action=\"/tokens/{}/revoke\">\
+             <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"ghost\" type=\"submit\">Revoke</button></form></span></li>",
             escape(&token.name),
+            chip(label, tone),
             token.id
         );
     }
     let revealed = revealed
         .map(|token| {
             format!(
-                "<p>New API token, shown once: <code>{}</code></p>",
+                "<div class=\"banner note\" role=\"status\"><p>New API token, shown once.</p><code class=\"secret\">{}</code></div>",
                 escape(token)
             )
         })
         .unwrap_or_default();
-    let stream_summary = streaming.summary();
     let connect = if connected {
         format!(
-            "<form class=\"inline\" method=\"post\" action=\"/auth/disconnect\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button type=\"submit\">Disconnect Tesla</button></form>"
+            "<form method=\"post\" action=\"/auth/disconnect\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"ghost\" type=\"submit\">{}Disconnect Tesla</button></form>",
+            icon(ICON_UNLINK)
         )
     } else {
-        "<a href=\"/auth/login\">Connect Tesla</a>".to_owned()
+        format!(
+            "<a class=\"button\" href=\"/auth/login\">{}Connect Tesla</a>",
+            icon(ICON_KEY)
+        )
     };
     page(&format!(
-        "<h1>tesla-logger</h1>{global}<p>Tesla account connected: {connected_text}. {connect}</p>\
-         <form class=\"inline\" method=\"post\" action=\"/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button type=\"submit\">Sign out</button></form>\
-         <h2>Vehicles</h2><p>Owner API stream: {stream_summary}. <a href=\"/auth/owner\">Set up streaming</a></p>\
-         <table><thead><tr><th>Name</th><th>VIN</th><th>State</th><th>Battery %</th><th>Last poll</th><th>Error</th><th>Stream</th></tr></thead><tbody>{rows}</tbody></table>\
-         <h2>API tokens</h2>{revealed}<form method=\"post\" action=\"/tokens\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
-         <label>Name <input name=\"name\" required maxlength=\"80\"></label> <button type=\"submit\">Create token</button></form>\
-         <table><thead><tr><th>Name</th><th>Status</th><th></th></tr></thead><tbody>{token_rows}</tbody></table>"
+        "<header class=\"toolbar\">\
+         <div><p class=\"kicker\">tesla-logger</p><h1>Dashboard</h1></div>\
+         <div class=\"toolbar-actions\">{connect}\
+         <form method=\"post\" action=\"/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"ghost\" type=\"submit\">{}Sign out</button></form></div></header>\
+         {global}\
+         <div class=\"meta\">{account}{stream}<a class=\"button ghost\" href=\"/auth/owner\">{}Set up streaming</a></div>\
+         <section><h2>Vehicles</h2><div class=\"vehicles\">{cards}</div></section>\
+         <section class=\"card\"><h2>API tokens</h2>{revealed}\
+         <form class=\"stack\" method=\"post\" action=\"/tokens\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+         <label class=\"field\">Name <input name=\"name\" required maxlength=\"80\" autocomplete=\"off\"></label>\
+         <button type=\"submit\">{}Create token</button></form>\
+         <ul class=\"list\">{token_rows}</ul></section>",
+        icon(ICON_LOGOUT),
+        icon(ICON_STREAM),
+        icon(ICON_KEY)
     ))
 }
 
@@ -448,9 +460,72 @@ struct TokenRow {
     revoked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-fn fmt_opt(value: Option<f64>) -> String {
-    value.map_or_else(|| "—".to_owned(), |value| format!("{value:.0}"))
+fn fmt_battery(value: Option<f64>) -> String {
+    value.map_or_else(|| "—".to_owned(), |value| format!("{value:.0}%"))
 }
+
+fn vehicle_card(vehicle: &VehicleRow, streaming: &crate::owner_stream::StreamSnapshot) -> String {
+    let (status, detail) = streaming.for_vehicle(vehicle.id);
+    let detail = detail.unwrap_or_else(|| "—".to_owned());
+    format!(
+        "<article class=\"vehicle\"><div class=\"vehicle-head\"><h3>{}</h3>{}</div>\
+         <dl class=\"facts\">\
+         <div><dt>VIN</dt><dd>{}</dd></div>\
+         <div><dt>State</dt><dd>{}</dd></div>\
+         <div><dt>Battery</dt><dd>{}</dd></div>\
+         <div><dt>Last poll</dt><dd>{}</dd></div>\
+         <div><dt>Error</dt><dd>{}</dd></div>\
+         <div><dt>Stream</dt><dd>{}</dd></div>\
+         </dl></article>",
+        escape(vehicle.name.as_deref().unwrap_or(vehicle.vin.as_str())),
+        chip(&status, tone_for_stream(&status)),
+        escape(&vehicle.vin),
+        escape(vehicle.activity.as_deref().unwrap_or("unknown")),
+        fmt_battery(vehicle.battery_level),
+        fmt_time(vehicle.last_poll_at),
+        escape(vehicle.last_error.as_deref().unwrap_or("—")),
+        escape(&detail)
+    )
+}
+
+fn tone_for_stream(status: &str) -> &'static str {
+    match status {
+        "connected" => "ok",
+        "error" => "bad",
+        _ => "neutral",
+    }
+}
+
+pub(super) fn chip(label: &str, tone: &str) -> String {
+    let tone = match tone {
+        "ok" | "bad" => tone,
+        _ => "neutral",
+    };
+    format!("<span class=\"chip {tone}\">{}</span>", escape(label))
+}
+
+pub(super) fn banner(tone: &str, text: &str) -> String {
+    let role = if tone == "bad" { "alert" } else { "status" };
+    format!(
+        "<div class=\"banner {tone}\" role=\"{role}\"><p>{}</p></div>",
+        escape(text)
+    )
+}
+
+pub(super) fn icon(path: &str) -> String {
+    format!(
+        "<svg class=\"icon\" viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path fill=\"currentColor\" d=\"{path}\"/></svg>"
+    )
+}
+
+// Paths from Material Design Icons (Pictogrammers), Apache-2.0.
+pub(super) const ICON_KEY: &str = "M22,18V22H18V19H15V16H12L9.74,13.74C9.19,13.91 8.61,14 8,14A6,6 0 0,1 2,8A6,6 0 0,1 8,2A6,6 0 0,1 14,8C14,8.61 13.91,9.19 13.74,9.74L22,18M7,5A2,2 0 0,0 5,7A2,2 0 0,0 7,9A2,2 0 0,0 9,7A2,2 0 0,0 7,5Z";
+pub(super) const ICON_LOGOUT: &str = "M17 7L15.59 8.41L18.17 11H8V13H18.17L15.59 15.58L17 17L22 12M4 5H12V3H4C2.9 3 2 3.9 2 5V19C2 20.1 2.9 21 4 21H12V19H4V5Z";
+pub(super) const ICON_STREAM: &str = "M4.93,4.93C3.12,6.74 2,9.24 2,12C2,14.76 3.12,17.26 4.93,19.07L6.34,17.66C4.89,16.22 4,14.22 4,12C4,9.79 4.89,7.78 6.34,6.34L4.93,4.93M19.07,4.93L17.66,6.34C19.11,7.78 20,9.79 20,12C20,14.22 19.11,16.22 17.66,17.66L19.07,19.07C20.88,17.26 22,14.76 22,12C22,9.24 20.88,6.74 19.07,4.93M7.76,7.76C6.67,8.85 6,10.35 6,12C6,13.65 6.67,15.15 7.76,16.24L9.17,14.83C8.45,14.11 8,13.11 8,12C8,10.89 8.45,9.89 9.17,9.17L7.76,7.76M16.24,7.76L14.83,9.17C15.55,9.89 16,10.89 16,12C16,13.11 15.55,14.11 14.83,14.83L16.24,16.24C17.33,15.15 18,13.65 18,12C18,10.35 17.33,8.85 16.24,7.76M12,10A2,2 0 0,0 10,12A2,2 0 0,0 12,14A2,2 0 0,0 14,12A2,2 0 0,0 12,10Z";
+pub(super) const ICON_UNLINK: &str = "M17,7H13V8.9H17C18.71,8.9 20.1,10.29 20.1,12C20.1,13.43 19.12,14.63 17.79,15L19.25,16.44C20.88,15.61 22,13.95 22,12A5,5 0 0,0 17,7M16,11H13.81L15.81,13H16V11M2,4.27L5.11,7.38C3.29,8.12 2,9.91 2,12A5,5 0 0,0 7,17H11V15.1H7C5.29,15.1 3.9,13.71 3.9,12C3.9,10.41 5.11,9.1 6.66,8.93L8.73,11H8V13H10.73L13,15.27V17H14.73L18.74,21L20,19.74L3.27,3L2,4.27Z";
+pub(super) const ICON_ARROW: &str =
+    "M20,11V13H8L13.5,18.5L12.08,19.92L4.16,12L12.08,4.08L13.5,5.5L8,11H20Z";
+pub(super) const ICON_CAR: &str = "M5,11L6.5,6.5H17.5L19,11M17.5,16A1.5,1.5 0 0,1 16,14.5A1.5,1.5 0 0,1 17.5,13A1.5,1.5 0 0,1 19,14.5A1.5,1.5 0 0,1 17.5,16M6.5,16A1.5,1.5 0 0,1 5,14.5A1.5,1.5 0 0,1 6.5,13A1.5,1.5 0 0,1 8,14.5A1.5,1.5 0 0,1 6.5,16M18.92,6C18.72,5.42 18.16,5 17.5,5H6.5C5.84,5 5.28,5.42 5.08,6L3,12V20A1,1 0 0,0 4,21H5A1,1 0 0,0 6,20V19H18V20A1,1 0 0,0 19,21H20A1,1 0 0,0 21,20V12L18.92,6Z";
 
 fn fmt_time(value: Option<chrono::DateTime<chrono::Utc>>) -> String {
     value.map_or_else(
@@ -466,8 +541,14 @@ pub(super) fn escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-const HEAD: &str = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>tesla-logger</title><style>:root{color-scheme:light dark}body{font:15px/1.45 system-ui,sans-serif;margin:2rem auto;max-width:52rem;padding:0 1rem}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.35rem .5rem;border-bottom:1px solid #8884;vertical-align:top}code{font-family:ui-monospace,monospace}button,input{font:inherit}.err{color:#a33}form.inline{display:inline}footer{margin-top:2rem;color:#666}</style></head><body>";
-const FOOT: &str = "<footer><p>tesla-logger is free software under the GNU AGPL-3.0-only. <a href=\"https://github.com/jcollonville/tesla-rs\">Source code</a>.</p></footer></body></html>";
+const HEAD: &str = concat!(
+    "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+    "<meta name=\"robots\" content=\"noindex\"><title>tesla-logger</title><style>",
+    include_str!("ui.css"),
+    "</style></head><body><main class=\"shell\">"
+);
+const FOOT: &str = "</main><footer><p>tesla-logger is free software under the GNU AGPL-3.0-only. <a href=\"https://github.com/jcollonville/tesla-rs\">Source code</a>.</p></footer></body></html>";
 
 pub(super) fn page(body: &str) -> String {
     let mut html = String::with_capacity(HEAD.len() + body.len() + FOOT.len());
@@ -475,4 +556,76 @@ pub(super) fn page(body: &str) -> String {
     html.push_str(body);
     html.push_str(FOOT);
     html
+}
+
+#[cfg(test)]
+pub(super) fn preview(name: &str, html: &str) {
+    if let Ok(dir) = std::env::var("UI_PREVIEW_DIR") {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(format!("{dir}/{name}"), html);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TokenRow, VehicleRow, login_markup, preview, render_status};
+
+    #[test]
+    fn login_form_posts_the_password() {
+        let html = login_markup("csrf-token", Some("Incorrect password"));
+        assert!(html.contains("action=\"/\""));
+        assert!(html.contains("name=\"password\""));
+        assert!(html.contains("name=\"csrf\" value=\"csrf-token\""));
+        assert!(html.contains("Incorrect password"));
+        assert!(html.contains("role=\"alert\""));
+        preview("login.html", &html);
+    }
+    use crate::owner_stream::StreamBoard;
+
+    #[tokio::test]
+    async fn dashboard_keeps_actions_and_shows_stream_chips() {
+        let board = StreamBoard::default();
+        board.set_mode(true, true).await;
+        board.set_vehicle(7, "connected", None).await;
+        let snapshot = board.snapshot().await;
+        let vehicles = [VehicleRow {
+            id: 7,
+            vin: "5YJ3E1EA7KF000001".to_owned(),
+            name: Some("Red".to_owned()),
+            activity: Some("driving".to_owned()),
+            battery_level: Some(72.4),
+            last_poll_at: None,
+            last_error: None,
+        }];
+        let tokens = [TokenRow {
+            id: 3,
+            name: "home".to_owned(),
+            revoked_at: None,
+        }];
+        let html = render_status(
+            "csrf-token",
+            true,
+            &vehicles,
+            &tokens,
+            Some("tl_secret"),
+            Some("poll failed"),
+            &snapshot,
+        );
+        assert!(html.contains("action=\"/logout\""));
+        assert!(html.contains("action=\"/auth/disconnect\""));
+        assert!(html.contains("href=\"/auth/owner\""));
+        assert!(html.contains("action=\"/tokens\""));
+        assert!(html.contains("action=\"/tokens/3/revoke\""));
+        assert!(html.contains("name=\"csrf\" value=\"csrf-token\""));
+        assert!(html.contains("Stream connected"));
+        assert!(html.contains("class=\"chip ok\""));
+        assert!(html.contains("72%"));
+        assert!(html.contains("Red"));
+        assert!(html.contains("tl_secret"));
+        assert!(html.contains("role=\"alert\""));
+        assert!(html.contains("poll failed"));
+        assert!(html.contains("viewport"));
+        assert!(!html.contains("void/callback"));
+        preview("dashboard.html", &html);
+    }
 }

@@ -6,9 +6,13 @@
 //! legacy interfaces. Tesla can remove them without notice. They are not a substitute for the
 //! Fleet API.
 //!
+//! Sign-in uses the public `ownerapi` client. The registered redirect is
+//! `tesla://auth/callback` for both `auth.tesla.com` and `auth.tesla.cn`. Token
+//! requests are `application/x-www-form-urlencoded`.
+//!
 //! Token material is held in [`secrecy::SecretString`]. [`Debug`] redacts access tokens, refresh
 //! tokens, authorization codes, and PKCE verifiers. The HTTP client does not log headers or
-//! bodies. Redirects are disabled.
+//! bodies. Redirects are disabled. The client speaks HTTP/2 with rustls.
 //!
 //! The subscribe frame returned by [`subscribe_frame`] contains the access token. Do not log it.
 //!

@@ -150,7 +150,7 @@ pub(super) async fn refresh(
         return message(
             &app,
             &headers,
-            "Paste an Owner API refresh token, or use the Tesla sign-in URL instead.",
+            "Paste an Owner API refresh token. A tesla:// callback belongs in Redirect URL.",
             None,
         )
         .await;
@@ -232,43 +232,100 @@ async fn render(app: &AppState, csrf: &str, error: Option<&str>, notice: Option<
     let link = pending.and_then(|(login, created)| {
         (created.elapsed() <= PENDING_TTL).then(|| login.authorize_url().to_string())
     });
-    let error = error
-        .map(|text| format!("<p class=\"err\">{}</p>", ui::escape(text)))
+    owner_markup(&OwnerView {
+        csrf,
+        error,
+        notice,
+        stream_status: snapshot.summary(),
+        token_stored: configured,
+        streaming_enabled: app.inner.config.owner_stream_enabled,
+        authorize_url: link.as_deref(),
+    })
+}
+
+struct OwnerView<'a> {
+    csrf: &'a str,
+    error: Option<&'a str>,
+    notice: Option<&'a str>,
+    stream_status: &'a str,
+    token_stored: bool,
+    streaming_enabled: bool,
+    authorize_url: Option<&'a str>,
+}
+
+fn owner_markup(view: &OwnerView<'_>) -> String {
+    let error = view
+        .error
+        .map(|text| ui::banner("bad", text))
         .unwrap_or_default();
-    let notice = notice
-        .map(|text| format!("<p>{}</p>", ui::escape(text)))
+    let notice = view
+        .notice
+        .map(|text| ui::banner("note", text))
         .unwrap_or_default();
-    let authorize = link.map_or_else(
-        || {
-            "<p>Prepare a sign-in, open it, then paste the redirect URL Tesla shows.</p>".to_owned()
-        },
+    let stream_tone = match view.stream_status {
+        "connected" => "ok",
+        "error" => "bad",
+        _ => "neutral",
+    };
+    let stream = ui::chip(&format!("Stream {}", view.stream_status), stream_tone);
+    let stored = if view.token_stored {
+        ui::chip("Owner token stored", "ok")
+    } else {
+        ui::chip("No owner token", "neutral")
+    };
+    let config_note = if view.streaming_enabled {
+        String::new()
+    } else {
+        ui::banner(
+            "note",
+            "Streaming is off because OWNER_STREAM_ENABLED is false. Tokens can still be saved.",
+        )
+    };
+    let authorize = view.authorize_url.map_or_else(
+        || "<p class=\"muted\">Prepare a sign-in to get the Tesla link.</p>".to_owned(),
         |url| {
             format!(
-                "<p><a href=\"{}\" rel=\"noreferrer\">Open the Tesla sign-in</a>. After Tesla redirects you, copy the full URL from the address bar. It starts with <code>https://auth.tesla.com/void/callback</code> (or <code>auth.tesla.cn</code> for a China account).</p>",
-                ui::escape(&url)
+                "<p class=\"stack\"><a class=\"button\" href=\"{}\" rel=\"noreferrer noopener\" target=\"_blank\">{}Open the Tesla sign-in</a></p>",
+                ui::escape(url),
+                ui::icon(ui::ICON_KEY)
             )
         },
     );
-    let enabled = if app.inner.config.owner_stream_enabled {
-        "Streaming is enabled."
-    } else {
-        "Streaming is off because OWNER_STREAM_ENABLED is false. Tokens can still be saved."
-    };
-    let stored = if configured { "yes" } else { "no" };
+    let csrf = view.csrf;
     ui::page(&format!(
-        "<h1>Owner API streaming</h1>{error}{notice}\
+        "<header class=\"toolbar\"><div><p class=\"kicker\"><a href=\"/\">tesla-logger</a></p>\
+         <h1 class=\"title\">{}Owner API streaming</h1></div>\
+         <a class=\"button ghost\" href=\"/\">{}Back</a></header>\
+         {error}{notice}\
          <p>This uses Tesla's legacy Owner API and streaming socket. They are unofficial and Tesla may shut them down. Fleet API polling stays the source for everything else. The stream adds about one position per second while driving.</p>\
-         <p>Status: {}. Owner token stored: {stored}. {enabled}</p>\
-         <p>Sign in here instead of pasting TeslaMate's refresh token. Tesla rotates refresh tokens, so reusing TeslaMate's token can sign TeslaMate out.</p>\
-         <form method=\"post\" action=\"/auth/owner/start\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button type=\"submit\">Prepare Tesla sign-in</button></form>\
+         <div class=\"meta\">{stream}{stored}</div>{config_note}\
+         <section class=\"card\"><h2>Sign in with Tesla</h2>\
+         <ol class=\"steps\">\
+         <li>Choose <strong>Prepare Tesla sign-in</strong>.</li>\
+         <li>Open the Tesla link and sign in with the account that owns the car. The link opens in a new tab so this page stays here.</li>\
+         <li>The browser cannot open <code>tesla://</code>. It may say the address is not understood, the site cannot be reached, or offer to open the Tesla app. Do not open the Tesla app.</li>\
+         <li>Copy the full URL from the address bar. It starts with <code>tesla://auth/callback?</code>. If Chrome drops it, the Network tab in developer tools still lists the failed navigation.</li>\
+         <li>Paste that URL into <strong>Redirect URL</strong> and choose <strong>Save sign-in</strong>. The field is masked so the authorization code is not displayed.</li>\
+         </ol>\
+         <form class=\"stack\" method=\"post\" action=\"/auth/owner/start\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+         <button type=\"submit\">{}Prepare Tesla sign-in</button></form>\
          {authorize}\
-         <form method=\"post\" action=\"/auth/owner/callback\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
-         <p><label>Redirect URL <input type=\"password\" name=\"redirect_url\" autocomplete=\"off\" spellcheck=\"false\" maxlength=\"8000\" required></label> <button type=\"submit\">Save sign-in</button></p></form>\
-         <form method=\"post\" action=\"/auth/owner/refresh\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
-         <p><label>Owner API refresh token <input type=\"password\" name=\"refresh_token\" autocomplete=\"off\" spellcheck=\"false\" maxlength=\"8000\" required></label> <button type=\"submit\">Save refresh token</button></p></form>\
-         <form method=\"post\" action=\"/auth/owner/disconnect\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button type=\"submit\">Disconnect Owner API</button></form>\
-         <p><a href=\"/\">Back</a></p>",
-        snapshot.summary()
+         <form class=\"stack\" method=\"post\" action=\"/auth/owner/callback\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+         <label class=\"field\">Redirect URL <input type=\"password\" name=\"redirect_url\" autocomplete=\"off\" spellcheck=\"false\" maxlength=\"8000\" required></label>\
+         <button type=\"submit\">Save sign-in</button></form></section>\
+         <section class=\"card\"><h2>Refresh token</h2>\
+         <p>Paste a refresh token created for this logger. Do not reuse TeslaMate's refresh token. Tesla rotates refresh tokens, and using TeslaMate's token here can sign TeslaMate out.</p>\
+         <form class=\"stack\" method=\"post\" action=\"/auth/owner/refresh\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+         <label class=\"field\">Owner API refresh token <input type=\"password\" name=\"refresh_token\" autocomplete=\"off\" spellcheck=\"false\" maxlength=\"8000\" required></label>\
+         <button type=\"submit\">Save refresh token</button></form></section>\
+         <section class=\"card\"><h2>Disconnect</h2>\
+         <p class=\"muted\">Removes the stored Owner API token. Fleet API polling is unchanged.</p>\
+         <form method=\"post\" action=\"/auth/owner/disconnect\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+         <button class=\"danger\" type=\"submit\">{}Disconnect Owner API</button></form></section>",
+        ui::icon(ui::ICON_CAR),
+        ui::icon(ui::ICON_ARROW),
+        ui::icon(ui::ICON_KEY),
+        ui::icon(ui::ICON_UNLINK)
     ))
 }
 
@@ -335,4 +392,54 @@ async fn store_tokens(app: &AppState, tokens: &OwnerTokens) -> Result<(), crate:
         .owner_tokens
         .send_modify(|value| *value = value.wrapping_add(1));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OwnerView, owner_markup};
+
+    #[test]
+    fn sign_in_page_explains_the_custom_scheme_callback() {
+        let html = owner_markup(&OwnerView {
+            csrf: "csrf-token",
+            error: Some("Owner API sign-in failed"),
+            notice: None,
+            stream_status: "disabled",
+            token_stored: false,
+            streaming_enabled: true,
+            authorize_url: Some(
+                "https://auth.tesla.com/oauth2/v3/authorize?client_id=ownerapi&redirect_uri=tesla%3A%2F%2Fauth%2Fcallback",
+            ),
+        });
+        assert!(html.contains("tesla://auth/callback?"));
+        assert!(html.contains("Do not open the Tesla app"));
+        assert!(html.contains("Network tab"));
+        assert!(html.contains("Do not reuse TeslaMate's refresh token"));
+        assert!(!html.contains("void/callback"));
+        assert!(html.contains("action=\"/auth/owner/start\""));
+        assert!(html.contains("action=\"/auth/owner/callback\""));
+        assert!(html.contains("action=\"/auth/owner/refresh\""));
+        assert!(html.contains("action=\"/auth/owner/disconnect\""));
+        assert!(html.contains("name=\"redirect_url\""));
+        assert!(html.contains("name=\"refresh_token\""));
+        assert!(html.contains("name=\"csrf\" value=\"csrf-token\""));
+        assert!(html.contains("redirect_uri=tesla%3A%2F%2Fauth%2Fcallback"));
+        assert!(html.contains("&amp;redirect_uri="));
+        assert!(html.contains("role=\"alert\""));
+        assert!(!html.contains("OWNER_STREAM_ENABLED"));
+        super::super::ui::preview("owner.html", &html);
+
+        let off = owner_markup(&OwnerView {
+            csrf: "csrf-token",
+            error: None,
+            notice: None,
+            stream_status: "disabled",
+            token_stored: false,
+            streaming_enabled: false,
+            authorize_url: None,
+        });
+        assert!(off.contains("OWNER_STREAM_ENABLED"));
+        assert!(off.contains("Prepare a sign-in"));
+        super::super::ui::preview("owner-off.html", &off);
+    }
 }
