@@ -6,6 +6,7 @@ mod assets;
 mod markup;
 mod owner;
 pub(crate) mod stats;
+mod trips;
 mod ui;
 
 use axum::body::Body;
