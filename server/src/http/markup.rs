@@ -111,7 +111,7 @@ pub(super) fn login_page(csrf: &str, error: Option<&str>) -> String {
         false,
         html! {
             section class="card auth-card" {
-                p class="kicker" { "tesla-logger" }
+                p class="kicker" { (brand_mark()) "Tesla Logger" }
                 h1 { "Connexion" }
                 p class="muted" { "Mot de passe de ce logger. Ce n'est pas le compte Tesla." }
                 @if let Some(error) = error {
@@ -501,7 +501,7 @@ fn toolbar(chrome: &Chrome, title: &str) -> Markup {
     html! {
         header class="toolbar" {
             div {
-                p class="kicker" { a href="/" { "tesla-logger" } }
+                p class="kicker" { (brand_mark()) a href="/" { "Tesla Logger" } }
                 h1 { (title) }
                 @if chrome.vehicles.len() >= 2 {
                     nav class="vehicle-select" aria-label="Véhicule" {
@@ -616,6 +616,13 @@ fn stream_tone(status: &str) -> &'static str {
     }
 }
 
+/// App icon shown before the "Tesla Logger" label in page headers.
+fn brand_mark() -> Markup {
+    html! {
+        img class="brand-mark" src="/favicon-32.png" alt="" width="18" height="18";
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn document(wide: bool, debug_script: bool, body: Markup) -> String {
     let class = if wide { "shell wide" } else { "shell" };
@@ -626,7 +633,14 @@ fn document(wide: bool, debug_script: bool, body: Markup) -> String {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="robots" content="noindex";
-                title { "tesla-logger" }
+                meta name="theme-color" content="#2a2a2c";
+                link rel="icon" href="/favicon.ico" sizes="any";
+                link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32";
+                link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192";
+                link rel="icon" href="/icon-512.png" type="image/png" sizes="512x512";
+                link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180";
+                link rel="manifest" href="/site.webmanifest";
+                title { "Tesla Logger" }
                 link rel="stylesheet" href="/static/ui.css";
                 script src="/static/tabs.js" defer {}
                 @if debug_script {
@@ -654,6 +668,28 @@ mod tests {
         Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview, Party, VehicleTab,
         connection_page, fleet_page, login_page, overview_page,
     };
+
+    #[test]
+    fn pages_link_same_origin_icons_and_show_the_mark_by_the_title() {
+        let html = login_page("csrf-token", None);
+        let head = html.split("</head>").next().expect("head");
+        for href in [
+            "/favicon.ico",
+            "/favicon-32.png",
+            "/apple-touch-icon.png",
+            "/icon-192.png",
+            "/icon-512.png",
+            "/site.webmanifest",
+        ] {
+            assert!(head.contains(href), "{href} missing from {head}");
+        }
+        assert!(head.contains("<title>Tesla Logger</title>"));
+        assert!(head.contains("name=\"theme-color\" content=\"#2a2a2c\""));
+        assert!(!head.contains("://"));
+        assert!(
+            html.contains("<p class=\"kicker\"><img class=\"brand-mark\" src=\"/favicon-32.png\"")
+        );
+    }
 
     fn preview(name: &str, html: &str) {
         if let Ok(dir) = std::env::var("UI_PREVIEW_DIR") {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 pub(crate) mod api;
+mod assets;
 mod markup;
 mod owner;
 pub(crate) mod stats;
@@ -47,6 +48,7 @@ pub(crate) fn router(state: AppState) -> Router {
             get(public_key),
         )
         .route("/api/openapi.yaml", get(openapi))
+        .merge(assets::routes())
         .merge(ui::routes())
         .merge(api)
         .layer(from_fn_with_state(state.clone(), security_headers))
@@ -129,7 +131,7 @@ async fn security_headers(
     if private_page(&path) && !headers.contains_key(header::CACHE_CONTROL) {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
-    if path != "/healthz" && !path.ends_with("public-key.pem") {
+    if path != "/healthz" && !path.ends_with("public-key.pem") && !assets::is_static(&path) {
         tracing::info!(%method, %path, status = %response.status(), "request");
     }
     response
@@ -152,6 +154,7 @@ fn private_page(path: &str) -> bool {
         && path != "/healthz"
         && path != "/api/openapi.yaml"
         && !path.starts_with("/.well-known/")
+        && !assets::is_static(path)
 }
 
 async fn require_bearer(
