@@ -15,8 +15,7 @@ use tesla_auth::{CallbackParams, TokenStore};
 use super::markup::{
     AccessLine, AuditLine, Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview,
     Party, SessionLine, SettingRow, TokenLine, VehicleTab, connection_page, debug_page, fleet_page,
-    login_page, missing_page, overview_page, placeholder_page, security_page, settings_page,
-    setup_page, system_page,
+    login_page, missing_page, overview_page, security_page, settings_page, setup_page, system_page,
 };
 use super::{cookie, ui_session};
 use crate::accounts::{self, TokenPublic};
@@ -42,6 +41,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/v/{id}/connection", get(vehicle_connection))
         .route("/connection", get(account_connection))
         .route("/settings", get(settings))
+        .route("/settings/override", post(save_setting))
         .route("/debug", get(debug_page_handler))
         .route("/system", get(system))
         .route("/security", get(security))
@@ -229,32 +229,13 @@ fn fmt_lag(at: Option<DateTime<Utc>>) -> String {
     }
 }
 
-async fn stats(State(app): State<AppState>, headers: HeaderMap, Path(id): Path<i64>) -> Response {
-    placeholder(
-        &app,
-        &headers,
-        id,
-        Placeholder {
-            tab: VehicleTab::Stats,
-            title: "Stats",
-            text: "Les graphiques réutiliseront les séries déjà servies par l'API.",
-            link_label: "Aperçu du véhicule",
-            link_href: format!("/v/{id}"),
-        },
-    )
-    .await
-}
-
-struct Placeholder {
-    tab: VehicleTab,
-    title: &'static str,
-    text: &'static str,
-    link_label: &'static str,
-    link_href: String,
-}
-
-async fn placeholder(app: &AppState, headers: &HeaderMap, id: i64, copy: Placeholder) -> Response {
-    let Some(page) = signed_page(app, headers).await else {
+async fn stats(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(query): Query<StatsQuery>,
+) -> Response {
+    let Some(page) = signed_page(&app, &headers).await else {
         return Redirect::to("/").into_response();
     };
     if !page.vehicles.iter().any(|vehicle| vehicle.id == id) {
@@ -263,16 +244,28 @@ async fn placeholder(app: &AppState, headers: &HeaderMap, id: i64, copy: Placeho
             page.cookie,
         );
     }
-    remember_vehicle(app, &page.session_id, id).await;
+    remember_vehicle(&app, &page.session_id, id).await;
+    let period = query.period.as_deref().unwrap_or("month");
+    let count = i32::try_from(query.count.unwrap_or(6)).unwrap_or(6);
+    let view = chrome(
+        &page,
+        Some(id),
+        Some(VehicleTab::Stats),
+        GlobalTab::None,
+        false,
+    );
     html_page(
-        placeholder_page(
-            &chrome(&page, Some(id), Some(copy.tab), GlobalTab::None, false),
-            copy.title,
-            copy.text,
-            Some((copy.link_label, copy.link_href.as_str())),
-        ),
+        super::stats::console_page(&app, &view, id, period, count).await,
         page.cookie,
     )
+}
+
+#[derive(Deserialize)]
+struct StatsQuery {
+    #[serde(default)]
+    period: Option<String>,
+    #[serde(default)]
+    count: Option<i64>,
 }
 
 async fn vehicle_connection(
@@ -652,13 +645,72 @@ async fn settings(State(app): State<AppState>, headers: HeaderMap) -> Response {
             source: row.source,
         })
         .collect::<Vec<_>>();
-    html_page(
-        settings_page(
-            &chrome(&page, None, None, GlobalTab::Settings, false),
-            &rows,
-        ),
-        page.cookie,
-    )
+    let mut body = settings_page(
+        &chrome(&page, None, None, GlobalTab::Settings, false),
+        &rows,
+    );
+    if page.admin {
+        let form = maud::html! {
+            section class="card" {
+                h2 { "Remplacer un réglage" }
+                p class="muted" { "La valeur est appliquée tout de suite. Un champ vide revient à l'environnement. Les secrets restent dans l'environnement." }
+                form class="stack" method="post" action="/settings/override" {
+                    input type="hidden" name="csrf" value=(&page.csrf);
+                    label class="field" for="setting-key" {
+                        "Clé"
+                        select id="setting-key" name="key" {
+                            @for key in crate::settings::KEYS {
+                                option value=(key) { (key) }
+                            }
+                        }
+                    }
+                    label class="field" for="setting-value" { "Valeur" input id="setting-value" name="value"; }
+                    label class="field" for="setting-vehicle" { "Véhicule, vide pour tous" input id="setting-vehicle" name="vehicle_id"; }
+                    button type="submit" { "Enregistrer" }
+                }
+            }
+        };
+        let extra = form.into_string();
+        body = body.replacen("</main>", &(extra + "</main>"), 1);
+    }
+    html_page(body, page.cookie)
+}
+
+#[derive(Deserialize)]
+struct SettingForm {
+    csrf: String,
+    key: String,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    vehicle_id: String,
+}
+
+async fn save_setting(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<SettingForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) || !principal.is_admin() || !principal.sudo_active() {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
+    }
+    let vehicle = form.vehicle_id.trim().parse::<i64>().ok();
+    if let Err(err) = crate::settings::set(&app.inner.db, vehicle, &form.key, &form.value).await {
+        tracing::warn!(error = %err, "setting was not stored");
+    } else {
+        crate::identity::audit(
+            &app.inner.db,
+            Some(principal.user_id),
+            "settings.change",
+            "ok",
+            &serde_json::json!({ "key": form.key }).to_string(),
+        )
+        .await;
+    }
+    Redirect::to("/settings").into_response()
 }
 
 async fn system(State(app): State<AppState>, headers: HeaderMap) -> Response {

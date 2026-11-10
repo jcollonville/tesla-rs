@@ -268,6 +268,7 @@ pub(super) fn overview_page(chrome: &Chrome, overview: &Overview) -> String {
     document(chrome.debug_script, body)
 }
 
+#[allow(dead_code)]
 pub(super) fn placeholder_page(
     chrome: &Chrome,
     title: &str,

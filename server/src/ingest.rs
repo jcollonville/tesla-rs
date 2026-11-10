@@ -41,7 +41,7 @@ const LIVE_ENDPOINTS: &[VehicleDataEndpoint] = &[
 ];
 
 /// How often to call the Fleet API. Live reads happen only while the car is already online.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct PollPolicy {
     pub drive: Duration,
     pub charge: Duration,
@@ -670,6 +670,19 @@ pub(crate) async fn run_poll<T: AccessTokenProvider>(
         if *shutdown.borrow() {
             break;
         }
+        let mut policy = policy;
+        policy.drive = crate::settings::secs_or(&archive.db, "POLL_DRIVE_SECS", policy.drive).await;
+        policy.charge =
+            crate::settings::secs_or(&archive.db, "POLL_CHARGE_SECS", policy.charge).await;
+        policy.parked =
+            crate::settings::secs_or(&archive.db, "POLL_PARKED_SECS", policy.parked).await;
+        policy.asleep =
+            crate::settings::secs_or(&archive.db, "POLL_ASLEEP_SECS", policy.asleep).await;
+        policy.backoff =
+            crate::settings::secs_or(&archive.db, "POLL_BACKOFF_SECS", policy.backoff).await;
+        policy.gps_fallback =
+            crate::settings::secs_or(&archive.db, "POLL_GPS_FALLBACK_SECS", policy.gps_fallback)
+                .await;
         let control = run_cycle(source, &archive, &policy, account_id).await;
         let wait = match control {
             Ok(CycleControl::Wait(wait) | CycleControl::Pause(wait)) => wait,
