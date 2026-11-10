@@ -30,6 +30,10 @@ pub(crate) struct Runtime {
     pub open_charge_id: Option<i64>,
     pub parked_live_polls: u32,
     pub last_telemetry: Option<tokio::time::Instant>,
+    /// Last merged status published to MQTT and the websocket.
+    pub published: Option<Observation>,
+    /// Time of the last Fleet poll. Stream frames keep this instead of their own timestamp.
+    pub last_poll_at: Option<DateTime<Utc>>,
     pub efficiency_kwh_per_km: Option<f64>,
     pub distance_unit: Option<String>,
     pub name: Option<String>,
@@ -44,62 +48,118 @@ pub(crate) struct LiveEvent {
     pub kind: &'static str,
     pub vehicle_id: i64,
     pub vin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub activity: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub battery_level: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rated_range_km: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub odometer_km: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub speed_kmh: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub power_kw: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub charger_power_kw: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub inside_temp_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub outside_temp_c: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub latitude: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub longitude: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub usable_battery_level: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ideal_range_km: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub est_range_km: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub heading_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub climate_on: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub locked: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sentry_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub charging_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub charge_energy_added_kwh: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub charge_limit_soc: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub shift_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_dc: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub software_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub update_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_poll_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_data_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub charger_voltage: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub charger_current: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub charge_current_request: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub charge_port_door_open: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub charge_port_latch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub plugged_in: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub time_to_full_charge_h: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scheduled_charging_start_time: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tpms_pressure_fl: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tpms_pressure_fr: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tpms_pressure_rl: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tpms_pressure_rr: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub df: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dr: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pf: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pr: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fd_window: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fp_window: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rd_window: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rp_window: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ft: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rt: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_user_present: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub elevation_m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub battery_heater_on: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_preconditioning: Option<bool>,
     pub at: DateTime<Utc>,
 }
@@ -259,6 +319,8 @@ pub(crate) async fn load_runtime(
         open_charge_id: row.charge_id,
         parked_live_polls: 0,
         last_telemetry: None,
+        published: None,
+        last_poll_at: None,
         efficiency_kwh_per_km: row.efficiency_kwh_per_km,
         distance_unit: row.distance_unit,
         name: row.name,
@@ -307,6 +369,7 @@ pub(crate) async fn apply_observation(
     geocoder: &Geocoder,
     events: &broadcast::Sender<LiveEvent>,
     live: bool,
+    store_position: bool,
 ) -> Result<(), AppError> {
     let previous = runtime.tracker.clone();
     let (next, transitions) = crate::state::reduce(&previous, obs);
@@ -341,7 +404,7 @@ pub(crate) async fn apply_observation(
     } else {
         None
     };
-    if live && obs.has_sample() {
+    if live && store_position && obs.has_sample() {
         insert_position(
             &mut tx,
             runtime.vehicle_id,
@@ -420,7 +483,13 @@ pub(crate) async fn apply_observation(
             tracing::warn!(error = %err, "reverse geocode failed");
         }
     }
-    let _ = events.send(live_event(runtime, obs));
+    runtime.last_poll_at = Some(obs.at);
+    if live {
+        let merged = crate::status::merge_poll(runtime.published.as_ref(), obs);
+        runtime.published = Some(merged);
+    }
+    let event_obs = runtime.published.clone().unwrap_or_else(|| obs.clone());
+    let _ = events.send(live_event(runtime, &event_obs));
     Ok(())
 }
 
@@ -474,6 +543,7 @@ pub(crate) async fn apply_stream_sample(
     }
 
     let obs = observation_from_stream(sample);
+    let merged = crate::status::merge_stream(runtime.published.as_ref(), &obs);
     let mut tx = pool.begin().await?;
     let fences = load_fences(&mut tx).await?;
     let fence_id = obs
@@ -549,12 +619,13 @@ pub(crate) async fn apply_stream_sample(
     runtime.tracker.drive_open = drive_open;
     runtime.tracker.charge_open = charge_open;
     runtime.tracker.activity = decision.activity;
+    runtime.published = Some(merged.clone());
     for job in address_jobs {
         if let Err(err) = attach_address(pool, geocoder, &job).await {
             tracing::warn!(error = %err, "reverse geocode failed");
         }
     }
-    let _ = events.send(live_event(runtime, &obs));
+    let _ = events.send(live_event(runtime, &merged));
     Ok(())
 }
 
@@ -1340,7 +1411,7 @@ async fn lookup_or_geocode(
 }
 
 fn live_event(runtime: &Runtime, obs: &Observation) -> LiveEvent {
-    LiveEvent::from_observation(
+    let mut event = LiveEvent::from_observation(
         runtime.vehicle_id,
         runtime.vin.clone(),
         runtime.name.clone(),
@@ -1348,7 +1419,9 @@ fn live_event(runtime: &Runtime, obs: &Observation) -> LiveEvent {
         runtime.tracker.activity.as_str(),
         obs,
         obs.at,
-    )
+    );
+    event.last_poll_at = runtime.last_poll_at;
+    event
 }
 
 fn clip_error(text: &str) -> String {
@@ -1430,4 +1503,81 @@ impl ChargeSampleRow {
 
 pub(crate) fn resting_observation(at: DateTime<Utc>, presence: Presence) -> Observation {
     Observation::at(at, presence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LiveEvent;
+    use crate::state::{Observation, Presence};
+    use crate::status::{at_secs, merge_stream};
+
+    fn frame(
+        obs: &Observation,
+        last_poll_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> serde_json::Value {
+        let mut event = LiveEvent::from_observation(
+            1,
+            "vehicle".to_owned(),
+            None,
+            None,
+            "driving",
+            obs,
+            obs.at,
+        );
+        event.last_poll_at = last_poll_at;
+        serde_json::to_value(&event).expect("event json")
+    }
+
+    fn polled() -> Observation {
+        let mut obs = Observation::at(at_secs(0), Presence::Online);
+        obs.inside_temp_c = Some(21.5);
+        obs.outside_temp_c = Some(9.0);
+        obs.charge_energy_added_kwh = Some(3.5);
+        obs.charge_limit_soc = Some(80.0);
+        obs.charging_state = Some("Disconnected".to_owned());
+        obs.plugged_in = Some(false);
+        obs.latitude = Some(48.1);
+        obs.longitude = Some(2.2);
+        obs
+    }
+
+    fn streamed() -> Observation {
+        let mut obs = Observation::at(at_secs(5), Presence::Online);
+        obs.latitude = Some(48.2);
+        obs.longitude = Some(2.3);
+        obs.speed_kmh = Some(42.0);
+        obs.power_kw = Some(11.0);
+        obs.odometer_km = Some(100.4);
+        obs.shift_state = Some("D".to_owned());
+        obs
+    }
+
+    #[test]
+    fn stream_frame_keeps_polled_temps_and_does_not_emit_null() {
+        let poll = polled();
+        let merged = merge_stream(Some(&poll), &streamed());
+        let value = frame(&merged, Some(poll.at));
+        let text = value.to_string();
+        assert_eq!(value["inside_temp_c"], 21.5);
+        assert_eq!(value["outside_temp_c"], 9.0);
+        assert_eq!(value["charge_energy_added_kwh"], 3.5);
+        assert_eq!(value["charge_limit_soc"], 80.0);
+        assert_eq!(value["charging_state"], "Disconnected");
+        assert_eq!(value["plugged_in"], false);
+        assert_eq!(value["latitude"], 48.2);
+        assert_eq!(value["speed_kmh"], 42.0);
+        assert!(value.get("charger_voltage").is_none(), "{text}");
+        assert!(!text.contains("null"), "{text}");
+        assert!(!text.contains("5YJ"), "{text}");
+    }
+
+    #[test]
+    fn stream_frame_without_a_poll_omits_temperature() {
+        let value = frame(&streamed(), None);
+        let text = value.to_string();
+        assert!(value.get("inside_temp_c").is_none(), "{text}");
+        assert!(value.get("outside_temp_c").is_none(), "{text}");
+        assert!(!text.contains("null"), "{text}");
+        assert_eq!(value["speed_kmh"], 42.0);
+    }
 }

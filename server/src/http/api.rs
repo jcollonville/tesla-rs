@@ -76,6 +76,7 @@ pub(crate) async fn vehicle_state(
     let (status, error) = snapshot.for_vehicle(id);
     row.stream_status = status;
     row.stream_error = error;
+    row.position_mode = app.inner.archive.gps.mode_name(id).await;
     Ok(Json(row))
 }
 
@@ -307,7 +308,8 @@ pub(crate) async fn ws(
     let events = app.inner.events.subscribe();
     let db = app.inner.db.clone();
     let board = app.inner.stream_board.clone();
-    upgrade.on_upgrade(move |socket| handle_socket(socket, db, events, board))
+    let gps = app.inner.archive.gps.clone();
+    upgrade.on_upgrade(move |socket| handle_socket(socket, db, events, board, gps))
 }
 
 async fn handle_socket(
@@ -315,6 +317,7 @@ async fn handle_socket(
     db: sqlx::PgPool,
     mut events: tokio::sync::broadcast::Receiver<crate::persist::LiveEvent>,
     board: crate::owner_stream::StreamBoard,
+    gps: crate::position_mode::GpsBoard,
 ) {
     let snapshot = format!(
         "SELECT v.vin, v.name, v.model, v.id AS vehicle_id,
@@ -333,6 +336,7 @@ async fn handle_socket(
             let (status, error) = snapshot.for_vehicle(row.state.vehicle_id);
             row.state.stream_status = status;
             row.state.stream_error = error;
+            row.state.position_mode = gps.mode_name(row.state.vehicle_id).await;
             let payload = serde_json::json!({
                 "type": "state",
                 "vin": row.vin,
@@ -380,10 +384,15 @@ async fn handle_socket(
                         };
                         let snapshot = board.snapshot().await;
                         let (status, error) = snapshot.for_vehicle(event.vehicle_id);
+                        let position_mode = gps.mode_name(event.vehicle_id).await;
                         if let Some(object) = value.as_object_mut() {
                             object.insert(
                                 "stream_status".to_owned(),
                                 serde_json::Value::String(status),
+                            );
+                            object.insert(
+                                "position_mode".to_owned(),
+                                serde_json::Value::String(position_mode),
                             );
                             object.insert(
                                 "stream_error".to_owned(),
@@ -645,10 +654,18 @@ pub(crate) struct StateJson {
     /// Short error class when [`Self::stream_status`] is `error`. Never a token.
     #[sqlx(default)]
     pub stream_error: Option<String>,
+    /// `hybrid` when the Owner stream is writing drive GPS, otherwise `fallback`.
+    #[sqlx(default)]
+    #[serde(default = "default_position_mode")]
+    pub position_mode: String,
 }
 
 fn default_stream_status() -> String {
     "disabled".to_owned()
+}
+
+fn default_position_mode() -> String {
+    "fallback".to_owned()
 }
 
 impl StateJson {
@@ -712,6 +729,7 @@ impl StateJson {
             is_preconditioning: None,
             stream_status: default_stream_status(),
             stream_error: None,
+            position_mode: default_position_mode(),
         }
     }
 }

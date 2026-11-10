@@ -108,6 +108,7 @@ struct OwnerSlot {
     reconnects: u64,
     last_frame_at: Option<DateTime<Utc>>,
     last_update_at: Option<DateTime<Utc>>,
+    position_mode: String,
     hello_ping: u64,
     updates: u64,
     errors: u64,
@@ -165,6 +166,7 @@ impl OwnerSlot {
             reconnects: 0,
             last_frame_at: None,
             last_update_at: None,
+            position_mode: "fallback".to_owned(),
             hello_ping: 0,
             updates: 0,
             errors: 0,
@@ -277,6 +279,21 @@ impl DebugBoard {
             if clear {
                 guard.owner.vehicles.clear();
             }
+        }
+        self.notify();
+    }
+
+    /// `hybrid` or `fallback`. The label is a fixed word, never a VIN.
+    pub(crate) fn set_position_mode(&self, db_id: i64, mode: &str) {
+        {
+            let mut guard = self.lock();
+            let Some(slot) = guard.owner.vehicles.get_mut(&db_id) else {
+                return;
+            };
+            if slot.position_mode == mode {
+                return;
+            }
+            mode.clone_into(&mut slot.position_mode);
         }
         self.notify();
     }
@@ -813,6 +830,7 @@ fn render_owner(guard: &DebugState, now: DateTime<Utc>) -> String {
                 ("Reconnects", slot.reconnects.to_string()),
                 ("Last frame", fmt_ago(slot.last_frame_at, now)),
                 ("Last data:update", fmt_ago(slot.last_update_at, now)),
+                ("Position mode", slot.position_mode.clone()),
                 ("Counts", counts),
                 (
                     "Last close",

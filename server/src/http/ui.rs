@@ -134,7 +134,8 @@ async fn status(State(app): State<AppState>, headers: HeaderMap) -> Response {
         None
     };
     let global = app.global_error().await;
-    let streaming = app.inner.stream_board.snapshot().await;
+    let mut streaming = app.inner.stream_board.snapshot().await;
+    streaming.modes = app.inner.archive.gps.modes().await;
     let body = render_status(
         &csrf.0,
         logged_in,
@@ -539,6 +540,7 @@ fn vehicle_card(vehicle: &VehicleRow, streaming: &crate::owner_stream::StreamSna
          <div><dt>Last poll</dt><dd>{}</dd></div>\
          <div><dt>Error</dt><dd>{}</dd></div>\
          <div><dt>Stream</dt><dd>{}</dd></div>\
+         <div><dt>GPS</dt><dd>{}</dd></div>\
          </dl></article>",
         escape(vehicle.name.as_deref().unwrap_or(vehicle.vin.as_str())),
         chip(&status, tone_for_stream(&status)),
@@ -547,7 +549,8 @@ fn vehicle_card(vehicle: &VehicleRow, streaming: &crate::owner_stream::StreamSna
         fmt_battery(vehicle.battery_level),
         fmt_time(vehicle.last_poll_at),
         escape(vehicle.last_error.as_deref().unwrap_or("—")),
-        escape(&detail)
+        escape(&detail),
+        escape(streaming.position_mode(vehicle.id))
     )
 }
 

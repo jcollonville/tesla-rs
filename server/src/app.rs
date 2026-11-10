@@ -10,7 +10,7 @@ use sqlx::postgres::PgPoolOptions;
 use tesla_auth::{AuthClient, ClientConfig, PendingAuthorization, Scope, Session};
 use tesla_owner_api::OwnerLogin;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, Notify, broadcast, watch};
 
 use crate::config::Config;
 use crate::crypto::{SharedTokenStore, TokenFile, read_public_key};
@@ -169,6 +169,7 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
     let (owner_tokens, _) = watch::channel(0_u64);
     let debug = DebugBoard::new(logs.clone());
     debug.apply_config(&config);
+    let gps = crate::position_mode::GpsBoard::new(debug.clone(), Arc::new(Notify::new()));
     let debug_saved = debug.clone();
     store.on_saved(std::sync::Arc::new(move |expires| {
         debug_saved.token_saved("fleet", expires);
@@ -180,6 +181,7 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
         events: events.clone(),
         runtimes: Arc::new(Mutex::new(HashMap::new())),
         stream_kick,
+        gps,
     });
     Ok(AppState {
         inner: Arc::new(Inner {
@@ -210,6 +212,7 @@ fn policy_from(config: &Config) -> PollPolicy {
         asleep: config.asleep_poll,
         backoff: config.backoff_poll,
         parked_live_limit: config.parked_live_limit,
+        gps_fallback: config.gps_fallback_poll,
     }
 }
 
@@ -311,6 +314,7 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
     logs.install_config(&config);
     let debug = DebugBoard::new(logs.clone());
     debug.apply_config(&config);
+    let gps = crate::position_mode::GpsBoard::new(debug.clone(), Arc::new(Notify::new()));
     let geocoder = Geocoder::disabled();
     let archive = Arc::new(Archive {
         db: pool.clone(),
@@ -318,6 +322,7 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
         events: events.clone(),
         runtimes: Arc::new(Mutex::new(HashMap::new())),
         stream_kick,
+        gps,
     });
     AppState {
         inner: Arc::new(Inner {
