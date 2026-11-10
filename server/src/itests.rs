@@ -13,8 +13,8 @@ use crate::app::test_state;
 use crate::crypto::sha256_hex;
 use crate::http::{OPENAPI, router};
 use crate::import::{POSITIONS_PAGE, POSITIONS_PAGE_SQL, import_pools};
-use crate::ingest::{Archive, apply_for_vin};
-use crate::persist::VehicleIdentity;
+use crate::ingest::{Archive, apply_for_vin, apply_stream_for_vin};
+use crate::persist::{StreamFix, VehicleIdentity};
 use crate::state::{Observation, Presence};
 use crate::test_util::TestDb;
 
@@ -480,6 +480,475 @@ async fn stream_points_follow_one_drive_and_yield_to_a_poll() {
     .unwrap();
     assert_eq!(closed.0, 1);
     assert!(closed.1.unwrap() > 0.0);
+}
+
+#[tokio::test]
+async fn short_drives_are_deleted_for_poll_and_stream() {
+    let Some(db) = TestDb::migrated("short").await else {
+        return;
+    };
+    let archive = test_archive(db.pool.clone());
+    let poll_vin = "5YJ3E1EA7KF000010";
+    let stream_vin = "5YJ3E1EA7KF000011";
+    let base = Utc.with_ymd_and_hms(2024, 7, 1, 8, 0, 0).unwrap();
+
+    // One stored position, then sleep. The closing sample is not a position.
+    apply_for_vin(
+        &archive,
+        poll_vin,
+        car(poll_vin),
+        shifted(base, "D", Some(100.0), 48.85, 2.35),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    let deleted_id = open_drive_id(&db.pool, poll_vin).await.expect("open drive");
+    apply_for_vin(
+        &archive,
+        poll_vin,
+        car(poll_vin),
+        Observation::at(base + chrono::Duration::minutes(5), Presence::Asleep),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed_drives(&db.pool, poll_vin).await.0, 0);
+    assert_eq!(detached_positions(&db.pool, poll_vin).await, 1);
+
+    let state = test_state(db.pool.clone()).await;
+    let token = "tl_short-drive";
+    sqlx::query("INSERT INTO api_tokens (name, token_hash) VALUES ('ha', $1)")
+        .bind(sha256_hex(token))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let poll_vehicle = vehicle_id(&db.pool, poll_vin).await;
+    let missing = router(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/drives/{deleted_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), axum::http::StatusCode::NOT_FOUND);
+    let stats = authed(
+        &state,
+        "GET",
+        &format!("/api/v1/stats?vehicle_id={poll_vehicle}"),
+        token,
+    )
+    .await;
+    let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+    assert_eq!(stats["drive_count"], 0);
+    assert_eq!(stats["distance_km"], 0.0);
+    let drives = authed(
+        &state,
+        "GET",
+        &format!("/api/v1/drives?vehicle_id={poll_vehicle}"),
+        token,
+    )
+    .await;
+    let drives: serde_json::Value = serde_json::from_str(&drives).unwrap();
+    assert_eq!(drives["total"], 0);
+    let last: Option<(i64,)> = sqlx::query_as(
+        "SELECT id FROM drives WHERE vehicle_id = $1 AND end_at IS NOT NULL
+         ORDER BY end_at DESC LIMIT 1",
+    )
+    .bind(poll_vehicle)
+    .fetch_optional(&db.pool)
+    .await
+    .unwrap();
+    assert!(last.is_none());
+
+    // Two positions, odometer unchanged, GPS far apart.
+    apply_for_vin(
+        &archive,
+        poll_vin,
+        car(poll_vin),
+        shifted(
+            base + chrono::Duration::minutes(10),
+            "D",
+            Some(200.0),
+            48.0,
+            2.0,
+        ),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    apply_for_vin(
+        &archive,
+        poll_vin,
+        car(poll_vin),
+        shifted(
+            base + chrono::Duration::minutes(20),
+            "P",
+            Some(200.0),
+            49.5,
+            3.5,
+        ),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed_drives(&db.pool, poll_vin).await.0, 0);
+
+    apply_for_vin(
+        &archive,
+        poll_vin,
+        car(poll_vin),
+        shifted(
+            base + chrono::Duration::minutes(30),
+            "D",
+            Some(300.0),
+            48.1,
+            2.1,
+        ),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    apply_for_vin(
+        &archive,
+        poll_vin,
+        car(poll_vin),
+        shifted(
+            base + chrono::Duration::minutes(40),
+            "P",
+            Some(300.009),
+            48.11,
+            2.11,
+        ),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed_drives(&db.pool, poll_vin).await.0, 0);
+
+    apply_for_vin(
+        &archive,
+        poll_vin,
+        car(poll_vin),
+        shifted(base + chrono::Duration::minutes(50), "D", None, 48.2, 2.2),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    apply_for_vin(
+        &archive,
+        poll_vin,
+        car(poll_vin),
+        shifted(base + chrono::Duration::minutes(60), "P", None, 48.4, 2.5),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed_drives(&db.pool, poll_vin).await.0, 0);
+
+    apply_for_vin(
+        &archive,
+        poll_vin,
+        car(poll_vin),
+        shifted(
+            base + chrono::Duration::minutes(70),
+            "D",
+            Some(400.0),
+            48.3,
+            2.3,
+        ),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    apply_for_vin(
+        &archive,
+        poll_vin,
+        car(poll_vin),
+        shifted(
+            base + chrono::Duration::minutes(80),
+            "P",
+            Some(400.01),
+            48.31,
+            2.31,
+        ),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    let (count, distance) = closed_drives(&db.pool, poll_vin).await;
+    assert_eq!(count, 1);
+    assert!((distance.unwrap() - 0.01).abs() < 1e-6);
+    let attached: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM positions p
+         JOIN drives d ON d.id = p.drive_id
+         JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE v.vin = $1",
+    )
+    .bind(poll_vin)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(attached.0, 2);
+    let kept_stats = authed(
+        &state,
+        "GET",
+        &format!("/api/v1/stats?vehicle_id={poll_vehicle}"),
+        token,
+    )
+    .await;
+    let kept_stats: serde_json::Value = serde_json::from_str(&kept_stats).unwrap();
+    assert_eq!(kept_stats["drive_count"], 1);
+
+    // Stream: one position (park frame has no coordinates), then 0 km, 0.009 km, 0.01 km.
+    let t0 = base + chrono::Duration::hours(3);
+    apply_stream_for_vin(
+        &archive,
+        stream_vin,
+        car(stream_vin),
+        &stream_fix(t0, Some("D"), Some(10.0), Some(48.0), Some(2.0)),
+    )
+    .await
+    .unwrap();
+    apply_stream_for_vin(
+        &archive,
+        stream_vin,
+        car(stream_vin),
+        &stream_fix(
+            t0 + chrono::Duration::seconds(5),
+            Some("P"),
+            Some(10.0),
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed_drives(&db.pool, stream_vin).await.0, 0);
+    assert_eq!(detached_positions(&db.pool, stream_vin).await, 1);
+
+    apply_stream_for_vin(
+        &archive,
+        stream_vin,
+        car(stream_vin),
+        &stream_fix(
+            t0 + chrono::Duration::seconds(20),
+            Some("D"),
+            Some(20.0),
+            Some(48.1),
+            Some(2.1),
+        ),
+    )
+    .await
+    .unwrap();
+    apply_stream_for_vin(
+        &archive,
+        stream_vin,
+        car(stream_vin),
+        &stream_fix(
+            t0 + chrono::Duration::seconds(40),
+            Some("P"),
+            Some(20.0),
+            Some(49.2),
+            Some(3.2),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed_drives(&db.pool, stream_vin).await.0, 0);
+
+    apply_stream_for_vin(
+        &archive,
+        stream_vin,
+        car(stream_vin),
+        &stream_fix(
+            t0 + chrono::Duration::seconds(60),
+            Some("D"),
+            Some(30.0),
+            Some(48.2),
+            Some(2.2),
+        ),
+    )
+    .await
+    .unwrap();
+    apply_stream_for_vin(
+        &archive,
+        stream_vin,
+        car(stream_vin),
+        &stream_fix(
+            t0 + chrono::Duration::seconds(80),
+            Some("P"),
+            Some(30.009),
+            Some(48.21),
+            Some(2.21),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed_drives(&db.pool, stream_vin).await.0, 0);
+
+    apply_stream_for_vin(
+        &archive,
+        stream_vin,
+        car(stream_vin),
+        &stream_fix(
+            t0 + chrono::Duration::seconds(100),
+            Some("D"),
+            Some(40.0),
+            Some(48.3),
+            Some(2.3),
+        ),
+    )
+    .await
+    .unwrap();
+    apply_stream_for_vin(
+        &archive,
+        stream_vin,
+        car(stream_vin),
+        &stream_fix(
+            t0 + chrono::Duration::seconds(120),
+            Some("P"),
+            Some(40.01),
+            Some(48.31),
+            Some(2.31),
+        ),
+    )
+    .await
+    .unwrap();
+    let (stream_count, stream_distance) = closed_drives(&db.pool, stream_vin).await;
+    assert_eq!(stream_count, 1);
+    assert!((stream_distance.unwrap() - 0.01).abs() < 1e-6);
+    let stream_vehicle = vehicle_id(&db.pool, stream_vin).await;
+    let stream_stats = authed(
+        &state,
+        "GET",
+        &format!("/api/v1/stats?vehicle_id={stream_vehicle}"),
+        token,
+    )
+    .await;
+    let stream_stats: serde_json::Value = serde_json::from_str(&stream_stats).unwrap();
+    assert_eq!(stream_stats["drive_count"], 1);
+}
+
+fn test_archive(pool: sqlx::PgPool) -> Archive {
+    let (events, _) = tokio::sync::broadcast::channel(8);
+    let (stream_kick, _) = tokio::sync::broadcast::channel(8);
+    Archive {
+        db: pool,
+        geocoder: crate::geocode::Geocoder::disabled(),
+        events,
+        runtimes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        stream_kick,
+    }
+}
+
+fn car(vin: &'static str) -> VehicleIdentity<'static> {
+    VehicleIdentity {
+        vin,
+        tesla_id: Some(11),
+        legacy_vehicle_id: Some(21),
+        name: Some("Red"),
+    }
+}
+
+fn shifted(
+    at: chrono::DateTime<Utc>,
+    shift: &str,
+    odometer_km: Option<f64>,
+    latitude: f64,
+    longitude: f64,
+) -> Observation {
+    let mut obs = Observation::at(at, Presence::Online);
+    obs.shift_state = Some(shift.to_owned());
+    obs.odometer_km = odometer_km;
+    obs.speed_kmh = Some(if shift == "P" { 0.0 } else { 30.0 });
+    obs.latitude = Some(latitude);
+    obs.longitude = Some(longitude);
+    obs.battery_level = Some(80.0);
+    obs
+}
+
+fn stream_fix(
+    at: chrono::DateTime<Utc>,
+    shift: Option<&str>,
+    odometer_km: Option<f64>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+) -> StreamFix {
+    StreamFix {
+        at,
+        shift_state: shift.map(str::to_owned),
+        speed_kmh: Some(if shift == Some("P") { 0.0 } else { 30.0 }),
+        power_kw: Some(10.0),
+        odometer_km,
+        battery_level: Some(80.0),
+        latitude,
+        longitude,
+        elevation_m: Some(30.0),
+        heading_deg: Some(90.0),
+        rated_range_km: Some(400.0),
+        est_range_km: Some(380.0),
+    }
+}
+
+async fn vehicle_id(pool: &sqlx::PgPool, vin: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT id FROM vehicles WHERE vin = $1")
+        .bind(vin)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
+async fn open_drive_id(pool: &sqlx::PgPool, vin: &str) -> Option<i64> {
+    sqlx::query_as(
+        "SELECT d.id FROM drives d
+         JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE v.vin = $1 AND d.end_at IS NULL",
+    )
+    .bind(vin)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+    .map(|(id,): (i64,)| id)
+}
+
+async fn closed_drives(pool: &sqlx::PgPool, vin: &str) -> (i64, Option<f64>) {
+    sqlx::query_as(
+        "SELECT COUNT(*)::bigint, MAX(d.distance_km)
+         FROM drives d
+         JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE v.vin = $1 AND d.end_at IS NOT NULL",
+    )
+    .bind(vin)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn detached_positions(pool: &sqlx::PgPool, vin: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM positions p
+         JOIN vehicles v ON v.id = p.vehicle_id
+         WHERE v.vin = $1 AND p.drive_id IS NULL",
+    )
+    .bind(vin)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
 }
 
 #[tokio::test]
