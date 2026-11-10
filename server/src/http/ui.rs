@@ -86,9 +86,11 @@ struct VehicleRow {
 }
 
 struct Page {
+    session_id: String,
     csrf: String,
     cookie: Option<HeaderValue>,
     vehicles: Vec<VehicleRow>,
+    remembered: Option<i64>,
 }
 
 async fn home(State(app): State<AppState>, headers: HeaderMap) -> Response {
@@ -147,6 +149,7 @@ async fn overview(
             page.cookie,
         );
     };
+    remember_vehicle(&app, &page.session_id, id).await;
     let mode = app.inner.archive.gps.mode_name(id).await;
     let (latest_sample, queue_depth) = app.inner.stream_board.snapshot().await.ingestion(id);
     let drive = last_drive(&app, id).await;
@@ -263,6 +266,7 @@ async fn placeholder(app: &AppState, headers: &HeaderMap, id: i64, copy: Placeho
             page.cookie,
         );
     }
+    remember_vehicle(app, &page.session_id, id).await;
     html_page(
         placeholder_page(
             &chrome(&page, Some(id), Some(copy.tab), GlobalTab::None, false),
@@ -343,6 +347,9 @@ pub(super) async fn render_connection(
     let authorize_url = pending.and_then(|(login, created)| {
         (created.elapsed() <= super::owner::PENDING_TTL).then(|| login.authorize_url().to_string())
     });
+    if let Some(id) = vehicle_id {
+        remember_vehicle(app, &page.session_id, id).await;
+    }
     let section = vehicle_id.map(|_| VehicleTab::Connection);
     let chrome = chrome(&page, vehicle_id, section, GlobalTab::None, false);
     let view = ConnectionView {
@@ -584,6 +591,7 @@ async fn login(
         id.clone(),
         crate::app::UiSession {
             expires: std::time::Instant::now() + session_ttl(),
+            last_vehicle: None,
         },
     );
     let mut response = Redirect::to("/").into_response();
@@ -851,7 +859,14 @@ pub(super) fn connection_location(vehicle_id: Option<i64>) -> String {
 }
 
 async fn signed_page(app: &AppState, headers: &HeaderMap) -> Option<Page> {
-    ui_session(app, headers).await?;
+    let session_id = ui_session(app, headers).await?;
+    let remembered = app
+        .inner
+        .ui_sessions
+        .lock()
+        .await
+        .get(&session_id)
+        .and_then(|session| session.last_vehicle);
     let csrf = ensure_csrf(app, headers).ok()?;
     let vehicles = match vehicle_rows(app).await {
         Ok(rows) => rows,
@@ -864,10 +879,18 @@ async fn signed_page(app: &AppState, headers: &HeaderMap) -> Option<Page> {
         }
     };
     Some(Page {
+        session_id,
         csrf: csrf.0,
         cookie: csrf.1,
         vehicles,
+        remembered,
     })
+}
+
+async fn remember_vehicle(app: &AppState, session_id: &str, id: i64) {
+    if let Some(session) = app.inner.ui_sessions.lock().await.get_mut(session_id) {
+        session.last_vehicle = Some(id);
+    }
 }
 
 fn chrome(
@@ -882,8 +905,8 @@ fn chrome(
         vehicles: nav_from(page, current),
         section,
         global,
-        wide: debug_script,
         debug_script,
+        remembered: page.remembered,
     }
 }
 
