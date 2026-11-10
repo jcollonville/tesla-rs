@@ -233,6 +233,7 @@ Optional:
 | `POLL_ASLEEP_SECS` | `300` | Poll interval while asleep |
 | `POLL_BACKOFF_SECS` | `720` | Poll interval after a backoff |
 | `POLL_PARKED_LIVE_LIMIT` | `2` | Live `vehicle_data` reads while parked |
+| `POLL_GPS_FALLBACK_SECS` | `300` | Drive GPS poll interval when the Owner stream is down or silent |
 | `NOMINATIM_ENABLED` | `true` | Reverse geocoding. The URL must be `https` when enabled |
 | `NOMINATIM_URL` | `https://nominatim.openstreetmap.org` | Nominatim base URL |
 | `NOMINATIM_CONTACT` | unset | Included in the User-Agent: `tesla-logger/0.1 (self-hosted; …)` |

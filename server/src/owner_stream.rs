@@ -6,8 +6,9 @@
 //! Fleet API polling stays the source for charge sessions, climate, and sleep.
 //! This task adds dense positions, speed, power, and shift state while the car
 //! is driving, and it opens a drive as soon as the stream reports a gear.
-//! The legacy streaming socket is unofficial. Failures back off and leave polling
-//! running.
+//! Published status merges those drive fields onto the last polled values.
+//! The legacy streaming socket is unofficial. Failures back off, switch GPS to
+//! fallback polling, and leave the normal `vehicle_data` cadence running.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,6 +58,8 @@ pub(crate) struct StreamSnapshot {
     enabled: bool,
     configured: bool,
     vehicles: HashMap<i64, (String, Option<String>)>,
+    /// `hybrid` or `fallback` per database id. Empty means fallback.
+    pub(crate) modes: HashMap<i64, String>,
 }
 
 impl StreamSnapshot {
@@ -69,6 +72,13 @@ impl StreamSnapshot {
             .get(&vehicle_id)
             .cloned()
             .unwrap_or_else(|| ("error".to_owned(), Some("connecting".to_owned())))
+    }
+
+    /// `hybrid` while the Owner stream is the drive GPS source, otherwise `fallback`.
+    pub(crate) fn position_mode(&self, vehicle_id: i64) -> &str {
+        self.modes
+            .get(&vehicle_id)
+            .map_or("fallback", String::as_str)
     }
 
     /// Page-level status. Per-vehicle state is on [`Self::for_vehicle`].
@@ -136,6 +146,7 @@ impl StreamBoard {
                 .iter()
                 .map(|(id, slot)| (*id, (slot.status.clone(), slot.detail.clone())))
                 .collect(),
+            modes: HashMap::new(),
         }
     }
 }
@@ -375,6 +386,8 @@ async fn supervise(
             .set_vehicle(target.db_id, "error", Some("connecting".to_owned()))
             .await;
         debug.set_owner_vehicle(target.db_id, target.stream_tag, "connecting");
+        let change = archive.gps.mark_down(target.db_id).await;
+        follow_mode(&archive, &target.vin, change).await;
         tasks.spawn(vehicle_loop(
             target,
             Arc::clone(&session),
@@ -434,6 +447,7 @@ async fn vehicle_loop(
                     &mut consecutive,
                     class,
                     &target,
+                    &archive,
                     &board,
                     &debug,
                     &mut kick,
@@ -452,6 +466,8 @@ async fn vehicle_loop(
             .set_vehicle(target.db_id, "error", Some("connecting".to_owned()))
             .await;
         debug.set_owner_vehicle(target.db_id, target.stream_tag, "connecting");
+        let change = archive.gps.mark_down(target.db_id).await;
+        follow_mode(&archive, &target.vin, change).await;
         let (tx, mut rx) = mpsc::channel(32);
         let pump = pump_stream(&url, &access, target.stream_tag, tx);
         tokio::pin!(pump);
@@ -497,6 +513,7 @@ async fn vehicle_loop(
             &mut consecutive,
             class,
             &target,
+            &archive,
             &board,
             &debug,
             &mut kick,
@@ -523,9 +540,13 @@ async fn accept_notice(
     match notice {
         StreamEvent::Subscribed => {
             board.set_vehicle(target.db_id, "connected", None).await;
+            let change = archive.gps.mark_up(target.db_id).await;
+            follow_mode(archive, &target.vin, change).await;
         }
         StreamEvent::Sample(sample) => {
             board.set_vehicle(target.db_id, "connected", None).await;
+            let change = archive.gps.mark_update(target.db_id).await;
+            follow_mode(archive, &target.vin, change).await;
             store_sample(debug, archive, target, carry, &sample).await;
         }
         StreamEvent::Trace(_) => {}
@@ -700,11 +721,29 @@ async fn store_sample(
     }
 }
 
+/// Pull the next Fleet poll forward when GPS mode changes.
+///
+/// The log line is emitted by [`crate::position_mode::GpsBoard`] with the database
+/// id only. This function does not record the VIN.
+async fn follow_mode(archive: &Archive, vin: &str, change: crate::position_mode::ModeChange) {
+    if !change.changed {
+        return;
+    }
+    {
+        let mut guard = archive.runtimes.lock().await;
+        if let Some(runtime) = guard.get_mut(vin) {
+            runtime.next_due = tokio::time::Instant::now();
+        }
+    }
+    archive.gps.notify();
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn backoff(
     consecutive: &mut u32,
     class: FailureClass,
     target: &Target,
+    archive: &Archive,
     board: &StreamBoard,
     debug: &DebugBoard,
     kick: &mut broadcast::Receiver<String>,
@@ -720,6 +759,8 @@ async fn backoff(
         .set_vehicle(target.db_id, "error", Some(class.as_str().to_owned()))
         .await;
     debug.owner_down(target.db_id, target.stream_tag, class.as_str());
+    let change = archive.gps.mark_down(target.db_id).await;
+    follow_mode(archive, &target.vin, change).await;
     if let Some(report) = report {
         let detail = crate::logs::redact_line(&report.detail, &[]);
         let since = report
@@ -1145,6 +1186,7 @@ mod tests {
             events,
             runtimes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             stream_kick: kick,
+            gps: crate::position_mode::GpsBoard::default(),
         });
         let board = StreamBoard::default();
         board.set_mode(true, true).await;

@@ -290,6 +290,15 @@ components:
           type: string
           nullable: true
           description: Short error class when stream_status is error. Tokens are never included.
+        position_mode:
+          type: string
+          enum: [hybrid, fallback]
+          description: >
+            hybrid while Owner stream data:update frames supply drive GPS and
+            vehicle_data supplies the other status fields. fallback when the
+            socket is down or silent during a drive; GPS positions then come
+            from vehicle_data every POLL_GPS_FALLBACK_SECS. Asleep cars are not
+            woken for either mode.
         charger_voltage: { type: number, nullable: true, description: Volts }
         charger_current:
           type: number

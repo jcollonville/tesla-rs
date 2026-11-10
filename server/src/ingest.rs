@@ -49,6 +49,8 @@ pub(crate) struct PollPolicy {
     pub asleep: Duration,
     pub backoff: Duration,
     pub parked_live_limit: u32,
+    /// Backup drive-position interval used when the Owner stream is not healthy.
+    pub gps_fallback: Duration,
 }
 
 /// Whether the next cycle should pay for `vehicle_data`.
@@ -148,6 +150,8 @@ pub(crate) struct Archive {
     pub runtimes: Arc<Mutex<HashMap<String, Runtime>>>,
     /// Wakes a backing-off Owner API stream when this VIN is seen online.
     pub stream_kick: broadcast::Sender<String>,
+    /// Owner-stream GPS mode. Fallback wakes the poller through this board.
+    pub gps: crate::position_mode::GpsBoard,
 }
 
 pub(crate) async fn apply_for_vin(
@@ -175,6 +179,7 @@ pub(crate) async fn apply_for_vin(
         &archive.geocoder,
         &archive.events,
         live,
+        true,
     )
     .await
 }
@@ -579,6 +584,8 @@ pub(crate) async fn run_poll<T: AccessTokenProvider>(
                 Duration::from_secs(30)
             }
         };
+        let wake = archive.gps.notified();
+        tokio::pin!(wake);
         tokio::select! {
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
@@ -586,6 +593,7 @@ pub(crate) async fn run_poll<T: AccessTokenProvider>(
                 }
             }
             () = sleep(wait) => {}
+            () = wake => {}
         }
     }
 }
@@ -655,32 +663,54 @@ async fn handle_summary(
         },
     )
     .await?;
-    let mut guard = archive.runtimes.lock().await;
-    if !guard.contains_key(&summary.vin) {
-        guard.insert(
-            summary.vin.clone(),
-            load_runtime(&archive.db, vehicle_id, &summary.vin).await?,
-        );
-    }
-    let runtime = guard.get_mut(&summary.vin).expect("runtime");
-    let telemetry_fresh = runtime
-        .last_telemetry
-        .is_some_and(|at| at.elapsed() < Duration::from_secs(120));
-    let plan = poll_plan(
+    let (activity, telemetry_fresh, parked_live_polls) = {
+        let mut guard = archive.runtimes.lock().await;
+        if !guard.contains_key(&summary.vin) {
+            guard.insert(
+                summary.vin.clone(),
+                load_runtime(&archive.db, vehicle_id, &summary.vin).await?,
+            );
+        }
+        let runtime = guard.get(&summary.vin).expect("runtime");
+        (
+            runtime.tracker.activity,
+            runtime
+                .last_telemetry
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(120)),
+            runtime.parked_live_polls,
+        )
+    };
+    // Owner stream health is not `telemetry_fresh`. A live socket must not
+    // suspend `vehicle_data`; that flag is only Fleet Telemetry.
+    let mode = archive
+        .gps
+        .reconcile(vehicle_id, summary.presence, activity)
+        .await
+        .mode;
+    let mut plan = poll_plan(
         summary.presence,
-        runtime.tracker.activity,
-        runtime.parked_live_polls,
+        activity,
+        parked_live_polls,
         telemetry_fresh,
         policy,
     );
+    if crate::position_mode::fallback_observe(mode, summary.presence, telemetry_fresh, plan.observe)
+    {
+        plan.observe = true;
+        plan.wait = policy.gps_fallback;
+    }
     if summary.presence != Presence::Online || !plan.observe {
-        runtime.parked_live_polls = 0;
-        runtime.next_due = Instant::now() + plan.wait;
+        {
+            let mut guard = archive.runtimes.lock().await;
+            if let Some(runtime) = guard.get_mut(&summary.vin) {
+                runtime.parked_live_polls = 0;
+                runtime.next_due = Instant::now() + plan.wait;
+            }
+        }
         let vin = summary.vin.clone();
         let presence = summary.presence;
-        drop(guard);
         let obs = resting_observation(Utc::now(), presence);
-        if let Err(err) = apply_existing(archive, &vin, obs, false).await {
+        if let Err(err) = apply_existing(archive, &vin, obs, false, false).await {
             tracing::warn!(
                 vehicle_id = summary.tesla_id,
                 error = %crate::logs::redact_line(&err.to_string(), &[]),
@@ -690,7 +720,6 @@ async fn handle_summary(
         }
         return Ok(CycleControl::Wait(plan.wait));
     }
-    drop(guard);
     match source.observe(&summary.vin).await? {
         ObserveResult::RateLimited(wait) => Ok(CycleControl::Pause(wait)),
         ObserveResult::Resting(presence) => {
@@ -701,11 +730,24 @@ async fn handle_summary(
             }
             drop(guard);
             let obs = resting_observation(Utc::now(), presence);
-            apply_existing(archive, &summary.vin, obs, false).await?;
+            apply_existing(archive, &summary.vin, obs, false, false).await?;
             Ok(CycleControl::Wait(policy.asleep))
         }
         ObserveResult::Live(obs) => {
-            apply_existing(archive, &summary.vin, obs, true).await?;
+            let driving = crate::position_mode::sample_is_driving(
+                activity,
+                obs.shift_state.as_deref(),
+                obs.speed_kmh,
+            );
+            let now = std::time::Instant::now();
+            let store_position = archive
+                .gps
+                .allow_poll_position(vehicle_id, driving, now, policy.gps_fallback)
+                .await;
+            apply_existing(archive, &summary.vin, obs, true, store_position).await?;
+            if store_position && driving {
+                archive.gps.mark_drive_position(vehicle_id, now).await;
+            }
             let mut guard = archive.runtimes.lock().await;
             if let Some(runtime) = guard.get_mut(&summary.vin) {
                 if matches!(
@@ -728,6 +770,7 @@ async fn apply_existing(
     vin: &str,
     obs: Observation,
     live: bool,
+    store_position: bool,
 ) -> Result<(), AppError> {
     let mut guard = archive.runtimes.lock().await;
     let Some(runtime) = guard.get_mut(vin) else {
@@ -740,6 +783,7 @@ async fn apply_existing(
         &archive.geocoder,
         &archive.events,
         live,
+        store_position,
     )
     .await
 }
@@ -768,6 +812,7 @@ mod tests {
             asleep: Duration::from_secs(300),
             backoff: Duration::from_secs(720),
             parked_live_limit: 2,
+            gps_fallback: Duration::from_secs(300),
         }
     }
 
@@ -787,6 +832,16 @@ mod tests {
         assert_eq!(driving.wait, Duration::from_secs(15));
         let streamed = poll_plan(Presence::Online, Activity::Driving, 0, true, &policy);
         assert!(!streamed.observe);
+    }
+
+    #[test]
+    fn owner_stream_does_not_suspend_vehicle_data() {
+        let policy = policy();
+        let driving = poll_plan(Presence::Online, Activity::Driving, 0, false, &policy);
+        assert!(driving.observe);
+        assert_eq!(driving.wait, policy.drive);
+        let charging = poll_plan(Presence::Online, Activity::Charging, 0, false, &policy);
+        assert!(charging.observe);
     }
 
     #[tokio::test]

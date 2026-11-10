@@ -32,6 +32,7 @@ pub(crate) struct Config {
     pub asleep_poll: Duration,
     pub backoff_poll: Duration,
     pub parked_live_limit: u32,
+    pub gps_fallback_poll: Duration,
     pub nominatim_enabled: bool,
     pub nominatim_url: String,
     pub nominatim_contact: Option<String>,
@@ -141,6 +142,11 @@ impl Config {
             backoff_poll: Duration::from_secs(optional_u64(map, "POLL_BACKOFF_SECS", 720)?),
             parked_live_limit: u32::try_from(optional_u64(map, "POLL_PARKED_LIVE_LIMIT", 2)?)
                 .map_err(|_| AppError::message("POLL_PARKED_LIVE_LIMIT is too large"))?,
+            gps_fallback_poll: Duration::from_secs(optional_u64(
+                map,
+                "POLL_GPS_FALLBACK_SECS",
+                300,
+            )?),
             nominatim_enabled,
             nominatim_url: optional(map, "NOMINATIM_URL")
                 .unwrap_or_else(|| "https://nominatim.openstreetmap.org".to_owned()),
@@ -342,6 +348,10 @@ mod tests {
         assert_eq!(config.redirect_uri, "https://tsl.b-612.fr/auth/callback");
         assert_eq!(config.region, tesla_auth::Region::Europe);
         assert!(config.owner_stream_enabled);
+        assert_eq!(
+            config.gps_fallback_poll,
+            std::time::Duration::from_secs(300)
+        );
         assert_eq!(
             config.owner_token_store_path,
             std::path::PathBuf::from("/data/owner-tokens.json")

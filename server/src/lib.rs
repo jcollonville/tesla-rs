@@ -25,8 +25,10 @@ mod logs;
 mod mqtt;
 mod owner_stream;
 mod persist;
+mod position_mode;
 mod rdp;
 mod state;
+mod status;
 mod telemetry;
 mod units;
 

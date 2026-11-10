@@ -49,6 +49,7 @@ fn openapi_lists_the_read_api() {
         "is_preconditioning",
         "scheduled_charging_start_time",
         "stream_status",
+        "position_mode",
     ] {
         assert!(OPENAPI.contains(field), "{field}");
     }
@@ -205,6 +206,7 @@ async fn polling_sequence_opens_and_closes_one_drive() {
         events,
         runtimes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         stream_kick,
+        gps: crate::position_mode::GpsBoard::default(),
     };
     let vin = "5YJ3E1EA7KF000001";
     let identity = || VehicleIdentity {
@@ -337,6 +339,7 @@ async fn stream_points_follow_one_drive_and_yield_to_a_poll() {
         events,
         runtimes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         stream_kick,
+        gps: crate::position_mode::GpsBoard::default(),
     };
     let vin = "5YJ3E1EA7KF000001";
     let identity = || VehicleIdentity {
@@ -851,6 +854,7 @@ fn test_archive(pool: sqlx::PgPool) -> Archive {
         events,
         runtimes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         stream_kick,
+        gps: crate::position_mode::GpsBoard::default(),
     }
 }
 
@@ -949,6 +953,109 @@ async fn detached_positions(pool: &sqlx::PgPool, vin: &str) -> i64 {
     .await
     .unwrap();
     row.0
+}
+
+#[tokio::test]
+async fn stream_event_keeps_polled_temperatures() {
+    let Some(db) = TestDb::migrated("merge").await else {
+        return;
+    };
+    let (events, mut rx) = tokio::sync::broadcast::channel(8);
+    let (stream_kick, _) = tokio::sync::broadcast::channel(8);
+    let archive = Archive {
+        db: db.pool.clone(),
+        geocoder: crate::geocode::Geocoder::disabled(),
+        events,
+        runtimes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        stream_kick,
+        gps: crate::position_mode::GpsBoard::default(),
+    };
+    let vin = "5YJ3E1EA7KF000001";
+    let identity = || VehicleIdentity {
+        vin,
+        tesla_id: Some(10),
+        legacy_vehicle_id: Some(99),
+        name: Some("Red"),
+    };
+    let base = Utc.with_ymd_and_hms(2024, 6, 1, 10, 0, 0).unwrap();
+    let mut poll = Observation::at(base, Presence::Online);
+    poll.inside_temp_c = Some(21.5);
+    poll.outside_temp_c = Some(9.0);
+    poll.charge_energy_added_kwh = Some(3.5);
+    poll.charge_limit_soc = Some(80.0);
+    poll.charging_state = Some("Disconnected".to_owned());
+    poll.plugged_in = Some(false);
+    poll.latitude = Some(48.1);
+    poll.longitude = Some(2.2);
+    poll.speed_kmh = Some(0.0);
+    apply_for_vin(&archive, vin, identity(), poll, true, false)
+        .await
+        .unwrap();
+    let _ = rx.try_recv();
+
+    crate::ingest::apply_stream_for_vin(
+        &archive,
+        vin,
+        identity(),
+        &crate::persist::StreamFix {
+            at: base + chrono::Duration::seconds(5),
+            shift_state: Some("D".to_owned()),
+            speed_kmh: Some(42.0),
+            power_kw: Some(11.0),
+            odometer_km: Some(100.4),
+            battery_level: Some(77.0),
+            latitude: Some(48.2),
+            longitude: Some(2.3),
+            elevation_m: Some(30.0),
+            heading_deg: Some(90.0),
+            rated_range_km: Some(400.0),
+            est_range_km: Some(380.0),
+        },
+    )
+    .await
+    .unwrap();
+    let event = rx.try_recv().expect("stream event");
+    let value = serde_json::to_value(&event).unwrap();
+    let text = value.to_string();
+    assert_eq!(value["inside_temp_c"], 21.5, "{text}");
+    assert_eq!(value["outside_temp_c"], 9.0, "{text}");
+    assert_eq!(value["charge_energy_added_kwh"], 3.5, "{text}");
+    assert_eq!(value["charge_limit_soc"], 80.0, "{text}");
+    assert_eq!(value["charging_state"], "Disconnected", "{text}");
+    assert_eq!(value["latitude"], 48.2, "{text}");
+    assert_eq!(value["speed_kmh"], 42.0, "{text}");
+    assert!(!text.contains("null"), "{text}");
+
+    let mut newer = Observation::at(base + chrono::Duration::seconds(20), Presence::Online);
+    newer.inside_temp_c = Some(22.0);
+    newer.outside_temp_c = Some(8.0);
+    newer.charge_limit_soc = Some(90.0);
+    newer.shift_state = Some("D".to_owned());
+    newer.latitude = Some(48.25);
+    newer.longitude = Some(2.31);
+    newer.speed_kmh = Some(40.0);
+    apply_for_vin(&archive, vin, identity(), newer, true, false)
+        .await
+        .unwrap();
+    let event = rx.try_recv().expect("poll event");
+    assert_eq!(event.inside_temp_c, Some(22.0));
+    assert_eq!(event.outside_temp_c, Some(8.0));
+    assert_eq!(event.charge_limit_soc, Some(90.0));
+    assert_eq!(event.latitude, Some(48.25));
+
+    let stored: (Option<f64>, Option<f64>) = sqlx::query_as(
+        "SELECT inside_temp_c, outside_temp_c FROM positions WHERE source = 'stream' ORDER BY recorded_at LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, (None, None));
+    let state: (Option<f64>, Option<f64>) =
+        sqlx::query_as("SELECT inside_temp_c, outside_temp_c FROM vehicle_state")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, (Some(22.0), Some(8.0)));
 }
 
 #[tokio::test]

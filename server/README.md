@@ -28,7 +28,7 @@ The UI password protects the status page, the logs page, and the OAuth start but
 
 ## Owner API streaming
 
-Fleet API polling records a position every `POLL_DRIVE_SECS` (15 seconds by default, often slower when Tesla rate-limits `vehicle_data`). The optional Owner API stream is the same legacy websocket TeslaMate uses (`wss://streaming.vn.teslamotors.com/streaming/`). It is not part of the Fleet API. Tesla can change or remove it without notice. When it is disconnected, rate-limited, or rejected, the logger logs `owner stream status`, backs off, and keeps polling.
+Fleet API polling records climate, charge, and the other fields the Owner stream does not carry. While that stream is delivering `data:update` frames, drive GPS points come from the stream (`source=stream`) and a live status frame keeps the last polled temperatures and charge fields. The optional Owner API stream is the same legacy websocket TeslaMate uses (`wss://streaming.vn.teslamotors.com/streaming/`). It is not part of the Fleet API. Tesla can change or remove it without notice. When it is disconnected, rate-limited, rejected, or connected without a `data:update` for 90 seconds during a drive, GPS positions fall back to `vehicle_data` (`source=poll`) every `POLL_GPS_FALLBACK_SECS` (5 minutes). The poller still does not call `wake_up`. The debug console and `position_mode` on the state API report `hybrid` or `fallback`. Mode changes are logged as `position mode` with the database id and no VIN.
 
 Enable it from the status page:
 
@@ -45,7 +45,7 @@ A refresh token generated for this logger can be pasted into **Owner API refresh
 
 `TESLA_TOKEN_ENCRYPTION_KEY` encrypts `owner-tokens.json` with the same AES-256-GCM format as the Fleet API token file. With Docker Compose the file is `/data/owner-tokens.json` on the `logger-data` volume. No restart is required after saving or disconnecting. Set `OWNER_STREAM_ENABLED=false` to stop connecting without deleting the token.
 
-Streamed rows are stored in `positions` with `source = 'stream'` and linked to the open drive. A poll within two seconds replaces the streamed point at that moment. Shift changes open and close the drive; an empty streaming gear does not close it. If the socket fails, polling continues.
+Streamed rows are stored in `positions` with `source = 'stream'` and linked to the open drive. Those rows may leave temperature null. A poll within two seconds replaces the streamed point at that moment. Shift changes open and close the drive; an empty streaming gear does not close it. If the socket fails, `vehicle_data` keeps running and drive GPS uses the fallback poll.
 
 Do not enable `sqlx=trace` in production. Query logs can include bound values. Tokens, the client secret, and the private key are not written to logs.
 
