@@ -800,10 +800,10 @@ async fn backup(State(app): State<AppState>, headers: HeaderMap) -> Response {
     if !principal.is_admin() || !principal.sudo_active() {
         return (StatusCode::FORBIDDEN, "sudo required").into_response();
     }
-    let output = std::process::Command::new("pg_dump")
-        .arg("--dbname")
-        .arg(&app.inner.config.database_url)
-        .output();
+    let Ok(mut command) = crate::system::pg_dump_command(&app.inner.config.database_url) else {
+        return (StatusCode::BAD_GATEWAY, "pg_dump failed").into_response();
+    };
+    let output = command.output();
     match output {
         Ok(output) if output.status.success() => {
             let mut response = output.stdout.into_response();
