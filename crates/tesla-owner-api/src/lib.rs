@@ -34,7 +34,7 @@ pub use error::OwnerError;
 pub use secrecy::{ExposeSecret, SecretString};
 pub use stream::{
     FailureClass, Incoming, PumpEnd, ReconnectPlan, STREAM_COLUMNS, StreamEvent, StreamSample,
-    classify_stream_error, classify_transport_message, parse_message, plan_reconnect, pump_stream,
-    subscribe_frame,
+    StreamStats, StreamStop, StreamTrace, classify_stream_error, classify_transport_message,
+    parse_message, plan_reconnect, pump_stream, subscribe_frame,
 };
 pub use vehicles::OwnerVehicle;

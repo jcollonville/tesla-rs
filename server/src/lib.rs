@@ -14,6 +14,7 @@ pub mod cli;
 mod app;
 mod config;
 mod crypto;
+mod debug;
 mod error;
 mod geocode;
 mod geofence;

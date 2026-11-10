@@ -150,7 +150,7 @@ label.field {
   font-weight: 600;
 }
 
-input {
+input, select {
   width: 100%;
   min-height: 44px;
   padding: 0.5rem 0.75rem;
@@ -292,4 +292,36 @@ footer {
   h1 { font-size: 1.75rem; }
   .auth-card { margin-top: 12vh; }
   dl.facts { grid-template-columns: 1fr 1fr; }
+  .status-grid { grid-template-columns: 1fr 1fr; }
 }
+
+.shell.wide { width: min(72rem, calc(100% - 2rem)); }
+body:has(main.shell.wide) footer { width: min(72rem, calc(100% - 2rem)); }
+
+.status-grid { display: grid; gap: 0.75rem; }
+.status-grid > .card { margin: 0; }
+
+.filters { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.filters select { width: auto; min-width: 8rem; flex: 1; }
+
+label.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 44px;
+  font-weight: 600;
+}
+label.check input { width: 1.15rem; min-height: 1.15rem; }
+
+.console {
+  max-height: min(28rem, 60vh);
+  overflow: auto;
+  margin-top: 0.75rem;
+}
+
+ol.logs.hide-keep li[data-keep="1"] { display: none; }
+ol.logs .dir { font-weight: 700; margin-right: 0.35rem; }
+ol.logs .dir.in { color: var(--ok); }
+ol.logs .dir.out { color: var(--primary); }
+ol.logs .ok { color: var(--ok); font-weight: 700; }
+ol.logs .info { font-weight: 600; }

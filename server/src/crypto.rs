@@ -27,10 +27,13 @@ const MAGIC: &[u8; 4] = b"TLG1";
 /// and the refresh token. `FileTokenStore` in `tesla-auth` remains available for
 /// callers that must keep the id token; this server keeps the two tokens required
 /// to poll.
+pub(crate) type TokenSaved = std::sync::Arc<dyn Fn(std::time::SystemTime) + Send + Sync>;
+
 pub(crate) struct TokenFile {
     path: PathBuf,
     key: Option<[u8; 32]>,
     lock: Mutex<()>,
+    saved: std::sync::Mutex<Option<TokenSaved>>,
 }
 
 #[allow(clippy::missing_fields_in_debug)]
@@ -72,7 +75,16 @@ impl TokenFile {
             path: path.into(),
             key,
             lock: Mutex::new(()),
+            saved: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Called after a token set is stored. The hook receives the access-token expiry only.
+    pub(crate) fn on_saved(&self, hook: TokenSaved) {
+        *self
+            .saved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
     }
 
     pub(crate) async fn load(&self) -> Result<Option<TokenSet>, AuthError> {
@@ -99,7 +111,18 @@ impl TokenFile {
             None => plaintext.clone(),
         };
         plaintext.zeroize();
-        write_private(&self.path, &sealed).await.map_err(store_err)
+        write_private(&self.path, &sealed)
+            .await
+            .map_err(store_err)?;
+        let hook = self
+            .saved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(tokens.expires_at());
+        }
+        Ok(())
     }
 
     pub(crate) async fn clear(&self) -> Result<(), AuthError> {
