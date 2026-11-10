@@ -1,8 +1,6 @@
 // Copyright (C) 2026 Jean Collonvillé
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use chrono::{DateTime, TimeZone, Utc};
 use http_body_util::BodyExt;
@@ -207,14 +205,13 @@ async fn polling_sequence_opens_and_closes_one_drive() {
     };
     let (events, _) = tokio::sync::broadcast::channel(8);
     let (stream_kick, _) = tokio::sync::broadcast::channel(8);
-    let archive = Archive {
-        db: db.pool.clone(),
-        geocoder: crate::geocode::Geocoder::disabled(),
+    let archive = Archive::new(
+        db.pool.clone(),
+        crate::geocode::Geocoder::disabled(),
         events,
-        runtimes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         stream_kick,
-        gps: crate::position_mode::GpsBoard::default(),
-    };
+        crate::position_mode::GpsBoard::default(),
+    );
     let vin = "5YJ3E1EA7KF000001";
     let identity = || VehicleIdentity {
         vin,
@@ -340,14 +337,13 @@ async fn stream_points_follow_one_drive_and_yield_to_a_poll() {
     };
     let (events, _) = tokio::sync::broadcast::channel(8);
     let (stream_kick, _) = tokio::sync::broadcast::channel(8);
-    let archive = Archive {
-        db: db.pool.clone(),
-        geocoder: crate::geocode::Geocoder::disabled(),
+    let archive = Archive::new(
+        db.pool.clone(),
+        crate::geocode::Geocoder::disabled(),
         events,
-        runtimes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         stream_kick,
-        gps: crate::position_mode::GpsBoard::default(),
-    };
+        crate::position_mode::GpsBoard::default(),
+    );
     let vin = "5YJ3E1EA7KF000001";
     let identity = || VehicleIdentity {
         vin,
@@ -855,14 +851,13 @@ async fn short_drives_are_deleted_for_poll_and_stream() {
 fn test_archive(pool: sqlx::PgPool) -> Archive {
     let (events, _) = tokio::sync::broadcast::channel(8);
     let (stream_kick, _) = tokio::sync::broadcast::channel(8);
-    Archive {
-        db: pool,
-        geocoder: crate::geocode::Geocoder::disabled(),
+    Archive::new(
+        pool,
+        crate::geocode::Geocoder::disabled(),
         events,
-        runtimes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         stream_kick,
-        gps: crate::position_mode::GpsBoard::default(),
-    }
+        crate::position_mode::GpsBoard::default(),
+    )
 }
 
 fn car(vin: &'static str) -> VehicleIdentity<'static> {
@@ -969,14 +964,13 @@ async fn stream_event_keeps_polled_temperatures() {
     };
     let (events, mut rx) = tokio::sync::broadcast::channel(8);
     let (stream_kick, _) = tokio::sync::broadcast::channel(8);
-    let archive = Archive {
-        db: db.pool.clone(),
-        geocoder: crate::geocode::Geocoder::disabled(),
+    let archive = Archive::new(
+        db.pool.clone(),
+        crate::geocode::Geocoder::disabled(),
         events,
-        runtimes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         stream_kick,
-        gps: crate::position_mode::GpsBoard::default(),
-    };
+        crate::position_mode::GpsBoard::default(),
+    );
     let vin = "5YJ3E1EA7KF000001";
     let identity = || VehicleIdentity {
         vin,

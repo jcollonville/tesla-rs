@@ -206,15 +206,6 @@ impl GpsBoard {
             .to_owned()
     }
 
-    pub(crate) async fn modes(&self) -> HashMap<i64, String> {
-        self.inner
-            .lock()
-            .await
-            .iter()
-            .map(|(id, slot)| (*id, slot.mode.as_str().to_owned()))
-            .collect()
-    }
-
     async fn mode(&self, vehicle_id: i64) -> Option<PositionMode> {
         self.inner
             .lock()

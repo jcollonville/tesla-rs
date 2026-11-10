@@ -12,8 +12,9 @@ use tesla_owner_api::OwnerLogin;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, broadcast, watch};
 
+use crate::accounts::{self, DbTokenStore};
 use crate::config::Config;
-use crate::crypto::{SharedTokenStore, TokenFile, read_public_key};
+use crate::crypto::read_public_key;
 use crate::debug::DebugBoard;
 use crate::error::AppError;
 use crate::geocode::Geocoder;
@@ -34,13 +35,16 @@ pub(crate) struct AppState {
 pub(crate) struct Inner {
     pub config: Config,
     pub db: PgPool,
-    pub session: Arc<Session<SharedTokenStore>>,
+    pub session: Arc<Session<DbTokenStore>>,
+    pub fleet_store: Arc<DbTokenStore>,
+    pub owner_store: Arc<DbTokenStore>,
+    pub fleet_account_id: i64,
+    pub owner_account_id: i64,
     pub pending: Mutex<HashMap<String, PendingAuthorization>>,
     pub public_key_pem: String,
     pub events: broadcast::Sender<LiveEvent>,
     pub ui_sessions: Mutex<HashMap<String, UiSession>>,
     pub revealed: Mutex<HashMap<String, String>>,
-    pub global_error: Arc<Mutex<Option<String>>>,
     pub archive: Arc<Archive>,
     pub owner_pending: Mutex<Option<(OwnerLogin, Instant)>>,
     pub stream_board: StreamBoard,
@@ -51,16 +55,6 @@ pub(crate) struct Inner {
 
 pub(crate) struct UiSession {
     pub expires: Instant,
-}
-
-impl AppState {
-    pub(crate) async fn set_global_error(&self, message: String) {
-        *self.inner.global_error.lock().await = Some(message);
-    }
-
-    pub(crate) async fn global_error(&self) -> Option<String> {
-        self.inner.global_error.lock().await.clone()
-    }
 }
 
 pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
@@ -80,7 +74,12 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
         ) {
             Ok(fleet) => fleet,
             Err(err) => {
-                poll_state.set_global_error(err.to_string()).await;
+                let _ = accounts::set_last_error(
+                    &poll_state.inner.db,
+                    poll_state.inner.fleet_account_id,
+                    &err.to_string(),
+                )
+                .await;
                 return;
             }
         };
@@ -88,7 +87,7 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
             &fleet,
             Arc::clone(&poll_state.inner.archive),
             policy,
-            Arc::clone(&poll_state.inner.global_error),
+            Some(poll_state.inner.fleet_account_id),
             poll_rx,
         )
         .await;
@@ -147,8 +146,20 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
 
 pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, AppError> {
     let public_key_pem = read_public_key(&config.private_key_path)?;
-    let store = Arc::new(TokenFile::open(
-        &config.token_store_path,
+    let db = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&config.database_url)
+        .await?;
+    sqlx::migrate!("./migrations").run(&db).await?;
+    let imported = accounts::import_token_files(&db, &config).await?;
+    let fleet_store = Arc::new(DbTokenStore::open(
+        db.clone(),
+        imported.fleet_id,
+        config.token_encryption_key.as_deref(),
+    )?);
+    let owner_store = Arc::new(DbTokenStore::open(
+        db.clone(),
+        imported.owner_id,
         config.token_encryption_key.as_deref(),
     )?);
     let auth = AuthClient::new(ClientConfig {
@@ -158,12 +169,7 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
         region: config.region,
         scopes: Scope::third_party_vehicle(),
     })?;
-    let session = Arc::new(Session::new(auth, SharedTokenStore(Arc::clone(&store))));
-    let db = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&config.database_url)
-        .await?;
-    sqlx::migrate!("./migrations").run(&db).await?;
+    let session = Arc::new(Session::new(auth, (*fleet_store).clone()));
     let (events, _) = broadcast::channel(256);
     let (stream_kick, _) = broadcast::channel(32);
     let (owner_tokens, _) = watch::channel(0_u64);
@@ -171,29 +177,28 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
     debug.apply_config(&config);
     let gps = crate::position_mode::GpsBoard::new(debug.clone(), Arc::new(Notify::new()));
     let debug_saved = debug.clone();
-    store.on_saved(std::sync::Arc::new(move |expires| {
+    fleet_store.on_saved(std::sync::Arc::new(move |expires| {
         debug_saved.token_saved("fleet", expires);
     }));
     let geocoder = Geocoder::from_config(&config)?;
-    let archive = Arc::new(Archive {
-        db: db.clone(),
-        geocoder,
-        events: events.clone(),
-        runtimes: Arc::new(Mutex::new(HashMap::new())),
-        stream_kick,
-        gps,
-    });
+    let mut archive = Archive::new(db.clone(), geocoder, events.clone(), stream_kick, gps);
+    archive.fleet_account_id = Some(imported.fleet_id);
+    archive.owner_account_id = Some(imported.owner_id);
+    let archive = Arc::new(archive);
     Ok(AppState {
         inner: Arc::new(Inner {
             config,
             db,
             session,
+            fleet_store,
+            owner_store,
+            fleet_account_id: imported.fleet_id,
+            owner_account_id: imported.owner_id,
             pending: Mutex::new(HashMap::new()),
             public_key_pem,
             events,
             ui_sessions: Mutex::new(HashMap::new()),
             revealed: Mutex::new(HashMap::new()),
-            global_error: Arc::new(Mutex::new(None)),
             archive,
             owner_pending: Mutex::new(None),
             stream_board: StreamBoard::default(),
@@ -300,12 +305,11 @@ pub(crate) async fn test_state_with(pool: PgPool, energy_price_per_kwh: Option<f
     }
     let config = Config::from_map(&map).unwrap();
     let public_key_pem = read_public_key(&config.private_key_path).unwrap();
-    let store = Arc::new(
-        TokenFile::open(
-            &config.token_store_path,
-            config.token_encryption_key.as_deref(),
-        )
-        .unwrap(),
+    let fleet_store = Arc::new(
+        DbTokenStore::open(pool.clone(), 0, config.token_encryption_key.as_deref()).unwrap(),
+    );
+    let owner_store = Arc::new(
+        DbTokenStore::open(pool.clone(), 0, config.token_encryption_key.as_deref()).unwrap(),
     );
     let auth = AuthClient::new(ClientConfig {
         client_id: config.client_id.clone(),
@@ -315,7 +319,7 @@ pub(crate) async fn test_state_with(pool: PgPool, energy_price_per_kwh: Option<f
         scopes: Scope::third_party_vehicle(),
     })
     .unwrap();
-    let session = Arc::new(Session::new(auth, SharedTokenStore(Arc::clone(&store))));
+    let session = Arc::new(Session::new(auth, (*fleet_store).clone()));
     let (events, _) = broadcast::channel(16);
     let (stream_kick, _) = broadcast::channel(8);
     let (owner_tokens, _) = watch::channel(0_u64);
@@ -325,25 +329,27 @@ pub(crate) async fn test_state_with(pool: PgPool, energy_price_per_kwh: Option<f
     debug.apply_config(&config);
     let gps = crate::position_mode::GpsBoard::new(debug.clone(), Arc::new(Notify::new()));
     let geocoder = Geocoder::disabled();
-    let archive = Arc::new(Archive {
-        db: pool.clone(),
+    let archive = Arc::new(Archive::new(
+        pool.clone(),
         geocoder,
-        events: events.clone(),
-        runtimes: Arc::new(Mutex::new(HashMap::new())),
+        events.clone(),
         stream_kick,
         gps,
-    });
+    ));
     AppState {
         inner: Arc::new(Inner {
             config,
             db: pool,
             session,
+            fleet_store,
+            owner_store,
+            fleet_account_id: 0,
+            owner_account_id: 0,
             pending: Mutex::new(HashMap::new()),
             public_key_pem,
             events,
             ui_sessions: Mutex::new(HashMap::new()),
             revealed: Mutex::new(HashMap::new()),
-            global_error: Arc::new(Mutex::new(None)),
             archive,
             owner_pending: Mutex::new(None),
             stream_board: StreamBoard::default(),

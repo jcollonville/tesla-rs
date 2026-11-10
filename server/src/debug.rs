@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::response::sse::Event;
 use chrono::{DateTime, Utc};
+use maud::{PreEscaped, html};
 use tesla_owner_api::StreamStop;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
@@ -533,7 +534,6 @@ impl DebugBoard {
         body.push_str(&render_history(&guard.history));
         body.push_str(&render_frames(&guard.events));
         body.push_str(&render_logs(lines));
-        body.push_str(SCRIPT);
         ConsoleView {
             frames_cursor,
             logs_cursor,
@@ -585,11 +585,19 @@ pub(crate) async fn probe(app: &AppState) {
         Ok(Ok(_))
     );
     app.inner.debug.set_postgres(reachable);
-    let key = app.inner.config.token_encryption_key.as_deref();
-    let owner = read_token(&app.inner.config.owner_token_store_path, key).await;
-    let fleet = read_token(&app.inner.config.token_store_path, key).await;
+    let owner = token_probe(&app.inner.owner_store).await;
+    let fleet = token_probe(&app.inner.fleet_store).await;
     app.inner.debug.set_token_probe("owner", owner);
     app.inner.debug.set_token_probe("fleet", fleet);
+}
+
+async fn token_probe(store: &crate::accounts::DbTokenStore) -> TokenProbe {
+    let view = store.public_view().await;
+    TokenProbe {
+        present: view.readable && view.present,
+        readable: view.readable,
+        expires_at: view.expires_at,
+    }
 }
 
 pub(crate) fn event_stream(
@@ -750,37 +758,6 @@ fn connection_text(stream_id: i64, stop: &StreamStop) -> String {
     )
 }
 
-async fn read_token(path: &std::path::Path, key: Option<&str>) -> TokenProbe {
-    let Ok(store) = crate::crypto::TokenFile::open(path, key) else {
-        return TokenProbe {
-            present: false,
-            readable: false,
-            expires_at: None,
-        };
-    };
-    match store.load().await {
-        Ok(Some(tokens)) => {
-            let expires_at = system_to_utc(tokens.expires_at());
-            drop(tokens);
-            TokenProbe {
-                present: true,
-                readable: true,
-                expires_at,
-            }
-        }
-        Ok(None) => TokenProbe {
-            present: false,
-            readable: true,
-            expires_at: None,
-        },
-        Err(_) => TokenProbe {
-            present: false,
-            readable: false,
-            expires_at: None,
-        },
-    }
-}
-
 fn system_to_utc(time: SystemTime) -> Option<DateTime<Utc>> {
     let Ok(duration) = time.duration_since(UNIX_EPOCH) else {
         return None;
@@ -803,13 +780,13 @@ fn render_owner(guard: &DebugState, now: DateTime<Utc>) -> String {
             &[("Detail", detail)],
         );
     }
-    let mut html = String::new();
+    let mut html_out = String::new();
     for (db_id, slot) in &guard.owner.vehicles {
         let counts = format!(
             "hello/ping {} · updates {} · errors {} · parse failures {} · empty drops {}",
             slot.hello_ping, slot.updates, slot.errors, slot.parse_failures, slot.empty_drops
         );
-        html.push_str(&card(
+        html_out.push_str(&card(
             "Owner stream",
             &slot.state,
             tone(&slot.state),
@@ -839,7 +816,7 @@ fn render_owner(guard: &DebugState, now: DateTime<Utc>) -> String {
             ],
         ));
     }
-    html
+    html_out
 }
 
 fn render_fleet(slot: &FleetSlot, now: DateTime<Utc>) -> String {
@@ -936,128 +913,168 @@ fn render_service(title: &str, slot: &ServiceSlot) -> String {
 }
 
 fn render_history(rows: &VecDeque<CloseRow>) -> String {
-    let mut items = String::new();
-    if rows.is_empty() {
-        items.push_str("<p class=\"muted\">No connection has ended yet.</p>");
-    } else {
-        items.push_str("<ol class=\"logs\">");
-        for row in rows {
-            let _ = std::fmt::Write::write_fmt(
-                &mut items,
-                format_args!(
-                    "<li><time>{}</time> <span class=\"dir note\">END</span> {}</li>",
-                    escape(&row.at.format("%H:%M:%S").to_string()),
-                    escape(&row.text)
-                ),
-            );
+    html! {
+        section class="card" {
+            h2 { "Connection history" }
+            @if rows.is_empty() {
+                p class="muted" { "No connection has ended yet." }
+            } @else {
+                ol class="logs" {
+                    @for row in rows {
+                        li {
+                            time { (row.at.format("%H:%M:%S").to_string()) }
+                            " "
+                            span class="dir note" { "END" }
+                            " "
+                            (row.text)
+                        }
+                    }
+                }
+            }
         }
-        items.push_str("</ol>");
     }
-    format!("<section class=\"card\"><h2>Connection history</h2>{items}</section>")
+    .into_string()
 }
 
 fn render_frames(events: &VecDeque<DebugEvent>) -> String {
-    let mut items = String::new();
-    if events.is_empty() {
-        items.push_str("<p class=\"muted\" id=\"frames-empty\">No frames yet.</p>");
+    html! {
+        section class="card" id="frames-panel" {
+            div class="toolbar" {
+                h2 { "Frames" }
+                div class="filters" {
+                    label class="check" {
+                        input id="keepalives" type="checkbox";
+                        " Show keepalives"
+                    }
+                    select id="dir" aria-label="Direction" {
+                        option value="" { "All directions" }
+                        option value="in" { "IN" }
+                        option value="out" { "OUT" }
+                        option value="poll" { "POLL" }
+                        option value="note" { "NOTE" }
+                    }
+                    select id="kind" aria-label="Frame type" {
+                        option value="" { "All types" }
+                        option { "data:update" }
+                        option { "data:subscribe_oauth" }
+                        option { "data:error" }
+                        option { "parse" }
+                        option { "drop" }
+                        option { "poll" }
+                        option { "session" }
+                        option { "control:hello" }
+                        option { "ping" }
+                        option { "pong" }
+                        option { "close" }
+                        option { "unknown" }
+                    }
+                }
+            }
+            @if events.is_empty() {
+                p class="muted" id="frames-empty" { "No frames yet." }
+            }
+            div class="console" id="frames-scroll" {
+                ol id="frames" class="logs hide-keep" {
+                    @for event in events {
+                        (PreEscaped(render_frame(event)))
+                    }
+                }
+            }
+        }
     }
-    items.push_str(
-        "<div class=\"console\" id=\"frames-scroll\"><ol id=\"frames\" class=\"logs hide-keep\">",
-    );
-    for event in events {
-        items.push_str(&render_frame(event));
-    }
-    items.push_str("</ol></div>");
-    format!(
-        "<section class=\"card\" id=\"frames-panel\"><div class=\"toolbar\"><h2>Frames</h2>\
-         <div class=\"filters\">\
-         <label class=\"check\"><input id=\"keepalives\" type=\"checkbox\"> Show keepalives</label>\
-         <select id=\"dir\" aria-label=\"Direction\"><option value=\"\">All directions</option>\
-         <option value=\"in\">IN</option><option value=\"out\">OUT</option>\
-         <option value=\"poll\">POLL</option><option value=\"note\">NOTE</option></select>\
-         <select id=\"kind\" aria-label=\"Frame type\"><option value=\"\">All types</option>\
-         <option>data:update</option><option>data:subscribe_oauth</option><option>data:error</option>\
-         <option>parse</option><option>drop</option><option>poll</option><option>session</option>\
-         <option>control:hello</option><option>ping</option><option>pong</option><option>close</option>\
-         <option>unknown</option></select></div></div>{items}</section>"
-    )
+    .into_string()
 }
 
 fn render_logs(lines: &[LogLine]) -> String {
-    let mut items = String::new();
-    if lines.is_empty() {
-        items.push_str("<p class=\"muted\">No log lines yet.</p>");
+    html! {
+        section class="card" id="logs-panel" {
+            div class="toolbar" {
+                h2 { "Application logs" }
+            }
+            @if lines.is_empty() {
+                p class="muted" { "No log lines yet." }
+            }
+            div class="filters" {
+                select id="level" aria-label="Log level" {
+                    option value="" { "All levels" }
+                    option { "ERROR" }
+                    option { "WARN" }
+                    option { "INFO" }
+                    option { "DEBUG" }
+                    option { "TRACE" }
+                }
+            }
+            div class="console" id="logs-scroll" {
+                ol id="app-logs" class="logs" {
+                    @for line in lines {
+                        (PreEscaped(render_log(line)))
+                    }
+                }
+            }
+        }
     }
-    items.push_str(
-        "<div class=\"filters\"><select id=\"level\" aria-label=\"Log level\"><option value=\"\">All levels</option>\
-         <option>ERROR</option><option>WARN</option><option>INFO</option><option>DEBUG</option><option>TRACE</option></select></div>",
-    );
-    items.push_str("<div class=\"console\" id=\"logs-scroll\"><ol id=\"app-logs\" class=\"logs\">");
-    for line in lines {
-        items.push_str(&render_log(line));
-    }
-    items.push_str("</ol></div>");
-    format!(
-        "<section class=\"card\" id=\"logs-panel\"><div class=\"toolbar\"><h2>Application logs</h2></div>{items}</section>"
-    )
+    .into_string()
 }
 
 fn render_frame(event: &DebugEvent) -> String {
     let keep = if event.keepalive { "1" } else { "0" };
-    format!(
-        "<li data-stream=\"frame\" data-seq=\"{}\" data-dir=\"{}\" data-type=\"{}\" data-keep=\"{keep}\"><time datetime=\"{}\" title=\"{}\">{}</time> <span class=\"dir {}\">{}</span> <span class=\"{}\">{}</span> {}</li>",
-        event.id,
-        escape(&event.direction),
-        escape(&event.kind),
-        event.at.to_rfc3339(),
-        escape(&event.at.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
-        escape(&event.at.format("%H:%M:%S").to_string()),
-        escape(&event.direction),
-        direction_label(&event.direction),
-        tone_class(&event.kind),
-        escape(&event.kind),
-        escape(&event.text)
-    )
+    let direction_class = format!("dir {}", event.direction);
+    html! {
+        li data-stream="frame" data-seq=(event.id) data-dir=(&event.direction) data-type=(&event.kind) data-keep=(keep) {
+            time datetime=(event.at.to_rfc3339()) title=(event.at.format("%Y-%m-%d %H:%M:%S UTC").to_string()) {
+                (event.at.format("%H:%M:%S").to_string())
+            }
+            " "
+            span class=(direction_class) { (direction_label(&event.direction)) }
+            " "
+            span class=(tone_class(&event.kind)) { (&event.kind) }
+            " "
+            (event.text)
+        }
+    }
+    .into_string()
 }
 
 fn render_log(line: &LogLine) -> String {
-    format!(
-        "<li data-stream=\"log\" data-seq=\"{}\" data-level=\"{}\"><time datetime=\"{}\">{}</time> <span class=\"{}\">{}</span> {}</li>",
-        line.seq,
-        escape(&line.level),
-        line.at.to_rfc3339(),
-        escape(&line.at.format("%H:%M:%S").to_string()),
-        level_class(&line.level),
-        escape(&line.level),
-        escape(&line.text)
-    )
+    html! {
+        li data-stream="log" data-seq=(line.seq) data-level=(&line.level) {
+            time datetime=(line.at.to_rfc3339()) { (line.at.format("%H:%M:%S").to_string()) }
+            " "
+            span class=(level_class(&line.level)) { (&line.level) }
+            " "
+            (line.text)
+        }
+    }
+    .into_string()
 }
 
 fn card(title: &str, chip_label: &str, tone_name: &str, rows: &[(&str, String)]) -> String {
-    let mut facts = String::new();
-    for (label, value) in rows {
-        let _ = std::fmt::Write::write_fmt(
-            &mut facts,
-            format_args!(
-                "<div><dt>{}</dt><dd>{}</dd></div>",
-                escape(label),
-                escape(value)
-            ),
-        );
+    html! {
+        article class="card" {
+            div class="vehicle-head" {
+                h3 { (title) }
+                (chip(chip_label, tone_name))
+            }
+            dl class="facts" {
+                @for (label, value) in rows {
+                    div {
+                        dt { (label) }
+                        dd { (value) }
+                    }
+                }
+            }
+        }
     }
-    format!(
-        "<article class=\"card\"><div class=\"vehicle-head\"><h3>{}</h3>{}</div><dl class=\"facts\">{facts}</dl></article>",
-        escape(title),
-        chip(chip_label, tone_name)
-    )
+    .into_string()
 }
 
-fn chip(label: &str, tone_name: &str) -> String {
+fn chip(label: &str, tone_name: &str) -> maud::Markup {
     let tone_name = match tone_name {
         "ok" | "bad" => tone_name,
         _ => "neutral",
     };
-    format!("<span class=\"chip {tone_name}\">{}</span>", escape(label))
+    let class = format!("chip {tone_name}");
+    html! { span class=(class) { (label) } }
 }
 
 fn tone(state: &str) -> &'static str {
@@ -1158,110 +1175,6 @@ fn truncate(text: String, max: usize) -> String {
     }
     text[..end].to_owned()
 }
-
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-const SCRIPT: &str = r#"<script>
-(function () {
-  var root = document.getElementById("debug-root");
-  var frames = document.getElementById("frames");
-  var logs = document.getElementById("app-logs");
-  var status = document.getElementById("status");
-  var pauseBtn = document.getElementById("pause");
-  var live = document.getElementById("live");
-  var framePane = document.getElementById("frames-scroll");
-  var logPane = document.getElementById("logs-scroll");
-  if (!root || !frames || !logs || !status) return;
-  var paused = false;
-  var queue = [];
-  var stickFrames = true;
-  var stickLogs = true;
-  function nearBottom(el) {
-    return el.scrollHeight - el.scrollTop - el.clientHeight < 48;
-  }
-  if (framePane) framePane.addEventListener("scroll", function () { stickFrames = nearBottom(framePane); });
-  if (logPane) logPane.addEventListener("scroll", function () { stickLogs = nearBottom(logPane); });
-  function applyFilters() {
-    var dir = document.getElementById("dir").value;
-    var kind = document.getElementById("kind").value;
-    var level = document.getElementById("level").value;
-    var showKeep = document.getElementById("keepalives").checked;
-    frames.classList.toggle("hide-keep", !showKeep);
-    frames.querySelectorAll("li").forEach(function (li) {
-      var dirOk = !dir || li.dataset.dir === dir;
-      var kindOk = !kind || li.dataset.type === kind;
-      li.hidden = !(dirOk && kindOk);
-    });
-    logs.querySelectorAll("li").forEach(function (li) {
-      var value = li.dataset.level || "";
-      var levelOk = !level || value === level || (level === "WARN" && value === "WARNING");
-      li.hidden = !levelOk;
-    });
-  }
-  function trim(list) {
-    while (list.children.length > 400) list.removeChild(list.firstElementChild);
-  }
-  function appendHtml(html) {
-    var tpl = document.createElement("template");
-    tpl.innerHTML = html.trim();
-    var li = tpl.content.firstElementChild;
-    if (!li) return;
-    var list = li.dataset.stream === "log" ? logs : frames;
-    var sel = 'li[data-stream="' + li.dataset.stream + '"][data-seq="' + li.dataset.seq + '"]';
-    if (list.querySelector(sel)) return;
-    list.appendChild(li);
-    trim(list);
-    var empty = document.getElementById("frames-empty");
-    if (empty && list === frames) empty.hidden = true;
-    applyFilters();
-    if (!paused) {
-      if (list === frames && framePane && stickFrames) framePane.scrollTop = framePane.scrollHeight;
-      if (list === logs && logPane && stickLogs) logPane.scrollTop = logPane.scrollHeight;
-    }
-  }
-  if (pauseBtn) {
-    pauseBtn.addEventListener("click", function () {
-      paused = !paused;
-      pauseBtn.textContent = paused ? "Resume" : "Pause";
-      pauseBtn.setAttribute("aria-pressed", paused ? "true" : "false");
-      if (!paused) {
-        queue.forEach(appendHtml);
-        queue.length = 0;
-        if (framePane && stickFrames) framePane.scrollTop = framePane.scrollHeight;
-        if (logPane && stickLogs) logPane.scrollTop = logPane.scrollHeight;
-      }
-    });
-  }
-  ["dir", "kind", "level", "keepalives"].forEach(function (id) {
-    var el = document.getElementById(id);
-    if (el) el.addEventListener("change", applyFilters);
-  });
-  var src = new EventSource("/logs/events?frames=" + (root.dataset.frames || "0") + "&logs=" + (root.dataset.logs || "0"));
-  src.addEventListener("status", function (event) {
-    if (!paused) status.innerHTML = event.data;
-  });
-  function onItem(event) {
-    if (paused) {
-      queue.push(event.data);
-      if (pauseBtn) pauseBtn.textContent = "Resume (" + queue.length + ")";
-      return;
-    }
-    appendHtml(event.data);
-  }
-  src.addEventListener("frame", onItem);
-  src.addEventListener("log", onItem);
-  src.onopen = function () { if (live) live.textContent = "live"; };
-  src.onerror = function () { if (live) live.textContent = "reconnecting"; };
-  applyFilters();
-  if (framePane) framePane.scrollTop = framePane.scrollHeight;
-  if (logPane) logPane.scrollTop = logPane.scrollHeight;
-})();
-</script>"#;
 
 #[cfg(test)]
 mod tests {

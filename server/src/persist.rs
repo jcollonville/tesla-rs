@@ -257,14 +257,16 @@ impl LiveEvent {
 pub(crate) async fn upsert_vehicle(
     pool: &PgPool,
     identity: VehicleIdentity<'_>,
+    account_id: Option<i64>,
 ) -> Result<i64, AppError> {
     let row: (i64,) = sqlx::query_as(
-        "INSERT INTO vehicles (vin, tesla_id, legacy_vehicle_id, name, source, external_id)
-         VALUES ($1, $2, $3, $4, 'fleet', $1)
+        "INSERT INTO vehicles (vin, tesla_id, legacy_vehicle_id, name, source, external_id, account_id)
+         VALUES ($1, $2, $3, $4, 'fleet', $1, $5)
          ON CONFLICT (vin) DO UPDATE SET
             tesla_id = COALESCE(EXCLUDED.tesla_id, vehicles.tesla_id),
             legacy_vehicle_id = COALESCE(EXCLUDED.legacy_vehicle_id, vehicles.legacy_vehicle_id),
             name = COALESCE(EXCLUDED.name, vehicles.name),
+            account_id = COALESCE(vehicles.account_id, EXCLUDED.account_id),
             updated_at = now()
          RETURNING id",
     )
@@ -272,6 +274,7 @@ pub(crate) async fn upsert_vehicle(
     .bind(identity.tesla_id)
     .bind(identity.legacy_vehicle_id)
     .bind(identity.name)
+    .bind(account_id)
     .fetch_one(pool)
     .await?;
     Ok(row.0)
