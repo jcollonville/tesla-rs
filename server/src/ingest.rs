@@ -28,7 +28,7 @@ use crate::persist::{
     LiveEvent, Runtime, VehicleIdentity, apply_observation, load_runtime, record_error,
     resting_observation, upsert_vehicle,
 };
-use crate::state::{Activity, Observation, Presence, refresh_plugged_in};
+use crate::state::{Activity, Observation, Presence, refresh_plugged_in, sanitize_charger_type};
 
 const LIVE_ENDPOINTS: &[VehicleDataEndpoint] = &[
     VehicleDataEndpoint::ChargeState,
@@ -449,7 +449,7 @@ pub(crate) fn observation_from_vehicle_data(data: VehicleData) -> Observation {
         obs.charger_current = finite(charge.charger_actual_current);
         obs.charge_current_request = finite(charge.charge_current_request);
         obs.fast_charger = charge.fast_charger_present;
-        obs.fast_charger_type = charge.fast_charger_type;
+        obs.fast_charger_type = sanitize_charger_type(charge.fast_charger_type.as_deref());
         obs.charge_limit_soc = charge.charge_limit_soc;
         obs.charge_port_door_open = charge.charge_port_door_open;
         obs.charge_port_latch = charge.charge_port_latch;
@@ -978,5 +978,28 @@ mod tests {
         let obs = super::observation_from_vehicle_data(data);
         assert_eq!(obs.time_to_full_charge_h, Some(1.5));
         assert_eq!(obs.plugged_in, Some(false));
+    }
+
+    #[test]
+    fn invalid_fast_charger_type_is_not_stored() {
+        let invalid: tesla_fleet_api::VehicleData = serde_json::from_str(
+            r#"{"id":1,"vin":"V","charge_state":{"fast_charger_type":"<invalid>","charging_state":"Charging"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::observation_from_vehicle_data(invalid).fast_charger_type,
+            None
+        );
+
+        let combo: tesla_fleet_api::VehicleData = serde_json::from_str(
+            r#"{"id":1,"vin":"V","charge_state":{"fast_charger_type":" Combo ","fast_charger_present":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::observation_from_vehicle_data(combo)
+                .fast_charger_type
+                .as_deref(),
+            Some("Combo")
+        );
     }
 }

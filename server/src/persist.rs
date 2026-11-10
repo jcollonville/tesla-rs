@@ -1005,7 +1005,16 @@ async fn close_charge(
             latitude = COALESCE($11, latitude),
             longitude = COALESCE($12, longitude),
             is_dc = COALESCE(is_dc, $13),
-            charger_type = COALESCE(charger_type, $14),
+            charger_type = COALESCE(
+                CASE
+                    WHEN btrim(charger_type) = ''
+                        OR lower(btrim(charger_type)) IN ('<invalid>', 'none', 'null')
+                        OR btrim(charger_type) ~ '^<.*>$'
+                    THEN NULL
+                    ELSE charger_type
+                END,
+                $14
+            ),
             max_power_kw = $15,
             duration_s = $16,
             outside_temp_avg_c = $17,
