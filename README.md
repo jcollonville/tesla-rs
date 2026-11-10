@@ -407,7 +407,7 @@ curl -fsS http://127.0.0.1:4000/.well-known/appspecific/com.tesla.3p.public-key.
 
 UI:
 
-1. Open `http://127.0.0.1:4000/`. The heading is **Sign in** (the document title is `tesla-logger`). The password is `TESLA_LOGGER_UI_PASSWORD`.
+1. Open `http://127.0.0.1:4000/`. The heading is **Sign in** (the document title is `Tesla Logger`). The password is `TESLA_LOGGER_UI_PASSWORD`.
 2. After login the dashboard lists vehicles once Fleet polling has stored some. **Tesla connected** means a Fleet token file is present.
 3. Open `http://127.0.0.1:4000/logs` in a private window, or after signing out. You are sent back to `/`, which is the sign-in page. After signing in, `/logs` shows the in-memory lines.
 

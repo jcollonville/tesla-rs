@@ -63,6 +63,9 @@ p { margin: 0.75rem 0; }
 a { color: var(--primary); }
 
 .kicker {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
   margin: 0 0 0.15rem;
   color: var(--muted);
   font-size: 0.75rem;
@@ -72,6 +75,12 @@ a { color: var(--primary); }
 }
 
 .kicker a { color: inherit; text-decoration: none; }
+
+.brand-mark {
+  width: 1.125rem;
+  height: 1.125rem;
+  flex: none;
+}
 .muted { color: var(--muted); }
 .title { display: inline-flex; align-items: center; gap: 0.45rem; }
 
