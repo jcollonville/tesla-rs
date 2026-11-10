@@ -16,6 +16,7 @@ mod app;
 mod config;
 mod crypto;
 mod debug;
+mod edits;
 mod error;
 mod geocode;
 mod geofence;

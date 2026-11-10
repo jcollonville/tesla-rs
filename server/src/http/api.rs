@@ -93,7 +93,8 @@ pub(crate) async fn list_drives(
     let page = page_params(query.page, query.per_page)?;
     let total: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM drives
-         WHERE ($1::bigint IS NULL OR vehicle_id = $1)
+         WHERE deleted_at IS NULL
+           AND ($1::bigint IS NULL OR vehicle_id = $1)
            AND ($2::timestamptz IS NULL OR start_at >= $2)
            AND ($3::timestamptz IS NULL OR start_at < $3)",
     )
@@ -201,7 +202,8 @@ pub(crate) async fn list_charges(
     let page = page_params(query.page, query.per_page)?;
     let total: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM charges
-         WHERE ($1::bigint IS NULL OR vehicle_id = $1)
+         WHERE deleted_at IS NULL
+           AND ($1::bigint IS NULL OR vehicle_id = $1)
            AND ($2::timestamptz IS NULL OR start_at >= $2)
            AND ($3::timestamptz IS NULL OR start_at < $3)",
     )
@@ -269,7 +271,7 @@ pub(crate) async fn stats(
                 COALESCE(SUM(duration_s), 0)::bigint,
                 COALESCE(SUM(energy_used_kwh), 0)::float8
          FROM drives
-         WHERE vehicle_id = $1 AND end_at IS NOT NULL
+         WHERE vehicle_id = $1 AND end_at IS NOT NULL AND deleted_at IS NULL
            AND ($2::timestamptz IS NULL OR start_at >= $2)
            AND ($3::timestamptz IS NULL OR start_at < $3)",
     )
@@ -282,7 +284,7 @@ pub(crate) async fn stats(
     let charges: (i64, f64) = sqlx::query_as(
         "SELECT COUNT(*)::bigint, COALESCE(SUM(energy_added_kwh), 0)::float8
          FROM charges
-         WHERE vehicle_id = $1 AND end_at IS NOT NULL
+         WHERE vehicle_id = $1 AND end_at IS NOT NULL AND deleted_at IS NULL
            AND ($2::timestamptz IS NULL OR start_at >= $2)
            AND ($3::timestamptz IS NULL OR start_at < $3)",
     )
@@ -472,6 +474,7 @@ fn max_points(value: Option<i64>) -> Result<usize, ApiError> {
 }
 
 fn drive_select(tail: &str) -> String {
+    let tail = tail.replacen("WHERE ", "WHERE deleted_at IS NULL AND ", 1);
     format!(
         "SELECT id, vehicle_id, start_at, end_at, distance_km, duration_s,
                 start_battery_level, end_battery_level, start_rated_range_km, end_rated_range_km,
@@ -484,6 +487,7 @@ fn drive_select(tail: &str) -> String {
 }
 
 fn charge_select(tail: &str) -> String {
+    let tail = tail.replacen("WHERE ", "WHERE deleted_at IS NULL AND ", 1);
     format!(
         "SELECT id, vehicle_id, start_at, end_at, energy_added_kwh, energy_used_kwh,
                 start_battery_level, end_battery_level, start_rated_range_km, end_rated_range_km,

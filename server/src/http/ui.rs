@@ -37,6 +37,7 @@ pub(crate) fn routes() -> Router<AppState> {
             "/v/{id}/charges/{charge_id}",
             get(super::trips::charge_detail),
         )
+        .merge(super::edits::routes())
         .route("/v/{id}/stats", get(stats))
         .route("/v/{id}/connection", get(vehicle_connection))
         .route("/connection", get(account_connection))
@@ -1170,7 +1171,7 @@ async fn vehicle_rows(app: &AppState, user_id: i64) -> Result<Vec<VehicleRow>, s
 async fn month_by_vehicle(app: &AppState, start: DateTime<Utc>) -> HashMap<i64, (f64, f64)> {
     let drives: Vec<(i64, Option<f64>)> = sqlx::query_as(
         "SELECT vehicle_id, COALESCE(SUM(distance_km), 0)
-         FROM drives WHERE start_at >= $1 GROUP BY vehicle_id",
+         FROM drives WHERE deleted_at IS NULL AND start_at >= $1 GROUP BY vehicle_id",
     )
     .bind(start)
     .fetch_all(&app.inner.db)
@@ -1178,7 +1179,7 @@ async fn month_by_vehicle(app: &AppState, start: DateTime<Utc>) -> HashMap<i64, 
     .unwrap_or_default();
     let charges: Vec<(i64, Option<f64>)> = sqlx::query_as(
         "SELECT vehicle_id, COALESCE(SUM(energy_added_kwh), 0)
-         FROM charges WHERE start_at >= $1 GROUP BY vehicle_id",
+         FROM charges WHERE deleted_at IS NULL AND start_at >= $1 GROUP BY vehicle_id",
     )
     .bind(start)
     .fetch_all(&app.inner.db)
@@ -1200,7 +1201,7 @@ type ActivityBrief = (DateTime<Utc>, Option<f64>, Option<DateTime<Utc>>);
 async fn last_drive(app: &AppState, vehicle_id: i64) -> String {
     let row: Option<ActivityBrief> = sqlx::query_as(
         "SELECT start_at, distance_km, end_at FROM drives
-         WHERE vehicle_id = $1 ORDER BY start_at DESC LIMIT 1",
+         WHERE vehicle_id = $1 AND deleted_at IS NULL ORDER BY start_at DESC LIMIT 1",
     )
     .bind(vehicle_id)
     .fetch_optional(&app.inner.db)
@@ -1220,7 +1221,7 @@ async fn last_drive(app: &AppState, vehicle_id: i64) -> String {
 async fn last_charge(app: &AppState, vehicle_id: i64) -> String {
     let row: Option<ActivityBrief> = sqlx::query_as(
         "SELECT start_at, energy_added_kwh, end_at FROM charges
-         WHERE vehicle_id = $1 ORDER BY start_at DESC LIMIT 1",
+         WHERE vehicle_id = $1 AND deleted_at IS NULL ORDER BY start_at DESC LIMIT 1",
     )
     .bind(vehicle_id)
     .fetch_optional(&app.inner.db)

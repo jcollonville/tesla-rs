@@ -361,6 +361,7 @@ pub(crate) fn series_query_sql(window: &StatsWindow) -> String {
             FROM drives d
             JOIN vehicles v ON v.id = d.vehicle_id
             WHERE d.vehicle_id = $1
+              AND d.deleted_at IS NULL
               AND d.end_at IS NOT NULL
               AND d.start_at >= {start}
               AND d.start_at < {end}
@@ -384,6 +385,7 @@ pub(crate) fn series_query_sql(window: &StatsWindow) -> String {
                 COALESCE({charge_end}, {charge_start}) AS range_at_100
             FROM charges c
             WHERE c.vehicle_id = $1
+              AND c.deleted_at IS NULL
               AND c.end_at IS NOT NULL
               AND c.start_at >= {start}
               AND c.start_at < {end}
@@ -425,6 +427,7 @@ pub(crate) fn series_query_sql(window: &StatsWindow) -> String {
                 end_odometer_km
             FROM drives
             WHERE vehicle_id = $1
+              AND deleted_at IS NULL
               AND end_at IS NOT NULL
               AND end_at >= {start}
             UNION ALL
@@ -437,6 +440,7 @@ pub(crate) fn series_query_sql(window: &StatsWindow) -> String {
                 NULL::float8
             FROM charges
             WHERE vehicle_id = $1
+              AND deleted_at IS NULL
               AND end_at IS NOT NULL
               AND end_at >= {start}
         ),
@@ -548,6 +552,7 @@ pub(crate) fn consumption_query_sql(window: &StatsWindow) -> String {
             FROM drives d
             JOIN vehicles v ON v.id = d.vehicle_id
             WHERE d.vehicle_id = $1
+              AND d.deleted_at IS NULL
               AND d.end_at IS NOT NULL
               AND d.outside_temp_avg_c IS NOT NULL
               AND d.distance_km > 0

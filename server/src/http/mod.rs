@@ -3,6 +3,7 @@
 
 pub(crate) mod api;
 mod assets;
+mod edits;
 mod markup;
 mod owner;
 pub(crate) mod stats;
