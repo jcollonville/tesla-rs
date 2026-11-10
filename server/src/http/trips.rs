@@ -216,7 +216,7 @@ pub(super) async fn drive_detail(
     };
     let drive = sqlx::query_as::<_, DriveRow>(
         "SELECT id, start_at, end_at, distance_km, duration_s, energy_used_kwh, source
-         FROM drives WHERE id = $1 AND vehicle_id = $2",
+         FROM drives WHERE id = $1 AND vehicle_id = $2 AND deleted_at IS NULL",
     )
     .bind(drive_id)
     .bind(id)
@@ -278,6 +278,49 @@ pub(super) async fn drive_detail(
             (maud::PreEscaped(power))
             h2 { "Altitude" }
             (maud::PreEscaped(altitude))
+        }
+        section class="card" {
+            h2 { "Modifier" }
+            form class="stack" method="post" action=(format!("/v/{id}/drives/{drive_id}/edit")) {
+                input type="hidden" name="csrf" value=(&page.csrf);
+                label class="field" for="note" { "Note" input id="note" name="note"; }
+                label class="field" for="tag" { "Tag" input id="tag" name="tag"; }
+                label class="field" for="start_geofence_id" { "Géofence départ (id, 0 pour vider)" input id="start_geofence_id" name="start_geofence_id"; }
+                label class="field" for="end_geofence_id" { "Géofence arrivée" input id="end_geofence_id" name="end_geofence_id"; }
+                label class="field" for="start_address_id" { "Adresse départ" input id="start_address_id" name="start_address_id"; }
+                label class="field" for="end_address_id" { "Adresse arrivée" input id="end_address_id" name="end_address_id"; }
+                button type="submit" { "Enregistrer" }
+            }
+            form method="post" action=(format!("/v/{id}/drives/{drive_id}/recompute")) {
+                input type="hidden" name="csrf" value=(&page.csrf);
+                button class="tonal" type="submit" { "Recalculer" }
+            }
+            form class="stack" method="post" action=(format!("/v/{id}/drives/{drive_id}/split")) {
+                input type="hidden" name="csrf" value=(&page.csrf);
+                label class="field" for="split_at" { "Couper à" input id="split_at" name="at" required; }
+                button class="tonal" type="submit" { "Couper" }
+            }
+            form class="stack" method="post" action=(format!("/v/{id}/drives/{drive_id}/merge")) {
+                input type="hidden" name="csrf" value=(&page.csrf);
+                label class="field" for="other" { "Fusionner avec l'id" input id="other" name="other" required; }
+                button class="tonal" type="submit" { "Fusionner" }
+            }
+            form method="post" action=(format!("/v/{id}/drives/{drive_id}/trash")) {
+                input type="hidden" name="csrf" value=(&page.csrf);
+                button class="danger" type="submit" { "Mettre à la corbeille" }
+            }
+            form class="stack" method="post" action=(format!("/v/{id}/drives/{drive_id}/purge")) {
+                input type="hidden" name="csrf" value=(&page.csrf);
+                label class="field" for="confirm_id" { "Retaper l'id pour purger" input id="confirm_id" name="confirm_id" required; }
+                label class="field" for="positions" {
+                    "Positions"
+                    select id="positions" name="positions" {
+                        option value="detach" { "Détacher" }
+                        option value="delete" { "Supprimer sur la plage" }
+                    }
+                }
+                button class="danger" type="submit" { "Purger" }
+            }
         }
     };
     html_page(document(false, body), page.cookie)
@@ -399,7 +442,7 @@ pub(super) async fn charge_detail(
     };
     let charge = sqlx::query_as::<_, ChargeRow>(
         "SELECT id, start_at, end_at, energy_added_kwh, energy_used_kwh, duration_s, cost, is_dc, source
-         FROM charges WHERE id = $1 AND vehicle_id = $2",
+         FROM charges WHERE id = $1 AND vehicle_id = $2 AND deleted_at IS NULL",
     )
     .bind(charge_id)
     .bind(id)
@@ -570,6 +613,7 @@ fn drive_sql(cursor: &str, order: &str) -> String {
         "SELECT id, start_at, end_at, distance_km, duration_s, energy_used_kwh, source
          FROM drives
          WHERE vehicle_id = $1
+           AND deleted_at IS NULL
            AND ($2::timestamptz IS NULL OR start_at >= $2)
            AND ($3::timestamptz IS NULL OR start_at < $3)
            AND ($4::text IS NULL OR source = $4)
@@ -638,6 +682,7 @@ fn charge_sql(cursor: &str, order: &str) -> String {
         "SELECT id, start_at, end_at, energy_added_kwh, energy_used_kwh, duration_s, cost, is_dc, source
          FROM charges
          WHERE vehicle_id = $1
+           AND deleted_at IS NULL
            AND ($2::timestamptz IS NULL OR start_at >= $2)
            AND ($3::timestamptz IS NULL OR start_at < $3)
            AND ($4::text IS NULL OR source = $4)
@@ -804,7 +849,7 @@ fn chart_svg(series: &[(f64, f64)]) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "<svg viewBox=\"0 0 100 44\" role=\"img\" aria-label=\"graphique\"><polyline fill=\"none\" stroke=\"currentColor\" stroke-width=\"0.6\" points=\"{coords}\"/></svg>"
+        "<svg class=\"chart\" viewBox=\"0 0 100 44\" width=\"640\" height=\"180\" role=\"img\" aria-label=\"graphique\"><polyline fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.2\" points=\"{coords}\"/></svg>"
     )
 }
 
@@ -846,7 +891,9 @@ mod tests {
     fn chart_svg_has_no_style_attribute() {
         let svg = chart_svg(&[(0.0, 1.0), (1.0, 3.0)]);
         assert!(svg.contains("<polyline"));
+        assert!(svg.contains("height=\"180\""));
         assert!(!svg.contains("style="));
+        assert!(!svg.contains("<text"));
         assert!(!svg.contains("<script"));
     }
 
