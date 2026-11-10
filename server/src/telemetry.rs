@@ -150,9 +150,9 @@ async fn handle_record(
             };
             if presence == Presence::Offline {
                 folded.remove(&vin);
-                let mut guard = archive.runtimes.lock().await;
-                if let Some(runtime) = guard.get_mut(&vin) {
-                    runtime.last_telemetry = None;
+                let slot = archive.runtimes.lock().await.get(&vin).cloned();
+                if let Some(slot) = slot {
+                    slot.lock().await.last_telemetry = None;
                 }
             }
             apply_for_vin(

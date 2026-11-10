@@ -26,11 +26,15 @@ use tokio::time::sleep;
 
 use crate::config::Config;
 use crate::debug::{DebugBoard, OwnerCount, OwnerNote};
-use crate::ingest::{Archive, apply_stream_for_vin};
+use crate::ingest::{Archive, apply_stream_batch};
 use crate::persist::{StreamFix, VehicleIdentity, upsert_vehicle};
 use crate::units::{MILES_TO_KM, miles_to_km};
 
 const FEET_TO_M: f64 = 0.3048;
+/// Socket reads enqueue here and return. The writer is the only task that touches the database.
+const STREAM_QUEUE: usize = 512;
+const STREAM_BATCH: usize = 20;
+const STREAM_BATCH_WAIT: Duration = Duration::from_secs(1);
 
 /// In-memory streaming status for the state API. Tokens are never stored here.
 #[derive(Clone, Default)]
@@ -49,6 +53,8 @@ struct BoardState {
 struct Slot {
     status: String,
     detail: Option<String>,
+    latest_sample_at: Option<DateTime<Utc>>,
+    queue_depth: usize,
 }
 
 /// Point-in-time view used by the status page and the state API.
@@ -56,7 +62,16 @@ struct Slot {
 pub(crate) struct StreamSnapshot {
     enabled: bool,
     configured: bool,
-    vehicles: HashMap<i64, (String, Option<String>)>,
+    vehicles: HashMap<i64, VehicleStream>,
+}
+
+/// Per-vehicle stream status. Lag is `now - latest_sample_at` at render time.
+#[derive(Clone, Debug)]
+pub(crate) struct VehicleStream {
+    pub(crate) status: String,
+    pub(crate) detail: Option<String>,
+    pub(crate) latest_sample_at: Option<DateTime<Utc>>,
+    pub(crate) queue_depth: usize,
 }
 
 impl StreamSnapshot {
@@ -65,10 +80,17 @@ impl StreamSnapshot {
         if !self.enabled || !self.configured {
             return ("disabled".to_owned(), None);
         }
+        self.vehicles.get(&vehicle_id).map_or_else(
+            || ("error".to_owned(), Some("connecting".to_owned())),
+            |slot| (slot.status.clone(), slot.detail.clone()),
+        )
+    }
+
+    /// Newest sample time and how many samples are waiting to be written.
+    pub(crate) fn ingestion(&self, vehicle_id: i64) -> (Option<DateTime<Utc>>, usize) {
         self.vehicles
             .get(&vehicle_id)
-            .cloned()
-            .unwrap_or_else(|| ("error".to_owned(), Some("connecting".to_owned())))
+            .map_or((None, 0), |slot| (slot.latest_sample_at, slot.queue_depth))
     }
 
     /// Page-level status. Per-vehicle state is on [`Self::for_vehicle`].
@@ -82,7 +104,7 @@ impl StreamSnapshot {
         if self
             .vehicles
             .values()
-            .all(|(status, _)| status == "connected")
+            .all(|slot| slot.status == "connected")
         {
             "connected"
         } else {
@@ -116,14 +138,47 @@ impl StreamBoard {
         if changed {
             tracing::info!(vehicle_id, status, "owner stream status");
         }
-        guard.vehicles.insert(
-            vehicle_id,
-            Slot {
-                status: status.to_owned(),
-                detail,
-            },
-        );
+        if let Some(slot) = guard.vehicles.get_mut(&vehicle_id) {
+            if slot.status != status {
+                status.clone_into(&mut slot.status);
+            }
+            slot.detail = detail;
+        } else {
+            guard.vehicles.insert(
+                vehicle_id,
+                Slot {
+                    status: status.to_owned(),
+                    detail,
+                    latest_sample_at: None,
+                    queue_depth: 0,
+                },
+            );
+        }
         guard.logged_disabled = false;
+    }
+
+    pub(crate) async fn note_ingestion(
+        &self,
+        vehicle_id: i64,
+        sample_at: DateTime<Utc>,
+        queue_depth: usize,
+    ) {
+        let mut guard = self.inner.lock().await;
+        let slot = guard.vehicles.entry(vehicle_id).or_insert_with(|| Slot {
+            status: "connected".to_owned(),
+            detail: None,
+            latest_sample_at: None,
+            queue_depth: 0,
+        });
+        slot.latest_sample_at = Some(sample_at);
+        slot.queue_depth = queue_depth;
+    }
+
+    pub(crate) async fn set_queue_depth(&self, vehicle_id: i64, queue_depth: usize) {
+        let mut guard = self.inner.lock().await;
+        if let Some(slot) = guard.vehicles.get_mut(&vehicle_id) {
+            slot.queue_depth = queue_depth;
+        }
     }
 
     pub(crate) async fn snapshot(&self) -> StreamSnapshot {
@@ -134,7 +189,17 @@ impl StreamBoard {
             vehicles: guard
                 .vehicles
                 .iter()
-                .map(|(id, slot)| (*id, (slot.status.clone(), slot.detail.clone())))
+                .map(|(id, slot)| {
+                    (
+                        *id,
+                        VehicleStream {
+                            status: slot.status.clone(),
+                            detail: slot.detail.clone(),
+                            latest_sample_at: slot.latest_sample_at,
+                            queue_depth: slot.queue_depth,
+                        },
+                    )
+                })
                 .collect(),
         }
     }
@@ -424,16 +489,46 @@ async fn vehicle_loop<S: TokenStore + 'static>(
     url: String,
     mut stop: watch::Receiver<bool>,
 ) {
+    let (tx, rx) = mpsc::channel(STREAM_QUEUE);
+    let writer = tokio::spawn(write_samples(
+        rx,
+        Arc::clone(&archive),
+        board.clone(),
+        debug.clone(),
+        target.db_id,
+        target.stream_tag,
+        target.vin.clone(),
+    ));
+    session_loop(&tx, target, session, archive, board, debug, url, &mut stop).await;
+    drop(tx);
+    if let Err(err) = writer.await
+        && !err.is_cancelled()
+    {
+        tracing::warn!(error = %err, "owner stream writer stopped");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn session_loop<S: TokenStore + 'static>(
+    tx: &mpsc::Sender<StreamFix>,
+    target: Target,
+    session: Arc<OwnerSession<S>>,
+    archive: Arc<Archive>,
+    board: StreamBoard,
+    debug: DebugBoard,
+    url: String,
+    stop: &mut watch::Receiver<bool>,
+) {
     let mut consecutive = 0_u32;
     let mut carry = Carry::default();
     let mut kick = archive.stream_kick.subscribe();
-    loop {
+    'session: loop {
         if *stop.borrow() {
-            return;
+            break 'session;
         }
         let access = match session.access_token().await {
             Ok(token) => token,
-            Err(SessionError::Missing) => return,
+            Err(SessionError::Missing) => break 'session,
             Err(err) => {
                 let class = match err {
                     SessionError::LoginRequired => FailureClass::Auth,
@@ -446,7 +541,7 @@ async fn vehicle_loop<S: TokenStore + 'static>(
                         );
                         FailureClass::Auth
                     }
-                    SessionError::Missing => return,
+                    SessionError::Missing => break 'session,
                 };
                 if !backoff(
                     &mut consecutive,
@@ -456,13 +551,13 @@ async fn vehicle_loop<S: TokenStore + 'static>(
                     &board,
                     &debug,
                     &mut kick,
-                    &mut stop,
+                    stop,
                     true,
                     None,
                 )
                 .await
                 {
-                    return;
+                    break 'session;
                 }
                 continue;
             }
@@ -473,28 +568,28 @@ async fn vehicle_loop<S: TokenStore + 'static>(
         debug.set_owner_vehicle(target.db_id, target.stream_tag, "connecting");
         let change = archive.gps.mark_down(target.db_id).await;
         follow_mode(&archive, &target.vin, change).await;
-        let (tx, mut rx) = mpsc::channel(32);
-        let pump = pump_stream(&url, &access, target.stream_tag, tx);
+        let (frames_tx, mut frames) = mpsc::channel(32);
+        let pump = pump_stream(&url, &access, target.stream_tag, frames_tx);
         tokio::pin!(pump);
         let mut saw = false;
         let mut rx_open = true;
         let end = loop {
             tokio::select! {
                 biased;
-                _ = stop.changed() => return,
-                notice = rx.recv(), if rx_open => {
+                _ = stop.changed() => break 'session,
+                notice = frames.recv(), if rx_open => {
                     match notice {
                         Some(notice) => {
                             saw = true;
-                            accept_notice(&board, &debug, &archive, &target, &mut carry, notice).await;
+                            accept_notice(&board, &debug, &archive, &target, &mut carry, tx, notice).await;
                         }
                         None => rx_open = false,
                     }
                 }
                 end = &mut pump => {
-                    while let Ok(notice) = rx.try_recv() {
+                    while let Ok(notice) = frames.try_recv() {
                         saw = true;
-                        accept_notice(&board, &debug, &archive, &target, &mut carry, notice).await;
+                        accept_notice(&board, &debug, &archive, &target, &mut carry, tx, notice).await;
                     }
                     break end;
                 }
@@ -522,13 +617,65 @@ async fn vehicle_loop<S: TokenStore + 'static>(
             &board,
             &debug,
             &mut kick,
-            &mut stop,
+            stop,
             true,
             Some(&stop_info),
         )
         .await
         {
-            return;
+            break 'session;
+        }
+    }
+}
+
+async fn write_samples(
+    mut rx: mpsc::Receiver<StreamFix>,
+    archive: Arc<Archive>,
+    board: StreamBoard,
+    debug: DebugBoard,
+    db_id: i64,
+    stream_tag: i64,
+    vin: String,
+) {
+    let mut batch = Vec::with_capacity(STREAM_BATCH);
+    loop {
+        let Some(first) = rx.recv().await else {
+            break;
+        };
+        batch.push(first);
+        let deadline = Instant::now() + STREAM_BATCH_WAIT;
+        loop {
+            if batch.len() >= STREAM_BATCH {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::select! {
+                incoming = rx.recv() => {
+                    match incoming {
+                        Some(sample) => batch.push(sample),
+                        None => break,
+                    }
+                }
+                () = sleep(remaining) => break,
+            }
+        }
+        if let Err(err) = apply_stream_batch(&archive, &vin, db_id, &batch).await {
+            tracing::warn!(
+                vehicle_id = db_id,
+                stream_id = stream_tag,
+                error = %crate::logs::redact_line(&err.to_string(), &[]),
+                "owner stream sample was not stored"
+            );
+        }
+        batch.clear();
+        let depth = rx.len();
+        debug.set_stream_queue(db_id, depth);
+        board.set_queue_depth(db_id, depth).await;
+        if rx.is_closed() && rx.is_empty() {
+            break;
         }
     }
 }
@@ -539,6 +686,7 @@ async fn accept_notice(
     archive: &Archive,
     target: &Target,
     carry: &mut Carry,
+    tx: &mpsc::Sender<StreamFix>,
     notice: StreamEvent,
 ) {
     note_stream_event(debug, target, &notice);
@@ -552,7 +700,7 @@ async fn accept_notice(
             board.set_vehicle(target.db_id, "connected", None).await;
             let change = archive.gps.mark_update(target.db_id).await;
             follow_mode(archive, &target.vin, change).await;
-            store_sample(debug, archive, target, carry, &sample).await;
+            enqueue_sample(debug, board, target, carry, tx, &sample).await;
         }
         StreamEvent::Trace(_) => {}
     }
@@ -694,36 +842,29 @@ fn fmt_num(value: Option<f64>) -> String {
     }
 }
 
-async fn store_sample(
+async fn enqueue_sample(
     debug: &DebugBoard,
-    archive: &Archive,
+    board: &StreamBoard,
     target: &Target,
     carry: &mut Carry,
+    tx: &mpsc::Sender<StreamFix>,
     sample: &StreamSample,
 ) {
     let Some(fix) = consider_sample(debug, target, carry, sample) else {
         return;
     };
-    if let Err(err) = apply_stream_for_vin(
-        archive,
-        &target.vin,
-        VehicleIdentity {
-            vin: &target.vin,
-            tesla_id: None,
-            legacy_vehicle_id: None,
-            name: None,
-        },
-        &fix,
-    )
-    .await
-    {
+    let at = fix.at;
+    if tx.send(fix).await.is_err() {
         tracing::warn!(
             vehicle_id = target.db_id,
             stream_id = target.stream_tag,
-            error = %crate::logs::redact_line(&err.to_string(), &[]),
-            "owner stream sample was not stored"
+            "owner stream writer stopped"
         );
+        return;
     }
+    let depth = STREAM_QUEUE.saturating_sub(tx.capacity());
+    debug.note_ingestion(target.db_id, target.stream_tag, at, depth);
+    board.note_ingestion(target.db_id, at, depth).await;
 }
 
 /// Pull the next Fleet poll forward when GPS mode changes.
@@ -734,11 +875,9 @@ async fn follow_mode(archive: &Archive, vin: &str, change: crate::position_mode:
     if !change.changed {
         return;
     }
-    {
-        let mut guard = archive.runtimes.lock().await;
-        if let Some(runtime) = guard.get_mut(vin) {
-            runtime.next_due = tokio::time::Instant::now();
-        }
+    let slot = archive.runtimes.lock().await.get(vin).cloned();
+    if let Some(slot) = slot {
+        slot.lock().await.next_due = tokio::time::Instant::now();
     }
     archive.gps.notify();
 }

@@ -481,6 +481,49 @@ pub(crate) fn stream_drive_decision(
     }
 }
 
+/// A drive that has already been closed. Late stream samples may join it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClosedDrive {
+    pub id: i64,
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+}
+
+/// Samples older than this at processing time must not open a drive.
+pub(crate) const STALE_STREAM_OPEN: chrono::Duration = chrono::Duration::seconds(30);
+
+/// How far before a closed drive a late sample may still belong to it.
+pub(crate) const CLOSED_DRIVE_SLACK: chrono::Duration = chrono::Duration::seconds(30);
+
+/// Whether one stream sample may open a drive, and which closed drive it joins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StreamSampleGate {
+    pub allow_open: bool,
+    pub attach_closed: Option<i64>,
+}
+
+/// Gates a stream sample against the last closed drive and the processing clock.
+///
+/// A sample at or before that drive's `end_at`, or older than [`STALE_STREAM_OPEN`],
+/// must not open a drive. A sample inside the drive, or up to [`CLOSED_DRIVE_SLACK`]
+/// before it started, is attached to that drive instead.
+pub(crate) fn gate_stream_sample(
+    at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    last_closed: Option<ClosedDrive>,
+) -> StreamSampleGate {
+    let stale = now.signed_duration_since(at) > STALE_STREAM_OPEN;
+    let covers_closed = last_closed.is_some_and(|closed| at <= closed.end_at);
+    let attach_closed = last_closed.and_then(|closed| {
+        let earliest = closed.start_at - CLOSED_DRIVE_SLACK;
+        (at >= earliest && at <= closed.end_at).then_some(closed.id)
+    });
+    StreamSampleGate {
+        allow_open: !stale && !covers_closed,
+        attach_closed,
+    }
+}
+
 /// A streamed fix within two seconds of a polled row is the same moment.
 ///
 /// Poll rows are every fifteen seconds or slower, so this only drops the stream
@@ -869,9 +912,10 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use super::{
-        Activity, Observation, Presence, Sample, Tracker, Transition, keep_closed_drive, reduce,
-        sanitize_charger_type, should_store_stream_position, stream_collides_with_poll,
-        stream_drive_decision, summarize_charge, summarize_drive,
+        Activity, ClosedDrive, Observation, Presence, Sample, Tracker, Transition,
+        gate_stream_sample, keep_closed_drive, reduce, sanitize_charger_type,
+        should_store_stream_position, stream_collides_with_poll, stream_drive_decision,
+        summarize_charge, summarize_drive,
     };
 
     fn odometer_sample(minute: i64, odometer_km: Option<f64>, latitude: f64) -> Sample {
@@ -1176,6 +1220,33 @@ mod tests {
             Some(0.0)
         ));
         assert!(!should_store_stream_position(true, false, None, Some(11.5)));
+    }
+
+    #[test]
+    fn late_samples_attach_to_the_closed_drive_and_do_not_open() {
+        let start = Utc.with_ymd_and_hms(2024, 11, 10, 12, 9, 0).unwrap();
+        let end = start + Duration::minutes(10);
+        let closed = ClosedDrive {
+            id: 7,
+            start_at: start,
+            end_at: end,
+        };
+        let now = Utc::now();
+        let inside = gate_stream_sample(start + Duration::minutes(2), now, Some(closed));
+        assert!(!inside.allow_open);
+        assert_eq!(inside.attach_closed, Some(7));
+        let before = gate_stream_sample(start - Duration::seconds(10), now, Some(closed));
+        assert!(!before.allow_open);
+        assert_eq!(before.attach_closed, Some(7));
+        let ancient = gate_stream_sample(start - Duration::hours(2), now, Some(closed));
+        assert!(!ancient.allow_open);
+        assert_eq!(ancient.attach_closed, None);
+        let stale = gate_stream_sample(now - Duration::seconds(45), now, Some(closed));
+        assert!(!stale.allow_open);
+        assert_eq!(stale.attach_closed, None);
+        let fresh = gate_stream_sample(now, now, Some(closed));
+        assert!(fresh.allow_open);
+        assert_eq!(fresh.attach_closed, None);
     }
 
     #[test]
