@@ -16,7 +16,7 @@ use crate::rdp::{rdp_limit, stride_indices};
 pub(crate) async fn list_vehicles(
     State(app): State<AppState>,
 ) -> Result<Json<Vec<VehicleJson>>, ApiError> {
-    let rows = sqlx::query_as::<_, VehicleJson>(
+    let mut rows = sqlx::query_as::<_, VehicleJson>(
         "SELECT v.id, v.vin, v.name, v.model, v.exterior_color, s.activity,
                 s.battery_level, s.rated_range_km, s.odometer_km, s.latitude, s.longitude,
                 s.speed_kmh, s.charger_power_kw, s.last_poll_at, s.last_error
@@ -27,6 +27,7 @@ pub(crate) async fn list_vehicles(
     .fetch_all(&app.inner.db)
     .await
     .map_err(internal)?;
+    rows.retain(|row| super::vehicle_visible(row.id));
     Ok(Json(rows))
 }
 
@@ -34,6 +35,7 @@ pub(crate) async fn vehicle(
     State(app): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<VehicleJson>, ApiError> {
+    allow_vehicle(id)?;
     let row = sqlx::query_as::<_, VehicleJson>(
         "SELECT v.id, v.vin, v.name, v.model, v.exterior_color, s.activity,
                 s.battery_level, s.rated_range_km, s.odometer_km, s.latitude, s.longitude,
@@ -54,6 +56,7 @@ pub(crate) async fn vehicle_state(
     State(app): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<StateJson>, ApiError> {
+    allow_vehicle(id)?;
     let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM vehicles WHERE id = $1")
         .bind(id)
         .fetch_optional(&app.inner.db)
@@ -84,6 +87,9 @@ pub(crate) async fn list_drives(
     State(app): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Page<DriveJson>>, ApiError> {
+    if let Some(id) = query.vehicle_id {
+        allow_vehicle(id)?;
+    }
     let page = page_params(query.page, query.per_page)?;
     let total: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM drives
@@ -97,7 +103,7 @@ pub(crate) async fn list_drives(
     .fetch_one(&app.inner.db)
     .await
     .map_err(internal)?;
-    let data = sqlx::query_as::<_, DriveJson>(&drive_select(
+    let mut data = sqlx::query_as::<_, DriveJson>(&drive_select(
         "WHERE ($1::bigint IS NULL OR vehicle_id = $1)
            AND ($2::timestamptz IS NULL OR start_at >= $2)
            AND ($3::timestamptz IS NULL OR start_at < $3)
@@ -112,12 +118,21 @@ pub(crate) async fn list_drives(
     .fetch_all(&app.inner.db)
     .await
     .map_err(internal)?;
+    data.retain(|row| super::vehicle_visible(row.vehicle_id));
     Ok(Json(Page {
         data,
         page: page.page,
         per_page: page.per_page,
         total: total.0,
     }))
+}
+
+fn allow_vehicle(id: i64) -> Result<(), ApiError> {
+    if super::vehicle_visible(id) {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound)
+    }
 }
 
 pub(crate) async fn drive_detail(
@@ -132,6 +147,7 @@ pub(crate) async fn drive_detail(
         .await
         .map_err(internal)?
         .ok_or(ApiError::NotFound)?;
+    allow_vehicle(drive.vehicle_id)?;
     let points = sqlx::query_as::<_, PointRow>(
         "SELECT recorded_at, latitude, longitude, speed_kmh, power_kw, battery_level,
                 elevation_m, rated_range_km, odometer_km
@@ -246,6 +262,7 @@ pub(crate) async fn stats(
     let Some(vehicle_id) = query.vehicle_id else {
         return Err(ApiError::BadRequest("vehicle_id is required"));
     };
+    allow_vehicle(vehicle_id)?;
     let drives: (i64, f64, i64, f64) = sqlx::query_as(
         "SELECT COUNT(*)::bigint,
                 COALESCE(SUM(distance_km), 0)::float8,

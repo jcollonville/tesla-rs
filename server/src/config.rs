@@ -184,7 +184,7 @@ impl Config {
         })
     }
 
-    pub(crate) fn public_settings(&self) -> Vec<PublicSetting> {
+    pub(crate) fn public_settings(&self, admin: bool) -> Vec<PublicSetting> {
         let mut rows = Vec::new();
         let mut push = |label: &'static str, key: &str, value: String| {
             rows.push(PublicSetting {
@@ -200,7 +200,9 @@ impl Config {
             self.public_base_url.clone(),
         );
         push("Région", "TESLA_FLEET_AUDIENCE", self.region.to_string());
-        push("Client ID", "TESLA_CLIENT_ID", self.client_id.clone());
+        if admin {
+            push("Client ID", "TESLA_CLIENT_ID", self.client_id.clone());
+        }
         push("Écoute", "TESLA_LISTEN_ADDR", self.listen_addr.to_string());
         push(
             "Poll conduite (s)",
@@ -265,11 +267,13 @@ impl Config {
         push("MQTT", "MQTT_ENABLED", self.mqtt_enabled.to_string());
         push("MQTT hôte", "MQTT_HOST", self.mqtt_host.clone());
         push("MQTT port", "MQTT_PORT", self.mqtt_port.to_string());
-        push(
-            "MQTT utilisateur",
-            "MQTT_USERNAME",
-            self.mqtt_username.clone().unwrap_or_else(|| "—".to_owned()),
-        );
+        if admin {
+            push(
+                "MQTT utilisateur",
+                "MQTT_USERNAME",
+                self.mqtt_username.clone().unwrap_or_else(|| "—".to_owned()),
+            );
+        }
         push(
             "MQTT préfixe",
             "MQTT_TOPIC_PREFIX",
@@ -518,7 +522,7 @@ mod tests {
         assert!(!rendered.contains("ui-secret-value"));
         assert!(!rendered.contains("encrypt-secret"));
         let settings = config
-            .public_settings()
+            .public_settings(true)
             .into_iter()
             .map(|row| row.value)
             .collect::<Vec<_>>()
@@ -528,6 +532,13 @@ mod tests {
         assert!(!settings.contains("ui-secret-value"));
         assert!(!settings.contains("encrypt-secret"));
         assert!(settings.contains("tsl.b-612.fr"));
+        let hidden = config
+            .public_settings(false)
+            .into_iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>();
+        assert!(!hidden.contains(&"Client ID"));
+        assert!(!hidden.contains(&"MQTT utilisateur"));
         assert_eq!(config.redirect_uri, "https://tsl.b-612.fr/auth/callback");
         assert_eq!(config.region, tesla_auth::Region::Europe);
         assert_eq!(config.timezone, "Europe/Paris");

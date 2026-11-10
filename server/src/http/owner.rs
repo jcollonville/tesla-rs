@@ -187,6 +187,12 @@ pub(super) async fn disconnect(
     if !session_ok(&app, &headers, &form.csrf).await {
         return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
     }
+    let sudo = super::ui_session(&app, &headers)
+        .await
+        .is_some_and(|principal| principal.sudo_active());
+    if !sudo {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
+    }
     if let Err(err) = app.inner.owner_store.clear().await {
         tracing::warn!(error = %err, "owner tokens could not be cleared");
         return message(

@@ -662,14 +662,7 @@ async fn write_samples(
                 () = sleep(remaining) => break,
             }
         }
-        if let Err(err) = apply_stream_batch(&archive, &vin, db_id, &batch).await {
-            tracing::warn!(
-                vehicle_id = db_id,
-                stream_id = stream_tag,
-                error = %crate::logs::redact_line(&err.to_string(), &[]),
-                "owner stream sample was not stored"
-            );
-        }
+        store_with_split(&archive, &vin, db_id, stream_tag, &batch).await;
         batch.clear();
         let depth = rx.len();
         debug.set_stream_queue(db_id, depth);
@@ -678,6 +671,52 @@ async fn write_samples(
             break;
         }
     }
+}
+
+async fn store_with_split(
+    archive: &Archive,
+    vin: &str,
+    db_id: i64,
+    stream_tag: i64,
+    samples: &[StreamFix],
+) {
+    if samples.is_empty() {
+        return;
+    }
+    if apply_stream_batch(archive, vin, db_id, samples)
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    if samples.len() == 1 {
+        if let Err(err) = apply_stream_batch(archive, vin, db_id, samples).await {
+            tracing::warn!(
+                vehicle_id = db_id,
+                stream_id = stream_tag,
+                error = %crate::logs::redact_line(&err.to_string(), &[]),
+                "owner stream sample was not stored"
+            );
+        }
+        return;
+    }
+    let mid = samples.len() / 2;
+    Box::pin(store_with_split(
+        archive,
+        vin,
+        db_id,
+        stream_tag,
+        &samples[..mid],
+    ))
+    .await;
+    Box::pin(store_with_split(
+        archive,
+        vin,
+        db_id,
+        stream_tag,
+        &samples[mid..],
+    ))
+    .await;
 }
 
 async fn accept_notice(

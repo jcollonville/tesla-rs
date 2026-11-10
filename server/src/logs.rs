@@ -807,10 +807,10 @@ mod tests {
 
     #[tokio::test]
     async fn logs_page_requires_a_session_and_hides_secrets() {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/unused")
-            .expect("lazy pool");
-        let state = crate::app::test_state(pool).await;
+        let Some(db) = crate::test_util::TestDb::migrated("logs-ui").await else {
+            return;
+        };
+        let state = crate::app::test_state(db.pool.clone()).await;
         let line = format!(
             "owner stream is up access_token={ACCESS} refresh_token={REFRESH} code={CODE} \
              code_verifier={VERIFIER} Authorization: Bearer {BEARER} \
@@ -840,12 +840,16 @@ mod tests {
         )
         .await;
         assert!(posted.status().is_redirection());
-        let session = header_cookie(posted.headers(), "tl_session").expect("session");
+        let session = header_cookie(posted.headers(), "__Host-tl_session").expect("session");
+        sqlx::query("UPDATE users SET must_change_password = false, totp_enabled = true")
+            .execute(&db.pool)
+            .await
+            .unwrap();
         let legacy = call(
             &state,
             "GET",
             "/logs",
-            Some(&format!("tl_session={session}")),
+            Some(&format!("__Host-tl_session={session}")),
             None,
         )
         .await;
@@ -855,7 +859,7 @@ mod tests {
             &state,
             "GET",
             "/debug",
-            Some(&format!("tl_session={session}")),
+            Some(&format!("__Host-tl_session={session}")),
             None,
         )
         .await;
@@ -864,7 +868,7 @@ mod tests {
             &state,
             "GET",
             "/logs/events",
-            Some(&format!("tl_session={session}")),
+            Some(&format!("__Host-tl_session={session}")),
             None,
         )
         .await;
@@ -894,7 +898,7 @@ mod tests {
             &state,
             "GET",
             "/auth/owner",
-            Some(&format!("tl_session={session}")),
+            Some(&format!("__Host-tl_session={session}")),
             None,
         )
         .await;
@@ -904,7 +908,7 @@ mod tests {
             &state,
             "GET",
             "/connection",
-            Some(&format!("tl_session={session}")),
+            Some(&format!("__Host-tl_session={session}")),
             None,
         )
         .await;
