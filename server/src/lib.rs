@@ -27,12 +27,14 @@ mod ingest;
 mod logs;
 mod mqtt;
 mod owner_stream;
+mod passkeys;
 mod persist;
 mod position_mode;
 mod rdp;
 mod settings;
 mod state;
 mod status;
+mod system;
 mod telemetry;
 mod units;
 

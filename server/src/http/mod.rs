@@ -236,7 +236,10 @@ async fn require_bearer(
             Some(ids)
         }
     };
-    let grant = ApiGrant { vehicles };
+    let grant = ApiGrant {
+        user_id: record.user_id,
+        vehicles,
+    };
     Ok(API_GRANT.scope(grant, next.run(request)).await)
 }
 
@@ -285,7 +288,12 @@ tokio::task_local! {
 }
 
 struct ApiGrant {
+    user_id: Option<i64>,
     vehicles: Option<Vec<i64>>,
+}
+
+pub(crate) fn api_user_id() -> Option<i64> {
+    API_GRANT.try_with(|grant| grant.user_id).ok().flatten()
 }
 
 pub(crate) fn vehicle_visible(id: i64) -> bool {

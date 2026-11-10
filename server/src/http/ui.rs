@@ -44,6 +44,11 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/settings/override", post(save_setting))
         .route("/debug", get(debug_page_handler))
         .route("/system", get(system))
+        .route("/system/backup", get(backup))
+        .route("/security/passkey/start", post(passkey_start))
+        .route("/security/passkey/finish", post(passkey_finish))
+        .route("/accounts", post(add_account))
+        .route("/accounts/{id}/disconnect", post(disconnect_account))
         .route("/security", get(security))
         .route("/security/setup", get(security_setup))
         .route("/security/password", post(change_password))
@@ -717,10 +722,191 @@ async fn system(State(app): State<AppState>, headers: HeaderMap) -> Response {
     let Some(page) = signed_page(&app, &headers).await else {
         return Redirect::to("/").into_response();
     };
-    html_page(
-        system_page(&chrome(&page, None, None, GlobalTab::System, false)),
-        page.cookie,
+    let mut body = system_page(&chrome(&page, None, None, GlobalTab::System, false));
+    let extra = system_status(&app).await;
+    body = body.replacen("</main>", &(extra + "</main>"), 1);
+    html_page(body, page.cookie)
+}
+
+#[allow(clippy::format_push_string)]
+async fn system_status(app: &AppState) -> String {
+    let size: String =
+        sqlx::query_scalar("SELECT pg_size_pretty(pg_database_size(current_database()))")
+            .fetch_one(&app.inner.db)
+            .await
+            .unwrap_or_else(|_| "—".to_owned());
+    let default_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM positions_default")
+        .fetch_one(&app.inner.db)
+        .await
+        .unwrap_or(0);
+    let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(&app.inner.db)
+        .await
+        .unwrap_or(0);
+    let cursors: Vec<(String, i64)> =
+        sqlx::query_as("SELECT source, cursor_id FROM import_cursors ORDER BY source")
+            .fetch_all(&app.inner.db)
+            .await
+            .unwrap_or_default();
+    let accounts: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT id, label, status FROM tesla_accounts ORDER BY id")
+            .fetch_all(&app.inner.db)
+            .await
+            .unwrap_or_default();
+    let alert = crate::system::storage_alert(default_rows, chrono::Utc::now().year());
+    let mode = escape_html(&app.inner.config.auth_mode);
+    let oidc = if app.inner.config.oidc_issuer.is_some() {
+        "configuré"
+    } else {
+        "absent"
+    };
+    let allow = app.inner.config.proxy_allowlist.len();
+    let mut text = format!(
+        "<section class=\"card\"><h2>Base</h2><p>Taille {size}. Migrations appliquées : {migrations}. Lignes dans positions_default : {default_rows}. Auth {mode}, OIDC {oidc}, allowlist {allow}.</p>"
+    );
+    if let Some(alert) = alert {
+        text.push_str(&format!(
+            "<p class=\"banner bad\" role=\"alert\">{alert}</p>"
+        ));
+    }
+    text.push_str("<h2>Comptes Tesla</h2><ul class=\"list\">");
+    for (_id, label, status) in accounts {
+        let label = escape_html(&label);
+        let status = escape_html(&status);
+        text.push_str(&format!("<li><span>{label} · {status}</span></li>"));
+    }
+    text.push_str("</ul><h2>Curseurs d'import</h2><ul class=\"list\">");
+    for (source, cursor) in cursors {
+        let source = escape_html(&source);
+        text.push_str(&format!("<li><span>{source} · {cursor}</span></li>"));
+    }
+    text.push_str(
+        "</ul><p>Sauvegarde : envoi authentifié vers /system/backup (admin et sudo).</p></section>",
+    );
+    text
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+async fn backup(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !principal.is_admin() || !principal.sudo_active() {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
+    }
+    let output = std::process::Command::new("pg_dump")
+        .arg("--dbname")
+        .arg(&app.inner.config.database_url)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let mut response = output.stdout.into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/sql"),
+            );
+            response.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"tesla-logger.sql\""),
+            );
+            response
+        }
+        _ => (StatusCode::BAD_GATEWAY, "pg_dump failed").into_response(),
+    }
+}
+
+async fn passkey_finish(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    let parsed = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    match crate::passkeys::finish_registration(
+        &app.inner.db,
+        &app.inner.config,
+        principal.user_id,
+        &parsed,
     )
+    .await
+    {
+        Ok(()) => Redirect::to("/security").into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    }
+}
+
+async fn passkey_start(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    match crate::passkeys::start_registration(
+        &app.inner.db,
+        &app.inner.config,
+        principal.user_id,
+        &principal.username,
+    )
+    .await
+    {
+        Ok(body) => axum::Json(body).into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AccountForm {
+    csrf: String,
+    label: String,
+}
+
+async fn add_account(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AccountForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) || !principal.is_admin() || !principal.sudo_active() {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
+    }
+    let label = form.label.trim();
+    if label.is_empty() {
+        return (StatusCode::BAD_REQUEST, "label required").into_response();
+    }
+    let _ = sqlx::query("INSERT INTO tesla_accounts (label, kind) VALUES ($1, 'fleet')")
+        .bind(label)
+        .execute(&app.inner.db)
+        .await;
+    Redirect::to("/settings").into_response()
+}
+
+async fn disconnect_account(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) || !principal.is_admin() || !principal.sudo_active() {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
+    }
+    let _ = sqlx::query(
+        "UPDATE tesla_accounts SET tokens = NULL, status = 'disconnected', last_error = NULL WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&app.inner.db)
+    .await;
+    Redirect::to("/settings").into_response()
 }
 
 async fn security(State(app): State<AppState>, headers: HeaderMap) -> Response {
@@ -787,7 +973,7 @@ async fn owner_redirect(State(app): State<AppState>, headers: HeaderMap) -> Resp
     let Some(principal) = ui_session(&app, &headers).await else {
         return Redirect::to("/").into_response();
     };
-    let vehicles = vehicle_rows(&app, principal.user_id)
+    let vehicles = vehicle_rows(&app, principal.user_id, principal.is_admin())
         .await
         .unwrap_or_default();
     if vehicles.len() == 1 {
@@ -834,6 +1020,12 @@ async fn login(
 ) -> Response {
     if !csrf_ok(&headers, &form.csrf) {
         return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
+    }
+    if app.inner.config.auth_mode == "proxy" {
+        let ip = crate::identity::client_ip(&headers);
+        if !crate::system::proxy_ip_allowed(&app.inner.config.proxy_allowlist, &ip) {
+            return (StatusCode::FORBIDDEN, "proxy address is not allowed").into_response();
+        }
     }
     let ip = crate::identity::client_ip(&headers);
     let outcome =
@@ -1150,7 +1342,7 @@ pub(crate) async fn signed_page(app: &AppState, headers: &HeaderMap) -> Option<P
     let admin = principal.is_admin();
     let username = principal.username;
     let csrf = ensure_csrf(app, headers).ok()?;
-    let vehicles = match vehicle_rows(app, user_id).await {
+    let vehicles = match vehicle_rows(app, user_id, admin).await {
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!(
@@ -1200,7 +1392,31 @@ pub(crate) fn html_page(body: String, set_cookie: Option<HeaderValue>) -> Respon
     response
 }
 
-async fn vehicle_rows(app: &AppState, user_id: i64) -> Result<Vec<VehicleRow>, sqlx::Error> {
+async fn vehicle_rows(
+    app: &AppState,
+    user_id: i64,
+    admin: bool,
+) -> Result<Vec<VehicleRow>, sqlx::Error> {
+    let see_all = admin
+        && crate::settings::text_or(&app.inner.db, None, "ADMIN_SEES_ALL_TRIPS", "true").await
+            != "false";
+    if see_all {
+        return sqlx::query_as(
+            "SELECT v.id,
+                    COALESCE(NULLIF(v.name, ''), 'Véhicule ' || v.id::text) AS name,
+                    v.account_id,
+                    s.activity,
+                    s.battery_level,
+                    s.last_poll_at,
+                    s.last_data_at,
+                    s.last_error
+             FROM vehicles v
+             LEFT JOIN vehicle_state s ON s.vehicle_id = v.id
+             ORDER BY v.id",
+        )
+        .fetch_all(&app.inner.db)
+        .await;
+    }
     sqlx::query_as(
         "SELECT v.id,
                 COALESCE(NULLIF(v.name, ''), 'Véhicule ' || v.id::text) AS name,

@@ -53,6 +53,10 @@ pub(crate) struct Config {
     pub timezone: String,
     /// Optional currency per kWh used when a charge has no stored cost.
     pub energy_price_per_kwh: Option<f64>,
+    /// `local` (default), `oidc`, or `proxy`. Proxy requires an IP allowlist.
+    pub auth_mode: String,
+    pub proxy_allowlist: Vec<String>,
+    pub oidc_issuer: Option<String>,
     /// Keys present in the environment or dotenv file. Values are not stored here.
     explicit_env: BTreeSet<String>,
 }
@@ -180,6 +184,9 @@ impl Config {
             owner_token_store_path,
             timezone: timezone_name(map)?,
             energy_price_per_kwh: optional_f64(map, "ENERGY_PRICE_PER_KWH")?,
+            auth_mode: auth_mode(map)?,
+            proxy_allowlist: proxy_allowlist(map),
+            oidc_issuer: optional(map, "AUTH_OIDC_ISSUER"),
             explicit_env: map.keys().cloned().collect(),
         })
     }
@@ -398,6 +405,29 @@ fn optional_u64(
     }
 }
 
+fn auth_mode(map: &BTreeMap<String, String>) -> Result<String, AppError> {
+    let mode = optional(map, "AUTH_MODE").unwrap_or_else(|| "local".to_owned());
+    if !matches!(mode.as_str(), "local" | "oidc" | "proxy") {
+        return Err(AppError::message("AUTH_MODE must be local, oidc, or proxy"));
+    }
+    if mode == "proxy" && proxy_allowlist(map).is_empty() {
+        return Err(AppError::message(
+            "AUTH_MODE=proxy requires AUTH_PROXY_ALLOWLIST",
+        ));
+    }
+    Ok(mode)
+}
+
+fn proxy_allowlist(map: &BTreeMap<String, String>) -> Vec<String> {
+    optional(map, "AUTH_PROXY_ALLOWLIST")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn timezone_name(map: &BTreeMap<String, String>) -> Result<String, AppError> {
     let value = optional(map, "TESLA_TIMEZONE").unwrap_or_else(|| "Europe/Paris".to_owned());
     let ok = (1..=64).contains(&value.len())
@@ -543,6 +573,7 @@ mod tests {
         assert_eq!(config.region, tesla_auth::Region::Europe);
         assert_eq!(config.timezone, "Europe/Paris");
         assert_eq!(config.energy_price_per_kwh, None);
+        assert_eq!(config.auth_mode, "local");
         assert!(config.owner_stream_enabled);
         assert_eq!(
             config.gps_fallback_poll,
@@ -552,5 +583,27 @@ mod tests {
             config.owner_token_store_path,
             std::path::PathBuf::from("/data/owner-tokens.json")
         );
+    }
+
+    #[test]
+    fn proxy_mode_requires_an_allowlist() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("TESLA_CLIENT_ID".into(), "id".into());
+        map.insert("TESLA_CLIENT_SECRET".into(), "secret".into());
+        map.insert(
+            "TESLA_FLEET_AUDIENCE".into(),
+            "https://fleet-api.prd.eu.vn.cloud.tesla.com".into(),
+        );
+        map.insert("TESLA_DOMAIN".into(), "tsl.b-612.fr".into());
+        map.insert("DATABASE_URL".into(), "postgres://localhost/tesla".into());
+        map.insert("TESLA_PRIVATE_KEY_PATH".into(), "/keys/key.pem".into());
+        map.insert("TESLA_TOKEN_STORE_PATH".into(), "/data/tokens.json".into());
+        map.insert("TESLA_LOGGER_UI_PASSWORD".into(), "password-value".into());
+        map.insert("AUTH_MODE".into(), "proxy".into());
+        assert!(Config::from_map(&map).is_err());
+        map.insert("AUTH_PROXY_ALLOWLIST".into(), "10.0.0.1, 10.0.0.2".into());
+        let config = Config::from_map(&map).unwrap();
+        assert_eq!(config.auth_mode, "proxy");
+        assert_eq!(config.proxy_allowlist, vec!["10.0.0.1", "10.0.0.2"]);
     }
 }

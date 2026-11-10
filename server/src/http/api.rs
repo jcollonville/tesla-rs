@@ -312,8 +312,11 @@ pub(crate) async fn geofences(
 ) -> Result<Json<Vec<GeofenceJson>>, ApiError> {
     let rows = sqlx::query_as::<_, GeofenceJson>(
         "SELECT id, name, latitude, longitude, radius_m, billing_type, cost_per_unit, session_fee
-         FROM geofences ORDER BY id",
+         FROM geofences
+         WHERE owner_user_id IS NULL OR owner_user_id = $1
+         ORDER BY id",
     )
+    .bind(super::api_user_id())
     .fetch_all(&app.inner.db)
     .await
     .map_err(internal)?;
