@@ -55,6 +55,12 @@ fn openapi_lists_the_read_api() {
         "temp_c_bucket",
         "drive_duration_s",
         "dc_share_pct",
+        "start_address:",
+        "end_address:",
+        "start_geofence:",
+        "end_geofence:",
+        "addresses.display_name",
+        "geofences.name",
     ] {
         assert!(OPENAPI.contains(field), "{field}");
     }
@@ -196,6 +202,360 @@ async fn api_requires_a_token_and_returns_drives() {
     .await;
     assert!(key.contains("BEGIN PUBLIC KEY"));
     assert!(!key.contains("PRIVATE KEY"));
+}
+
+#[tokio::test]
+async fn drives_and_charges_include_address_and_geofence_names() {
+    let Some(db) = TestDb::migrated("addr").await else {
+        return;
+    };
+    let state = test_state(db.pool.clone()).await;
+    let token = "tl_addr-token";
+    sqlx::query("INSERT INTO api_tokens (name, token_hash) VALUES ('addr', $1)")
+        .bind(sha256_hex(token))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let vehicle_id: i64 = sqlx::query_scalar(
+        "INSERT INTO vehicles (vin, name) VALUES ('5YJ300000000ADDR1', 'Addr') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    // Synthetic points only. These are not a street, a home, or a charger.
+    let start_address: i64 = sqlx::query_scalar(
+        "INSERT INTO addresses (latitude, longitude, display_name)
+         VALUES (0.0, 0.0, 'Fixture Origin') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let end_address: i64 = sqlx::query_scalar(
+        "INSERT INTO addresses (latitude, longitude, display_name)
+         VALUES (0.0, 1.0, 'Fixture Destination') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let blank_address: i64 = sqlx::query_scalar(
+        "INSERT INTO addresses (latitude, longitude, display_name)
+         VALUES (1.0, 0.0, NULL) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let start_fence: i64 = sqlx::query_scalar(
+        "INSERT INTO geofences (name, latitude, longitude, radius_m)
+         VALUES ('Fixture Bay', 0.0, 0.0, 25) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let end_fence: i64 = sqlx::query_scalar(
+        "INSERT INTO geofences (name, latitude, longitude, radius_m)
+         VALUES ('Fixture Pad', 0.0, 1.0, 25) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let charge_fence: i64 = sqlx::query_scalar(
+        "INSERT INTO geofences (name, latitude, longitude, radius_m)
+         VALUES ('Fixture Stall', 1.0, 0.0, 25) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let named_drive: i64 = sqlx::query_scalar(
+        "INSERT INTO drives (
+            vehicle_id, start_at, end_at, distance_km, source,
+            start_address_id, end_address_id, start_geofence_id, end_geofence_id
+         ) VALUES (
+            $1, '2024-07-01T10:00:00Z', '2024-07-01T10:20:00Z', 3.0, 'poll', $2, $3, $4, $5
+         ) RETURNING id",
+    )
+    .bind(vehicle_id)
+    .bind(start_address)
+    .bind(end_address)
+    .bind(start_fence)
+    .bind(end_fence)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let bare_drive: i64 = sqlx::query_scalar(
+        "INSERT INTO drives (vehicle_id, start_at, end_at, distance_km, source)
+         VALUES ($1, '2024-07-01T12:00:00Z', '2024-07-01T12:10:00Z', 1.0, 'poll')
+         RETURNING id",
+    )
+    .bind(vehicle_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let named_charge: i64 = sqlx::query_scalar(
+        "INSERT INTO charges (
+            vehicle_id, start_at, end_at, energy_added_kwh, source, address_id, geofence_id
+         ) VALUES (
+            $1, '2024-07-01T11:00:00Z', '2024-07-01T11:30:00Z', 4.0, 'poll', $2, $3
+         ) RETURNING id",
+    )
+    .bind(vehicle_id)
+    .bind(end_address)
+    .bind(charge_fence)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let blank_charge: i64 = sqlx::query_scalar(
+        "INSERT INTO charges (vehicle_id, start_at, end_at, energy_added_kwh, source, address_id)
+         VALUES ($1, '2024-07-01T13:00:00Z', '2024-07-01T13:20:00Z', 2.0, 'poll', $2)
+         RETURNING id",
+    )
+    .bind(vehicle_id)
+    .bind(blank_address)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let bare_charge: i64 = sqlx::query_scalar(
+        "INSERT INTO charges (vehicle_id, start_at, end_at, energy_added_kwh, source)
+         VALUES ($1, '2024-07-01T14:00:00Z', '2024-07-01T14:10:00Z', 1.0, 'poll')
+         RETURNING id",
+    )
+    .bind(vehicle_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let list = authed(
+        &state,
+        "GET",
+        &format!("/api/v1/drives?vehicle_id={vehicle_id}"),
+        token,
+    )
+    .await;
+    let parsed: serde_json::Value = serde_json::from_str(&list).unwrap();
+    let rows = parsed["data"].as_array().unwrap();
+    let named = row_by_id(rows, named_drive);
+    assert_eq!(named["start_address_id"].as_i64(), Some(start_address));
+    assert_eq!(named["end_address_id"].as_i64(), Some(end_address));
+    assert_eq!(named["start_address"], "Fixture Origin");
+    assert_eq!(named["end_address"], "Fixture Destination");
+    assert_eq!(named["start_geofence_id"].as_i64(), Some(start_fence));
+    assert_eq!(named["end_geofence_id"].as_i64(), Some(end_fence));
+    assert_eq!(named["start_geofence"], "Fixture Bay");
+    assert_eq!(named["end_geofence"], "Fixture Pad");
+    let bare = row_by_id(rows, bare_drive);
+    for key in [
+        "start_address_id",
+        "end_address_id",
+        "start_address",
+        "end_address",
+        "start_geofence_id",
+        "end_geofence_id",
+        "start_geofence",
+        "end_geofence",
+    ] {
+        assert!(bare.get(key).is_some(), "missing {key}");
+        assert!(bare[key].is_null(), "{key}");
+    }
+
+    let detail: serde_json::Value = serde_json::from_str(
+        &authed(
+            &state,
+            "GET",
+            &format!("/api/v1/drives/{named_drive}"),
+            token,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(detail["start_address"], "Fixture Origin");
+    assert_eq!(detail["end_address"], "Fixture Destination");
+    assert_eq!(detail["start_geofence"], "Fixture Bay");
+    assert_eq!(detail["end_geofence"], "Fixture Pad");
+    assert!(detail["route"].is_array());
+
+    let charges: serde_json::Value = serde_json::from_str(
+        &authed(
+            &state,
+            "GET",
+            &format!("/api/v1/charges?vehicle_id={vehicle_id}"),
+            token,
+        )
+        .await,
+    )
+    .unwrap();
+    let charge_rows = charges["data"].as_array().unwrap();
+    let named_row = row_by_id(charge_rows, named_charge);
+    assert_eq!(named_row["address_id"].as_i64(), Some(end_address));
+    assert_eq!(named_row["address"], "Fixture Destination");
+    assert_eq!(named_row["geofence_id"].as_i64(), Some(charge_fence));
+    assert_eq!(named_row["geofence"], "Fixture Stall");
+    let blank_row = row_by_id(charge_rows, blank_charge);
+    assert_eq!(blank_row["address_id"].as_i64(), Some(blank_address));
+    assert!(blank_row.get("address").is_some());
+    assert!(blank_row["address"].is_null());
+    assert!(blank_row.get("geofence").is_some());
+    assert!(blank_row["geofence"].is_null());
+    let bare_row = row_by_id(charge_rows, bare_charge);
+    for key in ["address_id", "address", "geofence_id", "geofence"] {
+        assert!(bare_row.get(key).is_some(), "missing {key}");
+        assert!(bare_row[key].is_null(), "{key}");
+    }
+
+    let charge_detail: serde_json::Value = serde_json::from_str(
+        &authed(
+            &state,
+            "GET",
+            &format!("/api/v1/charges/{named_charge}"),
+            token,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(charge_detail["address"], "Fixture Destination");
+    assert_eq!(charge_detail["geofence"], "Fixture Stall");
+    assert!(charge_detail["samples"].is_array());
+}
+
+fn row_by_id(rows: &[serde_json::Value], id: i64) -> &serde_json::Value {
+    rows.iter()
+        .find(|row| row["id"].as_i64() == Some(id))
+        .unwrap_or_else(|| panic!("missing id {id} in {rows:?}"))
+}
+
+#[tokio::test]
+async fn drive_and_charge_name_joins_use_primary_keys() {
+    let Some(db) = TestDb::migrated("addrplan").await else {
+        return;
+    };
+    let pkeys: Vec<(String, String)> = sqlx::query_as(
+        "SELECT t.relname::text, c.relname::text
+         FROM pg_index i
+         JOIN pg_class c ON c.oid = i.indexrelid
+         JOIN pg_class t ON t.oid = i.indrelid
+         JOIN pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = 'public'
+           AND t.relname IN ('addresses', 'geofences')
+           AND i.indisprimary",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        pkeys
+            .iter()
+            .any(|(table, index)| table == "addresses" && index == "addresses_pkey"),
+        "{pkeys:?}"
+    );
+    assert!(
+        pkeys
+            .iter()
+            .any(|(table, index)| table == "geofences" && index == "geofences_pkey"),
+        "{pkeys:?}"
+    );
+
+    let drive_sql = crate::http::api::drive_select(
+        "WHERE ($1::bigint IS NULL OR d.vehicle_id = $1)
+           AND ($2::timestamptz IS NULL OR d.start_at >= $2)
+           AND ($3::timestamptz IS NULL OR d.start_at < $3)
+         ORDER BY d.start_at DESC
+         LIMIT $4 OFFSET $5",
+    );
+    assert_eq!(drive_sql.matches("SELECT").count(), 1, "{drive_sql}");
+    assert_eq!(drive_sql.matches("LEFT JOIN addresses").count(), 2);
+    assert_eq!(drive_sql.matches("LEFT JOIN geofences").count(), 2);
+    let charge_sql = crate::http::api::charge_select(
+        "WHERE ($1::bigint IS NULL OR c.vehicle_id = $1)
+           AND ($2::timestamptz IS NULL OR c.start_at >= $2)
+           AND ($3::timestamptz IS NULL OR c.start_at < $3)
+         ORDER BY c.start_at DESC LIMIT $4 OFFSET $5",
+    );
+    assert_eq!(charge_sql.matches("SELECT").count(), 1, "{charge_sql}");
+    assert_eq!(charge_sql.matches("LEFT JOIN addresses").count(), 1);
+    assert_eq!(charge_sql.matches("LEFT JOIN geofences").count(), 1);
+
+    let mut conn = db.pool.acquire().await.unwrap();
+    sqlx::query("SET enable_seqscan = off")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let drive_plan = explain_page(&mut conn, &drive_sql).await;
+    assert_pk_lookups(&drive_plan, "addresses", "addresses_pkey");
+    assert_pk_lookups(&drive_plan, "geofences", "geofences_pkey");
+    let charge_plan = explain_page(&mut conn, &charge_sql).await;
+    assert_pk_lookups(&charge_plan, "addresses", "addresses_pkey");
+    assert_pk_lookups(&charge_plan, "geofences", "geofences_pkey");
+}
+
+async fn explain_page(conn: &mut sqlx::PgConnection, sql: &str) -> serde_json::Value {
+    let explained = format!("EXPLAIN (FORMAT JSON) {sql}");
+    let (plan,): (serde_json::Value,) = sqlx::query_as(&explained)
+        .bind(None::<i64>)
+        .bind(None::<DateTime<Utc>>)
+        .bind(None::<DateTime<Utc>>)
+        .bind(50_i64)
+        .bind(0_i64)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    plan
+}
+
+fn assert_pk_lookups(plan: &serde_json::Value, relation: &str, index: &str) {
+    let mut scans = Vec::new();
+    walk_relations(plan, &mut scans);
+    let matched: Vec<_> = scans
+        .iter()
+        .filter(|(name, _, _)| name == relation)
+        .collect();
+    assert!(
+        !matched.is_empty(),
+        "expected a lookup of {relation}, plan was {plan}"
+    );
+    for (name, node_type, index_name) in &matched {
+        assert!(
+            matches!(
+                node_type.as_str(),
+                "Index Scan" | "Index Only Scan" | "Bitmap Index Scan"
+            ),
+            "{name} used {node_type}, plan was {plan}"
+        );
+        assert_eq!(index_name.as_deref(), Some(index), "{plan}");
+    }
+}
+
+fn walk_relations(node: &serde_json::Value, out: &mut Vec<(String, String, Option<String>)>) {
+    let nodes: Vec<&serde_json::Value> = if let Some(list) = node.as_array() {
+        list.iter()
+            .map(|entry| entry.get("Plan").unwrap_or(entry))
+            .collect()
+    } else if let Some(plan) = node.get("Plan") {
+        vec![plan]
+    } else {
+        vec![node]
+    };
+    for node in nodes {
+        collect_relations(node, out);
+    }
+}
+
+fn collect_relations(node: &serde_json::Value, out: &mut Vec<(String, String, Option<String>)>) {
+    let node_type = node
+        .get("Node Type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if let Some(relation) = node.get("Relation Name").and_then(|value| value.as_str()) {
+        out.push((
+            relation.to_owned(),
+            node_type.to_owned(),
+            node.get("Index Name")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned),
+        ));
+    }
+    if let Some(children) = node.get("Plans").and_then(|value| value.as_array()) {
+        for child in children {
+            collect_relations(child, out);
+        }
+    }
 }
 
 #[tokio::test]

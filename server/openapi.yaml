@@ -421,6 +421,14 @@ components:
         start_longitude: { type: number, nullable: true }
         end_latitude: { type: number, nullable: true }
         end_longitude: { type: number, nullable: true }
+        start_address_id: { type: integer, format: int64, nullable: true }
+        end_address_id: { type: integer, format: int64, nullable: true }
+        start_address: { type: string, nullable: true, description: addresses.display_name at the start. Null when the drive has no address. }
+        end_address: { type: string, nullable: true, description: addresses.display_name at the end. Null when the drive has no address. }
+        start_geofence_id: { type: integer, format: int64, nullable: true }
+        end_geofence_id: { type: integer, format: int64, nullable: true }
+        start_geofence: { type: string, nullable: true, description: geofences.name at the start. Null when the drive has no geofence. }
+        end_geofence: { type: string, nullable: true, description: geofences.name at the end. Null when the drive has no geofence. }
     DrivePage:
       type: object
       required: [data, page, per_page, total]
@@ -478,6 +486,10 @@ components:
         latitude: { type: number, nullable: true }
         longitude: { type: number, nullable: true }
         cost: { type: number, nullable: true }
+        address_id: { type: integer, format: int64, nullable: true }
+        address: { type: string, nullable: true, description: addresses.display_name. Null when the charge has no address. }
+        geofence_id: { type: integer, format: int64, nullable: true }
+        geofence: { type: string, nullable: true, description: geofences.name. Null when the charge has no geofence. }
     ChargePage:
       type: object
       required: [data, page, per_page, total]
