@@ -15,4 +15,8 @@ ignore = [
     "RUSTSEC-2023-0071",
     # SQLite CVE-2026-119375 via libsqlite3-sys. Only reachable through the unused sqlx-sqlite driver.
     "RUSTSEC-2026-0459",
+    # Informational, assigned 2026-11-17. No patched release. sqlx 0.8 still links chrono.
+    "RUSTSEC-2026-0543",
+    # Informational, assigned 2026-11-17. No patched release. The server depends on chrono-tz.
+    "RUSTSEC-2026-0555",
 ]

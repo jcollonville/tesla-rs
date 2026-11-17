@@ -67,6 +67,10 @@ struct DriveRow {
     duration_s: Option<i32>,
     energy_used_kwh: Option<f64>,
     source: String,
+    start_address: Option<String>,
+    end_address: Option<String>,
+    start_geofence: Option<String>,
+    end_geofence: Option<String>,
 }
 
 #[derive(Clone, sqlx::FromRow)]
@@ -80,6 +84,8 @@ struct ChargeRow {
     cost: Option<f64>,
     is_dc: Option<bool>,
     source: String,
+    address: Option<String>,
+    geofence: Option<String>,
 }
 
 struct Bounds<'a> {
@@ -135,6 +141,7 @@ pub(super) async fn drives(
                     thead {
                         tr {
                             th { "Début" }
+                            th { "Lieux" }
                             th { "Distance" }
                             th { "Durée" }
                             th { "Énergie" }
@@ -145,6 +152,7 @@ pub(super) async fn drives(
                         @for row in &shown {
                             tr {
                                 td { a href=(format!("/v/{id}/drives/{}", row.id)) { (row.start_at.format("%Y-%m-%d %H:%M UTC").to_string()) } }
+                                td { (route_label(row)) }
                                 td { (fmt_opt(row.distance_km, "km")) }
                                 td { (fmt_duration(row.duration_s)) }
                                 td { (fmt_opt(row.energy_used_kwh, "kWh")) }
@@ -215,8 +223,17 @@ pub(super) async fn drive_detail(
         Err(response) => return response,
     };
     let drive = sqlx::query_as::<_, DriveRow>(
-        "SELECT id, start_at, end_at, distance_km, duration_s, energy_used_kwh, source
-         FROM drives WHERE id = $1 AND vehicle_id = $2 AND deleted_at IS NULL",
+        "SELECT d.id, d.start_at, d.end_at, d.distance_km, d.duration_s, d.energy_used_kwh, d.source,
+                start_addr.display_name AS start_address,
+                end_addr.display_name AS end_address,
+                start_fence.name AS start_geofence,
+                end_fence.name AS end_geofence
+         FROM drives d
+         LEFT JOIN addresses start_addr ON start_addr.id = d.start_address_id
+         LEFT JOIN addresses end_addr ON end_addr.id = d.end_address_id
+         LEFT JOIN geofences start_fence ON start_fence.id = d.start_geofence_id
+         LEFT JOIN geofences end_fence ON end_fence.id = d.end_geofence_id
+         WHERE d.id = $1 AND d.vehicle_id = $2 AND d.deleted_at IS NULL",
     )
     .bind(drive_id)
     .bind(id)
@@ -265,6 +282,7 @@ pub(super) async fn drive_detail(
         section class="card" {
             h2 { (drive.start_at.format("%Y-%m-%d %H:%M UTC").to_string()) }
             p { (fmt_opt(drive.distance_km, "km")) " · " (fmt_duration(drive.duration_s)) " · " (fmt_opt(drive.energy_used_kwh, "kWh")) }
+            p { (route_label(&drive)) }
             p { a href=(format!("/v/{id}/drives")) { "Retour à la liste" } }
         }
         section class="card" {
@@ -362,6 +380,7 @@ pub(super) async fn charges(
                     thead {
                         tr {
                             th { "Début" }
+                            th { "Lieu" }
                             th { "Énergie" }
                             th { "Durée" }
                             th { "Coût" }
@@ -372,6 +391,7 @@ pub(super) async fn charges(
                         @for row in &shown {
                             tr {
                                 td { a href=(format!("/v/{id}/charges/{}", row.id)) { (row.start_at.format("%Y-%m-%d %H:%M UTC").to_string()) } }
+                                td { (place_label(row.address.as_deref(), row.geofence.as_deref())) }
                                 td { (fmt_opt(row.energy_added_kwh, "kWh")) }
                                 td { (fmt_duration(row.duration_s)) }
                                 td { (fmt_opt(row.cost, "")) }
@@ -441,8 +461,14 @@ pub(super) async fn charge_detail(
         Err(response) => return response,
     };
     let charge = sqlx::query_as::<_, ChargeRow>(
-        "SELECT id, start_at, end_at, energy_added_kwh, energy_used_kwh, duration_s, cost, is_dc, source
-         FROM charges WHERE id = $1 AND vehicle_id = $2 AND deleted_at IS NULL",
+        "SELECT c.id, c.start_at, c.end_at, c.energy_added_kwh, c.energy_used_kwh, c.duration_s,
+                c.cost, c.is_dc, c.source,
+                addr.display_name AS address,
+                fence.name AS geofence
+         FROM charges c
+         LEFT JOIN addresses addr ON addr.id = c.address_id
+         LEFT JOIN geofences fence ON fence.id = c.geofence_id
+         WHERE c.id = $1 AND c.vehicle_id = $2 AND c.deleted_at IS NULL",
     )
     .bind(charge_id)
     .bind(id)
@@ -479,6 +505,7 @@ pub(super) async fn charge_detail(
         section class="card" {
             h2 { (charge.start_at.format("%Y-%m-%d %H:%M UTC").to_string()) }
             p { (fmt_opt(charge.energy_added_kwh, "kWh")) " · " (fmt_opt(charge.energy_used_kwh, "kWh utilisés")) }
+            p { (place_label(charge.address.as_deref(), charge.geofence.as_deref())) }
             p { a href=(format!("/v/{id}/charges")) { "Retour à la liste" } }
         }
         section class="card" {
@@ -566,16 +593,16 @@ async fn drive_page(
 ) -> Result<Vec<DriveRow>, sqlx::Error> {
     let sql = match bounds.sort {
         Sort::Start => drive_sql(
-            "($8::timestamptz IS NULL OR (start_at, id) < ($8, $9))",
-            "start_at DESC, id DESC",
+            "($8::timestamptz IS NULL OR (d.start_at, d.id) < ($8, $9))",
+            "d.start_at DESC, d.id DESC",
         ),
         Sort::Distance => drive_sql(
-            "($8::float8 IS NULL OR (COALESCE(distance_km, -1e308), id) < ($8, $9))",
-            "distance_km DESC NULLS LAST, id DESC",
+            "($8::float8 IS NULL OR (COALESCE(d.distance_km, -1e308), d.id) < ($8, $9))",
+            "d.distance_km DESC NULLS LAST, d.id DESC",
         ),
         Sort::Duration => drive_sql(
-            "($8::float8 IS NULL OR (COALESCE(duration_s::float8, -1), id) < ($8, $9))",
-            "duration_s DESC NULLS LAST, id DESC",
+            "($8::float8 IS NULL OR (COALESCE(d.duration_s::float8, -1), d.id) < ($8, $9))",
+            "d.duration_s DESC NULLS LAST, d.id DESC",
         ),
     };
     let cursor_time = bounds.before;
@@ -610,19 +637,27 @@ async fn drive_page(
 
 fn drive_sql(cursor: &str, order: &str) -> String {
     format!(
-        "SELECT id, start_at, end_at, distance_km, duration_s, energy_used_kwh, source
-         FROM drives
-         WHERE vehicle_id = $1
-           AND deleted_at IS NULL
-           AND ($2::timestamptz IS NULL OR start_at >= $2)
-           AND ($3::timestamptz IS NULL OR start_at < $3)
-           AND ($4::text IS NULL OR source = $4)
-           AND ($5::float8 IS NULL OR COALESCE(distance_km, 0) >= $5)
-           AND ($6::int IS NULL OR COALESCE(duration_s, 0) >= $6)
+        "SELECT d.id, d.start_at, d.end_at, d.distance_km, d.duration_s, d.energy_used_kwh, d.source,
+                start_addr.display_name AS start_address,
+                end_addr.display_name AS end_address,
+                start_fence.name AS start_geofence,
+                end_fence.name AS end_geofence
+         FROM drives d
+         LEFT JOIN addresses start_addr ON start_addr.id = d.start_address_id
+         LEFT JOIN addresses end_addr ON end_addr.id = d.end_address_id
+         LEFT JOIN geofences start_fence ON start_fence.id = d.start_geofence_id
+         LEFT JOIN geofences end_fence ON end_fence.id = d.end_geofence_id
+         WHERE d.vehicle_id = $1
+           AND d.deleted_at IS NULL
+           AND ($2::timestamptz IS NULL OR d.start_at >= $2)
+           AND ($3::timestamptz IS NULL OR d.start_at < $3)
+           AND ($4::text IS NULL OR d.source = $4)
+           AND ($5::float8 IS NULL OR COALESCE(d.distance_km, 0) >= $5)
+           AND ($6::int IS NULL OR COALESCE(d.duration_s, 0) >= $6)
            AND ($7::text IS NULL OR (
-                ($7 = 'zero_km' AND COALESCE(distance_km, 0) = 0)
-             OR ($7 = 'no_energy' AND COALESCE(energy_used_kwh, 0) = 0)
-             OR ($7 = 'open' AND end_at IS NULL AND start_at < now() - interval '24 hours')))
+                ($7 = 'zero_km' AND COALESCE(d.distance_km, 0) = 0)
+             OR ($7 = 'no_energy' AND COALESCE(d.energy_used_kwh, 0) = 0)
+             OR ($7 = 'open' AND d.end_at IS NULL AND d.start_at < now() - interval '24 hours')))
            AND {cursor}
          ORDER BY {order}
          LIMIT $10"
@@ -637,16 +672,16 @@ async fn charge_page(
 ) -> Result<Vec<ChargeRow>, sqlx::Error> {
     let sql = match bounds.sort {
         Sort::Start => charge_sql(
-            "($8::timestamptz IS NULL OR (start_at, id) < ($8, $9))",
-            "start_at DESC, id DESC",
+            "($8::timestamptz IS NULL OR (c.start_at, c.id) < ($8, $9))",
+            "c.start_at DESC, c.id DESC",
         ),
         Sort::Distance => charge_sql(
-            "($8::float8 IS NULL OR (COALESCE(energy_added_kwh, -1e308), id) < ($8, $9))",
-            "energy_added_kwh DESC NULLS LAST, id DESC",
+            "($8::float8 IS NULL OR (COALESCE(c.energy_added_kwh, -1e308), c.id) < ($8, $9))",
+            "c.energy_added_kwh DESC NULLS LAST, c.id DESC",
         ),
         Sort::Duration => charge_sql(
-            "($8::float8 IS NULL OR (COALESCE(duration_s::float8, -1), id) < ($8, $9))",
-            "duration_s DESC NULLS LAST, id DESC",
+            "($8::float8 IS NULL OR (COALESCE(c.duration_s::float8, -1), c.id) < ($8, $9))",
+            "c.duration_s DESC NULLS LAST, c.id DESC",
         ),
     };
     let query = sqlx::query_as::<_, ChargeRow>(&sql)
@@ -679,19 +714,24 @@ async fn charge_page(
 
 fn charge_sql(cursor: &str, order: &str) -> String {
     format!(
-        "SELECT id, start_at, end_at, energy_added_kwh, energy_used_kwh, duration_s, cost, is_dc, source
-         FROM charges
-         WHERE vehicle_id = $1
-           AND deleted_at IS NULL
-           AND ($2::timestamptz IS NULL OR start_at >= $2)
-           AND ($3::timestamptz IS NULL OR start_at < $3)
-           AND ($4::text IS NULL OR source = $4)
-           AND ($5::float8 IS NULL OR COALESCE(energy_added_kwh, 0) >= $5)
-           AND ($6::int IS NULL OR COALESCE(duration_s, 0) >= $6)
+        "SELECT c.id, c.start_at, c.end_at, c.energy_added_kwh, c.energy_used_kwh, c.duration_s,
+                c.cost, c.is_dc, c.source,
+                addr.display_name AS address,
+                fence.name AS geofence
+         FROM charges c
+         LEFT JOIN addresses addr ON addr.id = c.address_id
+         LEFT JOIN geofences fence ON fence.id = c.geofence_id
+         WHERE c.vehicle_id = $1
+           AND c.deleted_at IS NULL
+           AND ($2::timestamptz IS NULL OR c.start_at >= $2)
+           AND ($3::timestamptz IS NULL OR c.start_at < $3)
+           AND ($4::text IS NULL OR c.source = $4)
+           AND ($5::float8 IS NULL OR COALESCE(c.energy_added_kwh, 0) >= $5)
+           AND ($6::int IS NULL OR COALESCE(c.duration_s, 0) >= $6)
            AND ($7::text IS NULL OR (
-                ($7 = 'zero_km' AND COALESCE(energy_added_kwh, 0) = 0)
-             OR ($7 = 'no_energy' AND COALESCE(energy_used_kwh, 0) = 0)
-             OR ($7 = 'open' AND end_at IS NULL AND start_at < now() - interval '24 hours')))
+                ($7 = 'zero_km' AND COALESCE(c.energy_added_kwh, 0) = 0)
+             OR ($7 = 'no_energy' AND COALESCE(c.energy_used_kwh, 0) = 0)
+             OR ($7 = 'open' AND c.end_at IS NULL AND c.start_at < now() - interval '24 hours')))
            AND {cursor}
          ORDER BY {order}
          LIMIT $10"
@@ -865,6 +905,29 @@ fn fmt_duration(value: Option<i32>) -> String {
     value.map_or_else(|| "—".to_owned(), |secs| format!("{} min", secs / 60))
 }
 
+fn place_label(address: Option<&str>, geofence: Option<&str>) -> String {
+    let address = address.filter(|text| !text.is_empty());
+    let geofence = geofence.filter(|text| !text.is_empty());
+    match (address, geofence) {
+        (Some(address), Some(geofence)) if address != geofence => {
+            format!("{address} ({geofence})")
+        }
+        (Some(address), _) => address.to_owned(),
+        (None, Some(geofence)) => geofence.to_owned(),
+        (None, None) => "—".to_owned(),
+    }
+}
+
+fn route_label(row: &DriveRow) -> String {
+    let start = place_label(row.start_address.as_deref(), row.start_geofence.as_deref());
+    let end = place_label(row.end_address.as_deref(), row.end_geofence.as_deref());
+    if start == "—" && end == "—" {
+        "—".to_owned()
+    } else {
+        format!("{start} → {end}")
+    }
+}
+
 fn csv_response(body: String) -> Response {
     let mut response = (
         [(
@@ -992,6 +1055,95 @@ mod tests {
         .await;
         assert!(detail.contains("<polyline"));
         assert!(detail.contains("Retour à la liste"));
+    }
+
+    #[tokio::test]
+    async fn console_lists_show_fixture_address_names() {
+        let Some(db) = crate::test_util::TestDb::migrated("tripaddr").await else {
+            return;
+        };
+        let state = crate::app::test_state(db.pool.clone()).await;
+        let vehicle: (i64,) = sqlx::query_as(
+            "INSERT INTO vehicles (vin, name) VALUES ('5YJ30000000000A01', 'Lieux') RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let origin: (i64,) = sqlx::query_as(
+            "INSERT INTO addresses (latitude, longitude, display_name)
+             VALUES (0.0, 0.0, 'Fixture Origin') RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let bay: (i64,) = sqlx::query_as(
+            "INSERT INTO geofences (name, latitude, longitude, radius_m)
+             VALUES ('Fixture Bay', 0.0, 0.0, 10) RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let drive: (i64,) = sqlx::query_as(
+            "INSERT INTO drives (
+                vehicle_id, start_at, end_at, distance_km, duration_s, source,
+                start_address_id, start_geofence_id
+             ) VALUES ($1, '2024-07-02T08:00:00Z', '2024-07-02T08:10:00Z', 2, 600, 'poll', $2, $3)
+             RETURNING id",
+        )
+        .bind(vehicle.0)
+        .bind(origin.0)
+        .bind(bay.0)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let charge: (i64,) = sqlx::query_as(
+            "INSERT INTO charges (vehicle_id, start_at, end_at, energy_added_kwh, source, geofence_id)
+             VALUES ($1, '2024-07-02T09:00:00Z', '2024-07-02T09:20:00Z', 5, 'poll', $2)
+             RETURNING id",
+        )
+        .bind(vehicle.0)
+        .bind(bay.0)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let login = crate::identity::login(&state, "admin", "test-password", "", "127.0.0.1")
+            .await
+            .unwrap();
+        let crate::identity::LoginResult::Session(issued) = login else {
+            panic!("session");
+        };
+        sqlx::query("UPDATE users SET must_change_password = false, totp_enabled = true")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let cookie = format!("__Host-tl_session={}", issued.id);
+        let drives = get(&state, &format!("/v/{}/drives", vehicle.0), &cookie).await;
+        assert!(drives.contains("Fixture Origin (Fixture Bay)"));
+        let detail = get(
+            &state,
+            &format!("/v/{}/drives/{}", vehicle.0, drive.0),
+            &cookie,
+        )
+        .await;
+        assert!(detail.contains("Fixture Origin (Fixture Bay)"));
+        let charges = get(&state, &format!("/v/{}/charges", vehicle.0), &cookie).await;
+        assert!(charges.contains("Fixture Bay"));
+        let charge_page = get(
+            &state,
+            &format!("/v/{}/charges/{}", vehicle.0, charge.0),
+            &cookie,
+        )
+        .await;
+        assert!(charge_page.contains("Fixture Bay"));
+    }
+
+    #[test]
+    fn missing_place_is_a_dash() {
+        assert_eq!(super::place_label(None, None), "—");
+        assert_eq!(
+            super::place_label(Some("Fixture Origin"), None),
+            "Fixture Origin"
+        );
     }
 
     async fn get(state: &crate::app::AppState, uri: &str, cookie: &str) -> String {

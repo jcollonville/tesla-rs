@@ -105,10 +105,10 @@ pub(crate) async fn list_drives(
     .await
     .map_err(internal)?;
     let mut data = sqlx::query_as::<_, DriveJson>(&drive_select(
-        "WHERE ($1::bigint IS NULL OR vehicle_id = $1)
-           AND ($2::timestamptz IS NULL OR start_at >= $2)
-           AND ($3::timestamptz IS NULL OR start_at < $3)
-         ORDER BY start_at DESC
+        "WHERE ($1::bigint IS NULL OR d.vehicle_id = $1)
+           AND ($2::timestamptz IS NULL OR d.start_at >= $2)
+           AND ($3::timestamptz IS NULL OR d.start_at < $3)
+         ORDER BY d.start_at DESC
          LIMIT $4 OFFSET $5",
     ))
     .bind(query.vehicle_id)
@@ -142,7 +142,7 @@ pub(crate) async fn drive_detail(
     Query(query): Query<DetailQuery>,
 ) -> Result<Json<DriveDetail>, ApiError> {
     let max_points = max_points(query.max_points)?;
-    let drive = sqlx::query_as::<_, DriveJson>(&drive_select("WHERE id = $1"))
+    let drive = sqlx::query_as::<_, DriveJson>(&drive_select("WHERE d.id = $1"))
         .bind(id)
         .fetch_optional(&app.inner.db)
         .await
@@ -214,10 +214,10 @@ pub(crate) async fn list_charges(
     .await
     .map_err(internal)?;
     let data = sqlx::query_as::<_, ChargeJson>(&charge_select(
-        "WHERE ($1::bigint IS NULL OR vehicle_id = $1)
-           AND ($2::timestamptz IS NULL OR start_at >= $2)
-           AND ($3::timestamptz IS NULL OR start_at < $3)
-         ORDER BY start_at DESC LIMIT $4 OFFSET $5",
+        "WHERE ($1::bigint IS NULL OR c.vehicle_id = $1)
+           AND ($2::timestamptz IS NULL OR c.start_at >= $2)
+           AND ($3::timestamptz IS NULL OR c.start_at < $3)
+         ORDER BY c.start_at DESC LIMIT $4 OFFSET $5",
     ))
     .bind(query.vehicle_id)
     .bind(query.from)
@@ -239,7 +239,7 @@ pub(crate) async fn charge_detail(
     State(app): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<ChargeDetail>, ApiError> {
-    let charge = sqlx::query_as::<_, ChargeJson>(&charge_select("WHERE id = $1"))
+    let charge = sqlx::query_as::<_, ChargeJson>(&charge_select("WHERE c.id = $1"))
         .bind(id)
         .fetch_optional(&app.inner.db)
         .await
@@ -476,27 +476,50 @@ fn max_points(value: Option<i64>) -> Result<usize, ApiError> {
     Ok(usize::try_from(value.min(2_000)).unwrap_or(2_000))
 }
 
-fn drive_select(tail: &str) -> String {
-    let tail = tail.replacen("WHERE ", "WHERE deleted_at IS NULL AND ", 1);
+/// One statement for a drive page or one drive.
+///
+/// Address and geofence names are primary-key lookups (`addresses_pkey`,
+/// `geofences_pkey`) from the already limited `drives` rows. The nullable
+/// foreign keys do not need their own indexes for this direction, so no
+/// migration is required.
+pub(crate) fn drive_select(tail: &str) -> String {
+    let tail = tail.replacen("WHERE ", "WHERE d.deleted_at IS NULL AND ", 1);
     format!(
-        "SELECT id, vehicle_id, start_at, end_at, distance_km, duration_s,
-                start_battery_level, end_battery_level, start_rated_range_km, end_rated_range_km,
-                energy_used_kwh, max_speed_kmh, avg_speed_kmh, max_power_kw, min_power_kw,
-                elevation_gain_m, elevation_loss_m, inside_temp_avg_c, outside_temp_avg_c,
-                start_latitude, start_longitude, end_latitude, end_longitude,
-                start_address_id, end_address_id, start_geofence_id, end_geofence_id
-         FROM drives {tail}"
+        "SELECT d.id, d.vehicle_id, d.start_at, d.end_at, d.distance_km, d.duration_s,
+                d.start_battery_level, d.end_battery_level, d.start_rated_range_km, d.end_rated_range_km,
+                d.energy_used_kwh, d.max_speed_kmh, d.avg_speed_kmh, d.max_power_kw, d.min_power_kw,
+                d.elevation_gain_m, d.elevation_loss_m, d.inside_temp_avg_c, d.outside_temp_avg_c,
+                d.start_latitude, d.start_longitude, d.end_latitude, d.end_longitude,
+                d.start_address_id, d.end_address_id,
+                start_addr.display_name AS start_address,
+                end_addr.display_name AS end_address,
+                d.start_geofence_id, d.end_geofence_id,
+                start_fence.name AS start_geofence,
+                end_fence.name AS end_geofence
+         FROM drives d
+         LEFT JOIN addresses start_addr ON start_addr.id = d.start_address_id
+         LEFT JOIN addresses end_addr ON end_addr.id = d.end_address_id
+         LEFT JOIN geofences start_fence ON start_fence.id = d.start_geofence_id
+         LEFT JOIN geofences end_fence ON end_fence.id = d.end_geofence_id
+         {tail}"
     )
 }
 
-fn charge_select(tail: &str) -> String {
-    let tail = tail.replacen("WHERE ", "WHERE deleted_at IS NULL AND ", 1);
+/// One statement for a charge page or one charge. See [`drive_select`].
+pub(crate) fn charge_select(tail: &str) -> String {
+    let tail = tail.replacen("WHERE ", "WHERE c.deleted_at IS NULL AND ", 1);
     format!(
-        "SELECT id, vehicle_id, start_at, end_at, energy_added_kwh, energy_used_kwh,
-                start_battery_level, end_battery_level, start_rated_range_km, end_rated_range_km,
-                latitude, longitude, is_dc, charger_type, max_power_kw, duration_s, cost,
-                outside_temp_avg_c, address_id, geofence_id
-         FROM charges {tail}"
+        "SELECT c.id, c.vehicle_id, c.start_at, c.end_at, c.energy_added_kwh, c.energy_used_kwh,
+                c.start_battery_level, c.end_battery_level, c.start_rated_range_km, c.end_rated_range_km,
+                c.latitude, c.longitude, c.is_dc, c.charger_type, c.max_power_kw, c.duration_s, c.cost,
+                c.outside_temp_avg_c, c.address_id,
+                addr.display_name AS address,
+                c.geofence_id,
+                fence.name AS geofence
+         FROM charges c
+         LEFT JOIN addresses addr ON addr.id = c.address_id
+         LEFT JOIN geofences fence ON fence.id = c.geofence_id
+         {tail}"
     )
 }
 
@@ -822,8 +845,12 @@ pub(crate) struct DriveJson {
     pub end_longitude: Option<f64>,
     pub start_address_id: Option<i64>,
     pub end_address_id: Option<i64>,
+    pub start_address: Option<String>,
+    pub end_address: Option<String>,
     pub start_geofence_id: Option<i64>,
     pub end_geofence_id: Option<i64>,
+    pub start_geofence: Option<String>,
+    pub end_geofence: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -900,7 +927,9 @@ pub(crate) struct ChargeJson {
     pub cost: Option<f64>,
     pub outside_temp_avg_c: Option<f64>,
     pub address_id: Option<i64>,
+    pub address: Option<String>,
     pub geofence_id: Option<i64>,
+    pub geofence: Option<String>,
 }
 
 #[derive(Serialize)]

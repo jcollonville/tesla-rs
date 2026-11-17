@@ -13,6 +13,10 @@ unused-ignored-advisory = "allow"
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa is only an optional sqlx MySQL driver dependency and is not linked" },
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys is only an optional sqlx SQLite driver dependency and is not linked" },
+    # Assigned 2026-11-17. Informational only: no patched release exists.
+    # sqlx 0.8's chrono feature still links chrono, and the server uses chrono-tz.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained and sqlx 0.8 still requires it" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained and has no patched release" },
 ]
 
 [licenses]
