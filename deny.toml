@@ -13,6 +13,8 @@ unused-ignored-advisory = "allow"
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa is only an optional sqlx MySQL driver dependency and is not linked" },
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys is only an optional sqlx SQLite driver dependency and is not linked" },
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained advisory only, no known vulnerability; chrono is also pulled by sqlx; revisit when a maintained replacement exists" },
+    { id = "RUSTSEC-2026-0555", reason = "unmaintained advisory only, no known vulnerability; chrono-tz is part of the same chrono stack pulled with sqlx; revisit when a maintained replacement exists" },
 ]
 
 [licenses]
