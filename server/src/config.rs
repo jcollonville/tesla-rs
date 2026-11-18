@@ -57,6 +57,8 @@ pub(crate) struct Config {
     pub auth_mode: String,
     /// Fetch and serve official Tesla renders of the cars. Off keeps the drawings.
     pub car_renders_enabled: bool,
+    /// HTTPS origin of the basemap, or `None` when `TILE_UPSTREAM=off`.
+    pub tile_upstream: Option<String>,
     pub proxy_allowlist: Vec<String>,
     pub oidc_issuer: Option<String>,
     /// Keys present in the environment or dotenv file. Values are not stored here.
@@ -188,6 +190,7 @@ impl Config {
             energy_price_per_kwh: optional_f64(map, "ENERGY_PRICE_PER_KWH")?,
             auth_mode: auth_mode(map)?,
             car_renders_enabled: optional_bool(map, "CAR_RENDERS_ENABLED")?.unwrap_or(true),
+            tile_upstream: tile_upstream(map)?,
             proxy_allowlist: proxy_allowlist(map),
             oidc_issuer: optional(map, "AUTH_OIDC_ISSUER"),
             explicit_env: map.keys().cloned().collect(),
@@ -388,6 +391,27 @@ fn required(map: &BTreeMap<String, String>, key: &'static str) -> Result<String,
         None => Err(AppError::MissingEnv(key)),
     }
 }
+
+fn tile_upstream(map: &BTreeMap<String, String>) -> Result<Option<String>, AppError> {
+    let Some(value) = optional(map, "TILE_UPSTREAM") else {
+        return Ok(Some(TILE_UPSTREAM.to_owned()));
+    };
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    let url = Url::parse(value.trim_end_matches('/'))
+        .map_err(|_| AppError::message("TILE_UPSTREAM is invalid"))?;
+    if url.scheme() != "https" || url.host_str().is_none() {
+        return Err(AppError::message("TILE_UPSTREAM must be an https origin"));
+    }
+    let mut text = url.to_string();
+    if text.ends_with('/') {
+        text.pop();
+    }
+    Ok(Some(text))
+}
+
+const TILE_UPSTREAM: &str = "https://tiles.openfreemap.org";
 
 fn optional(map: &BTreeMap<String, String>, key: &str) -> Option<String> {
     map.get(key)

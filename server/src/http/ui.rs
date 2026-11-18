@@ -80,6 +80,11 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/static/car.js", get(car_js))
         .route("/static/setup.js", get(setup_js))
         .route("/static/charts.js", get(charts_js))
+        .route("/static/map.js", get(map_js))
+        .route("/static/maplibre-gl.css", get(maplibre_css))
+        .route("/static/maplibre-gl-csp.js", get(maplibre_js))
+        .route("/static/maplibre-gl-csp-worker.js", get(maplibre_worker))
+        .route("/tiles/p/{*path}", get(super::tiles::proxy))
 }
 
 #[derive(Deserialize)]
@@ -1804,6 +1809,39 @@ async fn setup_js() -> Response {
 }
 
 async fn charts_js() -> Response {
+    script(include_str!("charts.js"))
+}
+
+async fn map_js() -> Response {
+    script(include_str!("map.js"))
+}
+
+async fn maplibre_js() -> Response {
+    script(include_str!("vendor/maplibre-gl-csp.js"))
+}
+
+async fn maplibre_worker() -> Response {
+    script(include_str!("vendor/maplibre-gl-csp-worker.js"))
+}
+
+async fn maplibre_css() -> Response {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/css; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400"),
+            ),
+        ],
+        include_str!("vendor/maplibre-gl.css"),
+    )
+        .into_response()
+}
+
+fn script(body: &'static str) -> Response {
     (
         [
             (
@@ -1815,7 +1853,7 @@ async fn charts_js() -> Response {
                 HeaderValue::from_static("public, max-age=86400"),
             ),
         ],
-        include_str!("charts.js"),
+        body,
     )
         .into_response()
 }

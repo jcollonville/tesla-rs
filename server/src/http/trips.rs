@@ -448,15 +448,12 @@ pub(super) async fn drive_detail(
     let kept = viz::stride(points.len(), CHART_POINTS);
     let sampled: Vec<&TrackPoint> = kept.iter().filter_map(|index| points.get(*index)).collect();
     let sync = format!("drive-{drive_id}");
-    let map = viz::route_map(
-        &located,
-        &format!("route-{drive_id}"),
-        &sync,
-        &sampled
-            .iter()
-            .map(|point| Some((point.1?, point.2?)))
-            .collect::<Vec<_>>(),
-    );
+    let track: Vec<Option<(f64, f64)>> = sampled
+        .iter()
+        .map(|point| Some((point.1?, point.2?)))
+        .collect();
+    let map = viz::route_map(&located, &format!("route-{drive_id}"), &sync, &track);
+    let map_payload = viz::map_json(&track);
     let axis = time_axis(drive.start_at, tz);
     let t: Vec<f64> = sampled
         .iter()
@@ -572,8 +569,20 @@ pub(super) async fn drive_detail(
                 p class="eyebrow" { (when) }
             }
             section class="card route-card" aria-label="Tracé" {
-                @if let Some(map) = &map {
-                    div class="map-frame wide" { (map) }
+                @if map_payload.is_some() || map.is_some() {
+                    div class="map-frame map-stage" {
+                        @if let Some(map) = &map { (map) }
+                        @if let Some(payload) = &map_payload {
+                            div class="basemap" data-sync=(sync) data-map=(payload) role="application" aria-label="Carte du trajet" {}
+                        }
+                        p class="map-credit" {
+                            a href="https://openfreemap.org/" { "OpenFreeMap" }
+                            " © "
+                            a href="https://openmaptiles.org/" { "OpenMapTiles" }
+                            " · données "
+                            a href="https://www.openstreetmap.org/copyright" { "OpenStreetMap" }
+                        }
+                    }
                 } @else {
                     p class="muted" { "Pas de points GPS." }
                 }
@@ -679,6 +688,9 @@ pub(super) async fn drive_detail(
                 }
             }
         }
+        link rel="stylesheet" href="/static/maplibre-gl.css";
+        script src="/static/maplibre-gl-csp.js" defer {}
+        script src="/static/map.js" defer {}
         script src="/static/charts.js" defer {}
     };
     html_page(document(false, body), page.cookie)
@@ -984,6 +996,8 @@ struct ChargeDetail {
     outside_temp_avg_c: Option<f64>,
     source: String,
     note: Option<String>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
     address: Option<String>,
     geofence: Option<String>,
 }
@@ -1012,7 +1026,7 @@ pub(super) async fn charge_detail(
         "SELECT c.id, c.start_at, c.end_at, c.energy_added_kwh, c.energy_used_kwh, c.duration_s,
                 c.cost, c.is_dc, c.charger_type, c.max_power_kw, c.start_battery_level,
                 c.end_battery_level, c.start_rated_range_km, c.end_rated_range_km,
-                c.outside_temp_avg_c, c.source, c.note,
+                c.outside_temp_avg_c, c.source, c.note, c.latitude, c.longitude,
                 addr.display_name AS address,
                 fence.name AS geofence
          FROM charges c
@@ -1067,6 +1081,10 @@ pub(super) async fn charge_detail(
     let curve_t: Vec<f64> = curve.iter().map(|point| point.0).collect();
     let sync = format!("charge-{charge_id}");
     let place = Place::from(charge.address.as_deref(), charge.geofence.as_deref());
+    let charge_map = charge
+        .latitude
+        .zip(charge.longitude)
+        .and_then(|(lat, lon)| viz::point_json(lat, lon));
     let title = Place::name_or_unknown(place.as_ref());
     let dc = charge.is_dc == Some(true);
     let duration = elapsed(charge.start_at, charge.end_at, charge.duration_s);
@@ -1136,6 +1154,20 @@ pub(super) async fn charge_detail(
         (toolbar(&chrome, &title))
         (vehicle_tabs(&chrome))
         div class="detail" role="tabpanel" aria-labelledby="tab-charges" {
+            @if let Some(payload) = &charge_map {
+                section class="card route-card" aria-label="Lieu" {
+                    div class="map-frame map-stage" {
+                        div class="basemap" data-map=(payload) role="application" aria-label="Lieu de la charge" {}
+                        p class="map-credit" {
+                            a href="https://openfreemap.org/" { "OpenFreeMap" }
+                            " © "
+                            a href="https://openmaptiles.org/" { "OpenMapTiles" }
+                            " · données "
+                            a href="https://www.openstreetmap.org/copyright" { "OpenStreetMap" }
+                        }
+                    }
+                }
+            }
             div class="detail-head" {
                 a class="text-link back-inline" href=(format!("/v/{id}/charges")) { "← Retour à la liste" }
                 p class="eyebrow" {
@@ -1220,6 +1252,9 @@ pub(super) async fn charge_detail(
                 }
             }
         }
+        link rel="stylesheet" href="/static/maplibre-gl.css";
+        script src="/static/maplibre-gl-csp.js" defer {}
+        script src="/static/map.js" defer {}
         script src="/static/charts.js" defer {}
     };
     html_page(document(false, body), page.cookie)
@@ -1858,11 +1893,50 @@ mod tests {
         .await;
         assert!(detail.contains("<polyline"));
         assert!(detail.contains("class=\"map route-map\""));
+        assert!(detail.contains("class=\"basemap\""));
+        assert!(detail.contains("/static/maplibre-gl-csp.js"));
+        assert!(detail.contains("/static/map.js"));
         assert!(detail.contains("data-chart="));
         assert!(detail.contains("/static/charts.js"));
         assert!(detail.contains("Retour à la liste"));
-        assert!(!detail.contains("0.011"), "coordinates leaked");
-        assert!(!detail.contains("0.021"), "coordinates leaked");
+        assert!(detail.contains("OpenStreetMap"));
+        assert!(!detail.contains("tiles.openfreemap.org"));
+        assert!(!detail.contains("tile.openstreetmap.org"));
+        let svg = detail
+            .split("class=\"map route-map\"")
+            .nth(1)
+            .unwrap()
+            .split("</svg>")
+            .next()
+            .unwrap();
+        assert!(!svg.contains("0.011"), "svg leaked coordinates: {svg}");
+        assert!(
+            detail.contains("0.02100") && detail.contains("0.01100"),
+            "map payload missing the track"
+        );
+        sqlx::query(
+            "INSERT INTO charges (vehicle_id, start_at, end_at, latitude, longitude, source)
+             VALUES ($1, '2024-06-01T12:00:00Z', '2024-06-01T13:00:00Z', 0.0412, 0.0287, 'poll')",
+        )
+        .bind(vehicle.0)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let charge: (i64,) = sqlx::query_as("SELECT id FROM charges WHERE vehicle_id = $1")
+            .bind(vehicle.0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let charge_page = get(
+            &state,
+            &format!("/v/{}/charges/{}", vehicle.0, charge.0),
+            &cookie,
+        )
+        .await;
+        assert!(charge_page.contains("Lieu de la charge"));
+        assert!(charge_page.contains("0.02870"));
+        assert!(charge_page.contains("0.04120"));
+        assert!(!charge_page.contains("tiles.openfreemap.org"));
     }
 
     #[tokio::test]

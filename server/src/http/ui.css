@@ -737,6 +737,46 @@ dl.hero-facts {
 
 /* Maps */
 .map-frame { overflow: hidden; border-radius: var(--radius-sm); background: var(--map-bg); }
+.map-stage {
+  position: relative;
+  aspect-ratio: 800 / 440;
+  background-color: var(--map-bg);
+  background-image: radial-gradient(circle, var(--map-dot) 1.15px, transparent 1.3px);
+  background-size: 22px 22px;
+}
+.map-stage > svg.map, .map-stage > .basemap { position: absolute; inset: 0; width: 100%; height: 100%; }
+.map-stage > .basemap { z-index: 1; touch-action: none; }
+.map-stage.map-live > svg.map { visibility: hidden; }
+.map-credit {
+  display: none;
+  position: absolute;
+  z-index: 2;
+  right: 8px;
+  bottom: 8px;
+  margin: 0;
+  max-width: calc(100% - 16px);
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  color: var(--muted);
+  font-size: 0.6875rem;
+  line-height: 1.3;
+}
+.map-stage.map-live .map-credit { display: block; }
+.map-credit a { color: inherit; }
+.map-stage .maplibregl-ctrl-group {
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.map-stage .maplibregl-ctrl-group button {
+  width: 32px;
+  height: 32px;
+  background-color: var(--surface);
+}
+.map-stage .maplibregl-ctrl-group button + button { border-top-color: var(--line); }
 svg.map, svg.mini-map { display: block; width: 100%; height: auto; }
 svg.mini-map { aspect-ratio: 360 / 220; }
 svg.route-map { aspect-ratio: 800 / 440; }

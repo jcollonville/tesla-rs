@@ -3,9 +3,11 @@
 
 //! Maps and chart payloads.
 //!
-//! Maps are drawn from the archive's own positions with a local equirectangular
-//! projection. There are no map tiles, so no third party learns where the car is,
-//! and the page never prints coordinates: only projected SVG units leave the server.
+//! The overview mini-map is drawn from the archive's own positions with a local
+//! equirectangular projection, and that page does not print coordinates. A drive
+//! or a charge that the operator opened also carries a rounded track in
+//! `data-map` so the browser can place it on the basemap. The SVG underneath is
+//! the same local drawing, used when the basemap cannot load.
 //!
 //! Charts ship as a server-rendered fallback SVG plus a JSON payload in a
 //! `data-chart` attribute that `charts.js` turns into an interactive chart.
@@ -178,13 +180,6 @@ pub(crate) fn route_map(
     let xy = serde_json::to_string(&sample_xy).unwrap_or_else(|_| "[]".to_owned());
     let markup = html! {
         svg id=(id) class="map route-map" viewBox=(format!("0 0 {ROUTE_W} {ROUTE_H}")) role="img" aria-label="Tracé du trajet" data-sync=(sync) data-xy=(xy) {
-            defs {
-                pattern id=(format!("{id}-dots")) width="22" height="22" patternUnits="userSpaceOnUse" {
-                    circle class="map-dot" cx="1.5" cy="1.5" r="1.1" {}
-                }
-            }
-            rect class="map-bg" width=(ROUTE_W) height=(ROUTE_H) {}
-            rect width=(ROUTE_W) height=(ROUTE_H) fill=(format!("url(#{id}-dots)")) {}
             path class="map-casing" d=(track) {}
             path class="map-track" d=(track) pathLength="1" {}
             circle class="map-start" cx=(format!("{:.1}", start.0)) cy=(format!("{:.1}", start.1)) r="7" {}
@@ -198,6 +193,46 @@ pub(crate) fn route_map(
         }
     };
     Some(markup)
+}
+
+/// `data-map` payload. Coordinates are longitude then latitude, five decimals.
+/// `None` when no sample can be placed.
+pub(crate) fn map_json(samples: &[Option<(f64, f64)>]) -> Option<String> {
+    let mut body = String::from("{\"cursor\":[");
+    let mut any = false;
+    for (index, sample) in samples.iter().enumerate() {
+        if index > 0 {
+            body.push(',');
+        }
+        match sample.and_then(|(lat, lon)| finite_pair(lat, lon)) {
+            Some((lat, lon)) => {
+                any = true;
+                let _ = write!(body, "[{lon:.5},{lat:.5}]");
+            }
+            None => body.push_str("null"),
+        }
+    }
+    if !any {
+        return None;
+    }
+    body.push_str("]}");
+    Some(body)
+}
+
+/// One charge location, longitude then latitude.
+pub(crate) fn point_json(lat: f64, lon: f64) -> Option<String> {
+    let (lat, lon) = finite_pair(lat, lon)?;
+    Some(format!("{{\"point\":[{lon:.5},{lat:.5}]}}"))
+}
+
+fn finite_pair(lat: f64, lon: f64) -> Option<(f64, f64)> {
+    if !lat.is_finite() || !lon.is_finite() {
+        return None;
+    }
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return None;
+    }
+    Some((lat, lon))
 }
 
 const MINI_W: f64 = 360.0;
@@ -473,7 +508,7 @@ pub(crate) fn soc_bar(start: Option<f64>, end: Option<f64>) -> Markup {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, MiniMap, chart_svg, mini_map, route_map, stride};
+    use super::{Frame, MiniMap, chart_svg, map_json, mini_map, point_json, route_map, stride};
 
     #[test]
     fn chart_svg_has_no_style_attribute() {
@@ -511,11 +546,22 @@ mod tests {
             tracks: &tracks,
             label: "Maison",
         });
-        for svg in [route.into_string(), mini.into_string()] {
+        let route_svg = route.into_string();
+        let mini_svg = mini.into_string();
+        for svg in [&route_svg, &mini_svg] {
             assert!(!svg.contains("0.0123"), "{svg}");
             assert!(!svg.contains("0.0678"), "{svg}");
             assert!(!svg.contains("style="), "{svg}");
         }
+        assert!(!route_svg.contains("url(#"), "{route_svg}");
+        let payload = map_json(&[Some(points[0]), None, Some(points[1])]).unwrap();
+        assert!(
+            payload.contains("[0.06789,0.01235]") || payload.contains("[0.06789,0.01234]"),
+            "{payload}"
+        );
+        assert!(payload.contains("null"), "{payload}");
+        assert!(point_json(0.0, 0.0).is_some());
+        assert!(point_json(120.0, 0.0).is_none());
     }
 
     #[test]

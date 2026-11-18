@@ -19,7 +19,7 @@ use crate::debug::DebugBoard;
 use crate::error::AppError;
 use crate::geocode::Geocoder;
 use crate::http;
-use crate::http::CarRenders;
+use crate::http::{Basemap, CarRenders};
 use crate::ingest::{self, Archive, FleetPoll, PollPolicy};
 use crate::logs::LogBuffer;
 use crate::mqtt;
@@ -52,6 +52,7 @@ pub(crate) struct Inner {
     pub logs: LogBuffer,
     pub debug: DebugBoard,
     pub car_renders: CarRenders,
+    pub basemap: Basemap,
 }
 
 pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
@@ -188,6 +189,7 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
     archive.owner_account_id = Some(imported.owner_id);
     let archive = Arc::new(archive);
     let car_renders = CarRenders::from_config(&config);
+    let basemap = Basemap::from_config(&config);
     Ok(AppState {
         inner: Arc::new(Inner {
             config,
@@ -208,6 +210,7 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
             logs,
             debug,
             car_renders,
+            basemap,
         }),
     })
 }
@@ -371,6 +374,7 @@ async fn test_state_full(
             logs,
             debug,
             car_renders: renders.unwrap_or_else(|| CarRenders::new(false, String::new(), None)),
+            basemap: Basemap::disabled(),
         }),
     }
 }

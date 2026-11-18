@@ -11,11 +11,13 @@ mod overview;
 mod owner;
 mod render;
 pub(crate) mod stats;
+mod tiles;
 mod trips;
 mod ui;
 mod viz;
 
 pub(crate) use render::CarRenders;
+pub(crate) use tiles::Basemap;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -151,7 +153,7 @@ async fn security_headers(
     );
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     if let Ok(csp) = HeaderValue::from_str(&format!(
-        "default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; frame-ancestors 'none'"
+        "default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; worker-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; frame-ancestors 'none'"
     )) {
         headers.insert("content-security-policy", csp);
     }
@@ -168,7 +170,11 @@ async fn security_headers(
     if private_page(&path) && !headers.contains_key(header::CACHE_CONTROL) {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
-    if path != "/healthz" && !path.ends_with("public-key.pem") && !assets::is_static(&path) {
+    if path != "/healthz"
+        && !path.ends_with("public-key.pem")
+        && !assets::is_static(&path)
+        && !tiles::is_quiet(&path)
+    {
         tracing::info!(%method, %path, status = %response.status(), "request");
     }
     response
@@ -395,9 +401,16 @@ mod tests {
             .to_owned();
         assert!(csp.contains("default-src 'self'"), "{csp}");
         assert!(csp.contains("script-src 'self' 'nonce-"), "{csp}");
+        assert!(csp.contains("style-src 'self';"), "{csp}");
+        assert!(csp.contains("style-src-attr 'unsafe-inline'"), "{csp}");
+        assert!(csp.contains("worker-src 'self'"), "{csp}");
+        assert!(csp.contains("connect-src 'self'"), "{csp}");
+        assert!(csp.contains("img-src 'self' data:"), "{csp}");
+        assert!(!csp.contains("tiles.openfreemap.org"), "{csp}");
         assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
         assert!(csp.contains("object-src 'none'"), "{csp}");
-        assert!(!csp.contains("unsafe-inline"), "{csp}");
+        assert!(!csp.contains("script-src 'self' 'unsafe-inline'"), "{csp}");
+        assert!(!csp.contains("style-src 'self' 'unsafe-inline'"), "{csp}");
         assert!(plain.headers().get("permissions-policy").is_some());
         assert!(plain.headers().get("strict-transport-security").is_none());
         assert_eq!(
@@ -405,6 +418,27 @@ mod tests {
             "no-store"
         );
         assert_eq!(plain.status(), StatusCode::OK);
+        let tiles = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/tiles/p/styles/positron")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tiles.status(), StatusCode::UNAUTHORIZED);
+        let blocked = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/tiles/p/styles/liberty")
+                    .header("cookie", "__Host-tl_session=not-a-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
             plain.headers().get(header::REFERRER_POLICY).unwrap(),
             "same-origin"
