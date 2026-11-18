@@ -289,6 +289,8 @@ form.logout { margin: 0; flex: none; }
   box-shadow: var(--shadow);
 }
 
+.card > :is(p, ul, ol, dl, table, form, div) + :is(h2, h3) { margin-top: calc(var(--space) * 3); }
+
 .card-head {
   display: flex;
   flex-wrap: wrap;
