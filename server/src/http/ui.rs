@@ -77,6 +77,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/static/debug.js", get(debug_js))
         .route("/static/tabs.js", get(tabs_js))
         .route("/static/setup.js", get(setup_js))
+        .route("/static/charts.js", get(charts_js))
 }
 
 #[derive(Deserialize)]
@@ -147,7 +148,7 @@ async fn home(State(app): State<AppState>, headers: HeaderMap) -> Response {
         total_km += km;
         total_kwh += kwh;
         let mode = app.inner.archive.gps.mode_name(vehicle.id).await;
-        cards.push(FleetCard {
+        let mut card = FleetCard {
             id: vehicle.id,
             name: vehicle.name.clone(),
             activity: vehicle
@@ -156,17 +157,31 @@ async fn home(State(app): State<AppState>, headers: HeaderMap) -> Response {
                 .unwrap_or_else(|| "inconnu".to_owned()),
             battery: fmt_battery(vehicle.battery_level),
             position_mode: mode,
-            last_seen: fmt_time(vehicle.last_data_at.or(vehicle.last_poll_at)),
+            last_seen: super::format::ago(
+                vehicle.last_data_at.or(vehicle.last_poll_at),
+                Utc::now(),
+            ),
             last_error: vehicle.last_error.clone(),
-            month: format!("{km:.1} km · {kwh:.1} kWh"),
-        });
+            month: format!(
+                "{} · {}",
+                super::format::km(Some(km)),
+                super::format::kwh(Some(kwh))
+            ),
+            ..FleetCard::default()
+        };
+        super::overview::decorate_fleet_card(&app, &mut card).await;
+        cards.push(card);
     }
     let chrome = chrome(&page, None, None, GlobalTab::None, false);
     html_page(
         fleet_page(
             &chrome,
             &cards,
-            &format!("{total_km:.1} km · {total_kwh:.1} kWh"),
+            &format!(
+                "{} parcourus · {} chargés",
+                super::format::km(Some(total_km)),
+                super::format::kwh(Some(total_kwh))
+            ),
         ),
         page.cookie,
     )
@@ -189,8 +204,7 @@ async fn overview(
     remember_vehicle(&app, &page.session_id, id).await;
     let mode = app.inner.archive.gps.mode_name(id).await;
     let (latest_sample, queue_depth) = app.inner.stream_board.snapshot().await.ingestion(id);
-    let drive = last_drive(&app, id).await;
-    let charge = last_charge(&app, id).await;
+    let tz = super::format::zone(&app, Some(id)).await;
     let view = Overview {
         name: vehicle.name.clone(),
         activity: vehicle
@@ -204,8 +218,10 @@ async fn overview(
         last_error: vehicle.last_error.clone().unwrap_or_else(|| "—".to_owned()),
         stream_lag: fmt_lag(latest_sample),
         stream_queue: queue_depth.to_string(),
-        last_drive: drive,
-        last_charge: charge,
+        last_drive: super::overview::recent_drive(&app, id, tz).await,
+        last_charge: super::overview::recent_charge(&app, id, tz).await,
+        car: super::overview::car_card(&app, id).await,
+        month: super::overview::month(&app, id, tz).await,
     };
     html_page(
         overview_page(
@@ -1627,52 +1643,6 @@ async fn month_by_vehicle(app: &AppState, start: DateTime<Utc>) -> HashMap<i64, 
     map
 }
 
-type ActivityBrief = (DateTime<Utc>, Option<f64>, Option<DateTime<Utc>>);
-
-async fn last_drive(app: &AppState, vehicle_id: i64) -> String {
-    let row: Option<ActivityBrief> = sqlx::query_as(
-        "SELECT start_at, distance_km, end_at FROM drives
-         WHERE vehicle_id = $1 AND deleted_at IS NULL ORDER BY start_at DESC LIMIT 1",
-    )
-    .bind(vehicle_id)
-    .fetch_optional(&app.inner.db)
-    .await
-    .ok()
-    .flatten();
-    match row {
-        Some((start, distance, end)) => {
-            let distance = distance.map_or_else(|| "—".to_owned(), |km| format!("{km:.1} km"));
-            let state = if end.is_some() { "terminé" } else { "ouvert" };
-            format!("{distance} · {state} · {}", fmt_time(Some(start)))
-        }
-        None => "Aucun trajet".to_owned(),
-    }
-}
-
-async fn last_charge(app: &AppState, vehicle_id: i64) -> String {
-    let row: Option<ActivityBrief> = sqlx::query_as(
-        "SELECT start_at, energy_added_kwh, end_at FROM charges
-         WHERE vehicle_id = $1 AND deleted_at IS NULL ORDER BY start_at DESC LIMIT 1",
-    )
-    .bind(vehicle_id)
-    .fetch_optional(&app.inner.db)
-    .await
-    .ok()
-    .flatten();
-    match row {
-        Some((start, energy, end)) => {
-            let energy = energy.map_or_else(|| "—".to_owned(), |kwh| format!("{kwh:.1} kWh"));
-            let state = if end.is_some() {
-                "terminée"
-            } else {
-                "ouverte"
-            };
-            format!("{energy} · {state} · {}", fmt_time(Some(start)))
-        }
-        None => "Aucune charge".to_owned(),
-    }
-}
-
 #[derive(sqlx::FromRow)]
 struct TokenRow {
     id: i64,
@@ -1756,7 +1726,7 @@ fn nav_from(page: &Page, current: Option<i64>) -> Vec<NavVehicle> {
 }
 
 fn fmt_battery(value: Option<f64>) -> String {
-    value.map_or_else(|| "—".to_owned(), |value| format!("{value:.0}%"))
+    super::format::percent(value)
 }
 
 fn fmt_time(value: Option<DateTime<Utc>>) -> String {
@@ -1821,6 +1791,23 @@ async fn setup_js() -> Response {
             ),
         ],
         include_str!("setup.js"),
+    )
+        .into_response()
+}
+
+async fn charts_js() -> Response {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/javascript; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400"),
+            ),
+        ],
+        include_str!("charts.js"),
     )
         .into_response()
 }

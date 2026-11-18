@@ -27,6 +27,8 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
 use super::ApiError;
+use super::format;
+use super::viz::{self, BarChart, Series};
 use crate::app::AppState;
 use crate::error::redact_secrets;
 
@@ -285,6 +287,11 @@ fn localize(tz: Tz, local_start: NaiveDateTime) -> Result<(DateTime<Utc>, i32), 
         zoned.with_timezone(&Utc),
         zoned.offset().fix().local_minus_utc(),
     ))
+}
+
+/// Stored drive energy, else the rated-range estimate. Same basis as the stats series.
+pub(crate) fn drive_energy_sql(drive: &str, vehicle: &str) -> String {
+    drive_energy_expr(drive, vehicle)
 }
 
 fn drive_energy_expr(drive: &str, vehicle: &str) -> String {
@@ -739,65 +746,94 @@ pub(super) async fn console_page(
     let series = load_series(app, id, period, count).await.ok();
     let bins = load_bins(app, id, period, count).await.unwrap_or_default();
     let quality = quality(app, id).await;
+    let presets = [
+        ("week", 12, "Semaines"),
+        ("month", 12, "Mois"),
+        ("year", 5, "Années"),
+    ];
     let body = html! {
-        (toolbar(chrome, "Stats"))
+        (toolbar(chrome, "Statistiques"))
         (vehicle_tabs(chrome))
-        div role="tabpanel" {
-            form class="filters" method="get" action=(format!("/v/{id}/stats")) {
-                label class="field" for="period" {
-                    "Période"
-                    select id="period" name="period" {
-                        option value="week" { "semaine" }
-                        option value="month" { "mois" }
-                        option value="year" { "année" }
+        div id="panel-stats" role="tabpanel" aria-labelledby="tab-stats" {
+            div class="list-toolbar" {
+                nav class="segmented" aria-label="Regroupement" {
+                    @for (value, preset, label) in presets {
+                        @let href = format!("/v/{id}/stats?period={value}&count={preset}");
+                        @if period == value {
+                            a href=(href) aria-current="page" { (label) }
+                        } @else {
+                            a href=(href) { (label) }
+                        }
                     }
                 }
-                label class="field" for="count" { "Nombre" input id="count" name="count" value=(count.to_string()); }
-                button class="tonal" type="submit" { "Afficher" }
-                a href=(format!("/v/{id}/stats.csv?period={period}&count={count}")) { "CSV" }
+                a class="button ghost small" href=(format!("/v/{id}/stats.csv?period={period}&count={count}")) download { "Exporter en CSV" }
+            }
+            details class="filters-panel" {
+                summary { "Personnaliser" }
+                form class="filters" method="get" action=(format!("/v/{id}/stats")) {
+                    label class="field" for="period" {
+                        "Période"
+                        select id="period" name="period" {
+                            option value="week" selected[period == "week"] { "semaine" }
+                            option value="month" selected[period == "month"] { "mois" }
+                            option value="year" selected[period == "year"] { "année" }
+                        }
+                    }
+                    label class="field" for="count" { "Nombre" input id="count" name="count" inputmode="numeric" value=(count.to_string()); }
+                    div class="filters-actions" { button type="submit" { "Afficher" } }
+                }
             }
             @if let Some(series) = series {
-                p { "Total distance " (sum_distance(&series)) " km · coût/km " (first_cost(&series)) }
-                (bars(id, "Wh/km", &series, |bucket| bucket.wh_per_km.unwrap_or(0.0)))
-                (bars(id, "Distance", &series, |bucket| bucket.distance_km))
-                (bars(id, "Énergie chargée", &series, |bucket| bucket.energy_charged_kwh))
-                (bars(id, "Autonomie à 100 %", &series, |bucket| bucket.range_at_100_km.unwrap_or(0.0)))
-                (bars(id, "Part DC", &series, |bucket| bucket.dc_share_pct.unwrap_or(0.0)))
-                (bars(id, "Coût/km", &series, |bucket| bucket.cost_per_km.unwrap_or(0.0)))
-                (bars(id, "Perte à l'arrêt", &series, |bucket| bucket.idle_range_loss_km_per_day.unwrap_or(0.0)))
-                section class="card" {
-                    h2 { "Tableau" }
-                    table class="settings" {
-                        thead { tr { th { "Début" } th { "km" } th { "Wh/km" } th { "Coût/km" } } }
-                        tbody {
-                            @for bucket in &series.buckets {
-                                tr {
-                                    td { a href=(bucket_href(id, &series.period, bucket.start)) { (bucket.start.format("%Y-%m-%d").to_string()) } }
-                                    td { (format!("{:.1}", bucket.distance_km)) }
-                                    td { (bucket.wh_per_km.map_or_else(|| "—".into(), |value| format!("{value:.0}"))) }
-                                    td { (bucket.cost_per_km.map_or_else(|| "—".into(), |value| format!("{value:.3}"))) }
+                (summary(&series))
+                div class="chart-grid" {
+                    (series_figure(id, &series, ("Distance", "km", 0, "accent", Fold::Total), |bucket| Some(bucket.distance_km)))
+                    (series_figure(id, &series, ("Efficacité", "Wh/km", 0, "amber", Fold::Mean), |bucket| bucket.wh_per_km))
+                    (charged_figure(id, &series))
+                    (series_figure(id, &series, ("Coût des charges", "€", 2, "violet", Fold::Total), |bucket| bucket.charge_cost))
+                    (series_figure(id, &series, ("Autonomie à 100 %", "km", 0, "accent", Fold::Mean), |bucket| bucket.range_at_100_km))
+                    (series_figure(id, &series, ("Perte à l'arrêt", "km/j", 1, "slate", Fold::Mean), |bucket| bucket.idle_range_loss_km_per_day))
+                    (temp_figure(id, &bins))
+                }
+                details class="card table-card" {
+                    summary { "Tableau détaillé" }
+                    div class="table-scroll" {
+                        table class="settings data" {
+                            thead { tr { th scope="col" { "Période" } th scope="col" { "Distance" } th scope="col" { "Trajets" } th scope="col" { "Wh/km" } th scope="col" { "Chargé" } th scope="col" { "Part DC" } th scope="col" { "Coût/km" } } }
+                            tbody {
+                                @for bucket in series.buckets.iter().rev() {
+                                    tr {
+                                        th scope="row" { a href=(bucket_href(id, &series.period, bucket.start)) { (bucket_title(&series.period, bucket.start)) } }
+                                        td { (format::km(Some(bucket.distance_km))) }
+                                        td { (format::count(bucket.drive_count)) }
+                                        td { (format::unit(bucket.wh_per_km, 0, "Wh/km")) }
+                                        td { (format::kwh(Some(bucket.energy_charged_kwh))) }
+                                        td { (format::percent(bucket.dc_share_pct)) }
+                                        td { (format::unit(bucket.cost_per_km, 3, "€")) }
+                                    }
                                 }
                             }
                         }
                     }
                 }
+            } @else {
+                section class="card empty-state" {
+                    h2 { "Pas de statistiques" }
+                    p class="muted" { "Aucune donnée pour cette période." }
+                }
             }
-            section class="card" {
-                h2 { "Consommation par température" }
-                (temp_bars(id, &bins))
-            }
-            section class="card" {
-                h2 { "Qualité" }
-                dl class="facts" {
+            section class="card" aria-labelledby="quality-title" {
+                h2 id="quality-title" { "Qualité des données" }
+                dl class="metrics compact" {
                     div { dt { "Trajets sans énergie" } dd { (quality.drives_without_energy) } }
                     div { dt { "Charges sans énergie utilisée" } dd { (quality.charges_without_energy) } }
-                    div { dt { "Jours sans point GPS" } dd { (quality.gap_days) } }
+                    div { dt { "Jours sans point GPS (30 j)" } dd { (quality.gap_days) } }
                     @for (source, count) in &quality.points {
-                        div { dt { (source) } dd { (count) } }
+                        div { dt { "Points " (source) } dd { (format::count(*count)) } }
                     }
                 }
             }
         }
+        script src="/static/charts.js" defer {}
     };
     document(chrome.debug_script, body)
 }
@@ -871,60 +907,254 @@ async fn load_bins(
         .collect())
 }
 
-fn bars(
-    id: i64,
-    title: &str,
-    series: &SeriesResponse,
-    value: impl Fn(&Bucket) -> f64,
-) -> maud::Markup {
-    use maud::html;
-    let max = series
-        .buckets
-        .iter()
-        .map(&value)
-        .fold(0.0_f64, f64::max)
-        .max(1e-9);
-    let width = u32::try_from(series.buckets.len().max(1)).unwrap_or(1) * 8;
-    html! {
-        section class="card" {
-            h2 { (title) }
-            svg class="chart" viewBox=(format!("0 0 {width} 40")) width="640" height="180" role="img" aria-label=(title) {
-                @for (index, bucket) in series.buckets.iter().enumerate() {
-                    @let height = (value(bucket) / max) * 36.0;
-                    @let x = u32::try_from(index).unwrap_or(0) * 8;
-                    a href=(bucket_href(id, &series.period, bucket.start)) {
-                        rect x=(x) y=(format!("{:.2}", 38.0 - height)) width="6" height=(format!("{height:.2}")) fill="currentColor" {}
-                    }
-                }
-            }
-            ol class="chart-labels" {
-                @for bucket in &series.buckets {
-                    li { a href=(bucket_href(id, &series.period, bucket.start)) { (bucket.start.format("%d/%m").to_string()) } }
-                }
-            }
-        }
+fn bucket_label(period: &str, start: DateTime<FixedOffset>) -> String {
+    let date = start.date_naive();
+    match period {
+        "year" => date.year().to_string(),
+        "month" => format::short_month(date).to_owned(),
+        _ => format::short_date(date),
     }
 }
 
-fn temp_bars(id: i64, bins: &[TempBin]) -> maud::Markup {
-    use maud::html;
-    let max = bins
+fn bucket_title(period: &str, start: DateTime<FixedOffset>) -> String {
+    let date = start.date_naive();
+    match period {
+        "year" => date.year().to_string(),
+        "month" => format::month_title(date),
+        _ => format!("Semaine du {} {}", format::short_date(date), date.year()),
+    }
+}
+
+struct Axes {
+    labels: Vec<String>,
+    titles: Vec<String>,
+    hrefs: Vec<String>,
+}
+
+fn axes(id: i64, series: &SeriesResponse) -> Axes {
+    Axes {
+        labels: series
+            .buckets
+            .iter()
+            .map(|bucket| bucket_label(&series.period, bucket.start))
+            .collect(),
+        titles: series
+            .buckets
+            .iter()
+            .map(|bucket| bucket_title(&series.period, bucket.start))
+            .collect(),
+        hrefs: series
+            .buckets
+            .iter()
+            .map(|bucket| bucket_href(id, &series.period, bucket.start))
+            .collect(),
+    }
+}
+
+fn bar_series(
+    name: &str,
+    unit: &str,
+    decimals: u8,
+    tone: &'static str,
+    values: Vec<Option<f64>>,
+) -> Series {
+    Series {
+        name: name.to_owned(),
+        unit: unit.to_owned(),
+        decimals,
+        tone,
+        values,
+        area: false,
+        signed: false,
+    }
+}
+
+/// How a chart summary folds its buckets: sums for amounts, means for ratios.
+#[derive(Clone, Copy)]
+enum Fold {
+    Total,
+    Mean,
+}
+
+fn series_figure(
+    id: i64,
+    series: &SeriesResponse,
+    (title, unit, decimals, tone, fold): (&str, &str, u8, &'static str, Fold),
+    value: impl Fn(&Bucket) -> Option<f64>,
+) -> maud::Markup {
+    let axes = axes(id, series);
+    let values: Vec<Option<f64>> = series.buckets.iter().map(&value).collect();
+    let known: Vec<f64> = values.iter().flatten().copied().collect();
+    let places = usize::from(decimals);
+    let total: f64 = known.iter().sum();
+    let summary = match fold {
+        _ if known.is_empty() => "Pas de données".to_owned(),
+        Fold::Total => format!(
+            "Total {} · max {}",
+            format::unit(Some(total), places, unit),
+            format::unit(known.iter().copied().reduce(f64::max), places, unit)
+        ),
+        Fold::Mean => format!(
+            "Moyenne {} · max {}",
+            format::unit(
+                Some(total / f64::from(u32::try_from(known.len()).unwrap_or(1))),
+                places,
+                unit
+            ),
+            format::unit(known.iter().copied().reduce(f64::max), places, unit)
+        ),
+    };
+    viz::bar_figure(
+        title,
+        &summary,
+        &BarChart {
+            kind: "bar",
+            labels: &axes.labels,
+            titles: &axes.titles,
+            hrefs: &axes.hrefs,
+            series: vec![bar_series(title, unit, decimals, tone, values)],
+            stacked: false,
+        },
+    )
+}
+
+fn charged_figure(id: i64, series: &SeriesResponse) -> maud::Markup {
+    let axes = axes(id, series);
+    let ac: Vec<Option<f64>> = series
+        .buckets
         .iter()
-        .filter_map(|bin| bin.wh_per_km)
-        .fold(0.0_f64, f64::max)
-        .max(1e-9);
+        .map(|bucket| Some(bucket.ac_energy_kwh))
+        .collect();
+    let dc: Vec<Option<f64>> = series
+        .buckets
+        .iter()
+        .map(|bucket| Some(bucket.dc_energy_kwh))
+        .collect();
+    let total_ac: f64 = series
+        .buckets
+        .iter()
+        .map(|bucket| bucket.ac_energy_kwh)
+        .sum();
+    let total_dc: f64 = series
+        .buckets
+        .iter()
+        .map(|bucket| bucket.dc_energy_kwh)
+        .sum();
+    let summary = format!(
+        "{} en AC · {} en DC",
+        format::kwh(Some(total_ac)),
+        format::kwh(Some(total_dc))
+    );
+    viz::bar_figure(
+        "Énergie chargée",
+        &summary,
+        &BarChart {
+            kind: "bar",
+            labels: &axes.labels,
+            titles: &axes.titles,
+            hrefs: &axes.hrefs,
+            series: vec![
+                bar_series("AC", "kWh", 1, "accent", ac),
+                bar_series("DC", "kWh", 1, "green", dc),
+            ],
+            stacked: true,
+        },
+    )
+}
+
+fn temp_figure(id: i64, bins: &[TempBin]) -> maud::Markup {
+    let labels: Vec<String> = bins
+        .iter()
+        .map(|bin| {
+            format!(
+                "{}{}°C",
+                format::number(f64::from(bin.temp_c_bucket), 0),
+                format::NNBSP
+            )
+        })
+        .collect();
+    let titles: Vec<String> = bins
+        .iter()
+        .map(|bin| {
+            format!(
+                "{} à {}{}°C · {}",
+                format::number(f64::from(bin.temp_c_bucket), 0),
+                format::number(f64::from(bin.temp_c_bucket + 5), 0),
+                format::NNBSP,
+                format::km(Some(bin.distance_km))
+            )
+        })
+        .collect();
+    let hrefs: Vec<String> = bins.iter().map(|_| format!("/v/{id}/drives")).collect();
+    let best = bins
+        .iter()
+        .filter_map(|bin| Some((bin.temp_c_bucket, bin.wh_per_km?)))
+        .min_by(|left, right| left.1.total_cmp(&right.1));
+    let summary = best.map_or_else(
+        || "Pas de données".to_owned(),
+        |(temp, wh)| {
+            format!(
+                "Meilleure efficacité vers {}{}°C : {}",
+                format::number(f64::from(temp), 0),
+                format::NNBSP,
+                format::unit(Some(wh), 0, "Wh/km")
+            )
+        },
+    );
+    viz::bar_figure(
+        "Consommation par température",
+        &summary,
+        &BarChart {
+            kind: "bar",
+            labels: &labels,
+            titles: &titles,
+            hrefs: &hrefs,
+            series: vec![bar_series(
+                "Efficacité",
+                "Wh/km",
+                0,
+                "amber",
+                bins.iter().map(|bin| bin.wh_per_km).collect(),
+            )],
+            stacked: false,
+        },
+    )
+}
+
+fn summary(series: &SeriesResponse) -> maud::Markup {
+    use maud::html;
+    let buckets = &series.buckets;
+    let distance: f64 = buckets.iter().map(|bucket| bucket.distance_km).sum();
+    let energy: f64 = buckets
+        .iter()
+        .filter_map(|bucket| bucket.energy_used_kwh)
+        .sum();
+    let charged: f64 = buckets.iter().map(|bucket| bucket.energy_charged_kwh).sum();
+    let dc: f64 = buckets.iter().map(|bucket| bucket.dc_energy_kwh).sum();
+    let cost: Option<f64> = buckets
+        .iter()
+        .filter_map(|bucket| bucket.charge_cost)
+        .reduce(|left, right| left + right);
+    let drives: i64 = buckets.iter().map(|bucket| bucket.drive_count).sum();
+    let cost_per_km = cost.filter(|_| distance > 0.0).map(|cost| cost / distance);
+    let metrics = [
+        ("Distance", format::km(Some(distance))),
+        ("Trajets", format::count(drives)),
+        (
+            "Efficacité",
+            format::unit(format::efficiency(Some(energy), Some(distance)), 0, "Wh/km"),
+        ),
+        ("Énergie chargée", format::kwh(Some(charged))),
+        (
+            "Part DC",
+            format::percent((charged > 0.0).then(|| dc / charged * 100.0)),
+        ),
+        ("Coût/km", format::unit(cost_per_km, 3, "€")),
+    ];
     html! {
-        svg class="chart" viewBox=(format!("0 0 {} 40", bins.len().max(1) * 8)) width="640" height="180" role="img" aria-label="Consommation par température" {
-            @for (index, bin) in bins.iter().enumerate() {
-                @let height = bin.wh_per_km.unwrap_or(0.0) / max * 36.0;
-                a href=(format!("/v/{id}/drives")) {
-                    rect x=(u32::try_from(index).unwrap_or(0) * 8) y=(format!("{:.2}", 38.0 - height)) width="6" height=(format!("{height:.2}")) fill="currentColor" {}
-                }
-            }
-        }
-        ol class="chart-labels" {
-            @for bin in bins {
-                li { (bin.temp_c_bucket) " °C" }
+        dl class="metrics summary" aria-label="Totaux de la période" {
+            @for (label, value) in &metrics {
+                div { dt { (label) } dd { (value) } }
             }
         }
     }
@@ -942,25 +1172,6 @@ fn bucket_href(id: i64, period: &str, start: DateTime<FixedOffset>) -> String {
         start.format("%Y-%m-%d"),
         end.format("%Y-%m-%d")
     )
-}
-
-fn sum_distance(series: &SeriesResponse) -> String {
-    format!(
-        "{:.1}",
-        series
-            .buckets
-            .iter()
-            .map(|bucket| bucket.distance_km)
-            .sum::<f64>()
-    )
-}
-
-fn first_cost(series: &SeriesResponse) -> String {
-    series
-        .buckets
-        .iter()
-        .find_map(|bucket| bucket.cost_per_km)
-        .map_or_else(|| "—".into(), |value| format!("{value:.3}"))
 }
 
 #[cfg(test)]

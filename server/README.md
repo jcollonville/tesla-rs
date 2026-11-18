@@ -95,3 +95,9 @@ cargo test -p tesla-logger
 ```
 
 Database tests create throwaway databases and skip when `DATABASE_URL` is unset outside CI.
+
+`demo/seed.sql` fills a migrated database with an invented archive (two cars, six weeks of drives and charges, places in the ocean near 0°N 0°E) for UI work and screenshots. Each run replaces only its own demo rows:
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f server/demo/seed.sql
+```
