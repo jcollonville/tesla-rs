@@ -9,10 +9,13 @@ mod format;
 mod markup;
 mod overview;
 mod owner;
+mod render;
 pub(crate) mod stats;
 mod trips;
 mod ui;
 mod viz;
+
+pub(crate) use render::CarRenders;
 
 use axum::body::Body;
 use axum::extract::State;

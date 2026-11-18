@@ -19,6 +19,7 @@ use crate::debug::DebugBoard;
 use crate::error::AppError;
 use crate::geocode::Geocoder;
 use crate::http;
+use crate::http::CarRenders;
 use crate::ingest::{self, Archive, FleetPoll, PollPolicy};
 use crate::logs::LogBuffer;
 use crate::mqtt;
@@ -50,6 +51,7 @@ pub(crate) struct Inner {
     pub owner_tokens: watch::Sender<u64>,
     pub logs: LogBuffer,
     pub debug: DebugBoard,
+    pub car_renders: CarRenders,
 }
 
 pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
@@ -185,6 +187,7 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
     archive.fleet_account_id = Some(imported.fleet_id);
     archive.owner_account_id = Some(imported.owner_id);
     let archive = Arc::new(archive);
+    let car_renders = CarRenders::from_config(&config);
     Ok(AppState {
         inner: Arc::new(Inner {
             config,
@@ -204,6 +207,7 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
             owner_tokens,
             logs,
             debug,
+            car_renders,
         }),
     })
 }
@@ -250,8 +254,23 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
 }
 
 #[cfg(test)]
-#[allow(clippy::unused_async)]
 pub(crate) async fn test_state_with(pool: PgPool, energy_price_per_kwh: Option<f64>) -> AppState {
+    test_state_full(pool, energy_price_per_kwh, None).await
+}
+
+/// Test state whose car renders come from `renders`, normally a mock server.
+#[cfg(test)]
+pub(crate) async fn test_state_renders(pool: PgPool, renders: CarRenders) -> AppState {
+    test_state_full(pool, None, Some(renders)).await
+}
+
+#[cfg(test)]
+#[allow(clippy::unused_async)]
+async fn test_state_full(
+    pool: PgPool,
+    energy_price_per_kwh: Option<f64>,
+    renders: Option<CarRenders>,
+) -> AppState {
     use std::collections::BTreeMap;
 
     use p256::SecretKey;
@@ -295,6 +314,7 @@ pub(crate) async fn test_state_with(pool: PgPool, energy_price_per_kwh: Option<f
         "test-key".to_owned(),
     );
     map.insert("NOMINATIM_ENABLED".to_owned(), "false".to_owned());
+    map.insert("CAR_RENDERS_ENABLED".to_owned(), "false".to_owned());
     if let Some(price) = energy_price_per_kwh {
         map.insert("ENERGY_PRICE_PER_KWH".to_owned(), price.to_string());
     }
@@ -350,6 +370,7 @@ pub(crate) async fn test_state_with(pool: PgPool, energy_price_per_kwh: Option<f
             owner_tokens,
             logs,
             debug,
+            car_renders: renders.unwrap_or_else(|| CarRenders::new(false, String::new(), None)),
         }),
     }
 }

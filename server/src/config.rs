@@ -55,6 +55,8 @@ pub(crate) struct Config {
     pub energy_price_per_kwh: Option<f64>,
     /// `local` (default), `oidc`, or `proxy`. Proxy requires an IP allowlist.
     pub auth_mode: String,
+    /// Fetch and serve official Tesla renders of the cars. Off keeps the drawings.
+    pub car_renders_enabled: bool,
     pub proxy_allowlist: Vec<String>,
     pub oidc_issuer: Option<String>,
     /// Keys present in the environment or dotenv file. Values are not stored here.
@@ -185,6 +187,7 @@ impl Config {
             timezone: timezone_name(map)?,
             energy_price_per_kwh: optional_f64(map, "ENERGY_PRICE_PER_KWH")?,
             auth_mode: auth_mode(map)?,
+            car_renders_enabled: optional_bool(map, "CAR_RENDERS_ENABLED")?.unwrap_or(true),
             proxy_allowlist: proxy_allowlist(map),
             oidc_issuer: optional(map, "AUTH_OIDC_ISSUER"),
             explicit_env: map.keys().cloned().collect(),
