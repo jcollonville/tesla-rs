@@ -6,9 +6,11 @@
 //! The picture comes from Tesla's public configurator compositor
 //! (`static-assets.tesla.com`) and depends only on the model, the paint and the
 //! wheels. The server fetches it once per combination, keeps it in memory and in
-//! a cache directory, and serves it from `/v/{id}/car.png`. The browser never
-//! contacts Tesla, so the CSP keeps `img-src 'self' data:`. The URL sent to
-//! Tesla holds the option codes only: no VIN, no vehicle id, no coordinates.
+//! a cache directory, and serves it from `/v/{id}/car.png` for a signed-in
+//! browser and from `GET /api/v1/vehicles/{id}/car.png` for a read API token.
+//! The browser never contacts Tesla, so the CSP keeps `img-src 'self' data:`.
+//! The URL sent to Tesla holds the option codes only: no VIN, no vehicle id,
+//! no coordinates.
 //!
 //! Only combinations known to render are requested. The compositor answers an
 //! unknown paint with HTTP 200 and a car without a body, so unknown paints,
@@ -381,6 +383,81 @@ pub(super) async fn car_png(
     response
 }
 
+/// `GET /api/v1/vehicles/{id}/car.png`: the same cached render, for a read token.
+///
+/// `{id}` is the numeric vehicle id. A missing picture, a disabled render
+/// service, or a failed fetch is the JSON `404` used by the other API routes.
+pub(super) async fn api_car_png(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, super::ApiError> {
+    if !super::vehicle_visible(id) {
+        return Err(super::ApiError::NotFound);
+    }
+    let Some(spec) = super::overview::render_spec(&app, id).await else {
+        return Err(super::ApiError::NotFound);
+    };
+    let Some(bytes) = app.inner.car_renders.get(&spec).await else {
+        return Err(super::ApiError::NotFound);
+    };
+    let etag = entity_tag(&bytes);
+    if not_modified(&headers, &etag) {
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, cache_control()),
+            ],
+        )
+            .into_response());
+    }
+    let mut response = (*bytes).clone().into_response();
+    let out = response.headers_mut();
+    out.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    out.insert(header::ETAG, etag);
+    out.insert(header::CACHE_CONTROL, cache_control());
+    Ok(response)
+}
+
+fn cache_control() -> HeaderValue {
+    HeaderValue::from_static("private, max-age=86400")
+}
+
+/// Strong entity tag over the PNG bytes. Quoted, never weak.
+fn entity_tag(bytes: &[u8]) -> HeaderValue {
+    use sha2::{Digest, Sha256};
+    let quoted = format!("\"{}\"", hex::encode(Sha256::digest(bytes)));
+    HeaderValue::from_str(&quoted).unwrap_or_else(|_| HeaderValue::from_static("\"0\""))
+}
+
+/// `If-None-Match` uses weak comparison: `W/"abc"` matches `"abc"`, and `*` matches.
+fn not_modified(headers: &HeaderMap, etag: &HeaderValue) -> bool {
+    let Some(raw) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(current) = etag.to_str().ok() else {
+        return false;
+    };
+    let current = opaque_tag(current);
+    raw.split(',').any(|part| {
+        let part = part.trim();
+        part == "*" || opaque_tag(part) == current
+    })
+}
+
+fn opaque_tag(value: &str) -> &str {
+    let value = value.trim();
+    value
+        .strip_prefix("W/")
+        .unwrap_or(value)
+        .trim()
+        .trim_matches('"')
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::Body as HttpBody;
@@ -585,6 +662,208 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn api_serves_the_cached_render_with_token_auth_etag_and_json_404() {
+        let Some(db) = crate::test_util::TestDb::migrated("car-render-api").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        compositor(
+            &server,
+            ResponseTemplate::new(200).set_body_raw(PNG, "image/png"),
+            1,
+        )
+        .await;
+        let renders = CarRenders::new(true, server.uri(), Some(scratch()));
+        let state = crate::app::test_state_renders(db.pool.clone(), renders).await;
+        let known: i64 = sqlx::query_scalar(
+            "INSERT INTO vehicles (vin, name, model, exterior_color, wheel_type)
+             VALUES ($1, 'Rendu', 'modely', 'PearlWhite', 'Gemini19') RETURNING id",
+        )
+        .bind(VIN)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let plain: i64 = sqlx::query_scalar(
+            "INSERT INTO vehicles (vin, name, model, exterior_color)
+             VALUES ('5YJYTESTVIN000043', 'Dessin', 'modely', 'StealthGrey') RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let read = "tl_render-read";
+        sqlx::query("INSERT INTO api_tokens (name, token_hash, scopes) VALUES ('read', $1, $2)")
+            .bind(crate::crypto::sha256_hex(read))
+            .bind(&["read".to_owned()])
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let live_only = "tl_render-live";
+        sqlx::query("INSERT INTO api_tokens (name, token_hash, scopes) VALUES ('live', $1, $2)")
+            .bind(crate::crypto::sha256_hex(live_only))
+            .bind(&["read:live".to_owned()])
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let path = format!("/api/v1/vehicles/{known}/car.png");
+        let (status, _, body) = api(&state, &path, None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, br#"{"error":"unauthorized"}"#);
+
+        let (status, _, body) = api(&state, &path, Some(live_only), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, br#"{"error":"unauthorized"}"#);
+
+        let (status, headers, body) = api(&state, &path, Some(read), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "image/png");
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL).unwrap(),
+            "private, max-age=86400"
+        );
+        let etag = headers
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            etag.starts_with('"') && etag.ends_with('"') && !etag.starts_with("W/"),
+            "{etag}"
+        );
+        assert_eq!(body, PNG);
+
+        let (status, headers, body) = api(&state, &path, Some(read), Some(etag.as_str())).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+        assert_eq!(body, b"");
+        assert_eq!(headers.get(header::ETAG).unwrap(), etag.as_str());
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL).unwrap(),
+            "private, max-age=86400"
+        );
+
+        let (status, _, body) = api(&state, &path, Some(read), Some("\"other\"")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, PNG);
+
+        let (status, headers, body) = api(
+            &state,
+            &format!("/api/v1/vehicles/{plain}/car.png"),
+            Some(read),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(body, br#"{"error":"not found"}"#);
+
+        let (status, _, body) = api(
+            &state,
+            &format!("/api/v1/vehicles/{VIN}/car.png"),
+            Some(read),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_ne!(body, PNG);
+
+        let one = api(
+            &state,
+            &format!("/api/v1/vehicles/{known}"),
+            Some(read),
+            None,
+        )
+        .await;
+        let one = String::from_utf8(one.2).unwrap();
+        assert!(one.contains("\"car_render\":true"), "{one}");
+
+        let vehicles = api(&state, "/api/v1/vehicles", Some(read), None).await;
+        let listed = String::from_utf8(vehicles.2).unwrap();
+        assert!(listed.contains("\"car_render\":true"), "{listed}");
+        assert!(listed.contains("\"car_render\":false"), "{listed}");
+        assert!(!listed.contains("static-assets.tesla.com"));
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let url = requests[0].url.as_str();
+        assert!(
+            !url.contains(VIN) && !url.to_ascii_lowercase().contains("vin"),
+            "{url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_render_is_404_when_renders_are_disabled() {
+        let Some(db) = crate::test_util::TestDb::migrated("car-render-off").await else {
+            return;
+        };
+        let state = crate::app::test_state(db.pool.clone()).await;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO vehicles (vin, name, model, exterior_color, wheel_type)
+             VALUES ('5YJYTESTVIN000044', 'Off', 'modely', 'PearlWhite', 'Gemini19') RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let token = "tl_render-off";
+        sqlx::query("INSERT INTO api_tokens (name, token_hash, scopes) VALUES ('off', $1, $2)")
+            .bind(crate::crypto::sha256_hex(token))
+            .bind(&["read".to_owned()])
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let (status, headers, body) = api(
+            &state,
+            &format!("/api/v1/vehicles/{id}/car.png"),
+            Some(token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, br#"{"error":"not found"}"#);
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let listed =
+            String::from_utf8(api(&state, "/api/v1/vehicles", Some(token), None).await.2).unwrap();
+        assert!(listed.contains("\"car_render\":false"), "{listed}");
+        assert!(!listed.contains("\"car_render\":true"));
+    }
+
+    async fn api(
+        state: &crate::app::AppState,
+        uri: &str,
+        token: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if let Some(etag) = if_none_match {
+            builder = builder.header(header::IF_NONE_MATCH, etag);
+        }
+        let response = crate::http::router(state.clone())
+            .oneshot(builder.body(HttpBody::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        (status, headers, body)
+    }
+
     #[test]
     fn spec_follows_model_paint_and_wheel() {
         let spec = Spec::from_vehicle(Body::ModelY, Some("PearlWhite"), Some("Induction20"))
@@ -632,6 +911,22 @@ mod tests {
         assert_eq!(rim_diameter("Uberturbine21"), Some(21));
         assert_eq!(rim_diameter("Gemini"), None);
         assert_eq!(rim_diameter("Wheel2"), None);
+    }
+
+    #[test]
+    fn if_none_match_uses_weak_comparison() {
+        let etag = super::entity_tag(b"\x89PNG\r\n\x1a\nrender-bytes");
+        let mut headers = axum::http::HeaderMap::new();
+        assert!(!super::not_modified(&headers, &etag));
+        headers.insert(header::IF_NONE_MATCH, etag.clone());
+        assert!(super::not_modified(&headers, &etag));
+        let weak = format!("W/{etag}", etag = etag.to_str().unwrap());
+        headers.insert(header::IF_NONE_MATCH, weak.parse().unwrap());
+        assert!(super::not_modified(&headers, &etag));
+        headers.insert(header::IF_NONE_MATCH, "\"other\", *".parse().unwrap());
+        assert!(super::not_modified(&headers, &etag));
+        headers.insert(header::IF_NONE_MATCH, "\"other\"".parse().unwrap());
+        assert!(!super::not_modified(&headers, &etag));
     }
 
     #[test]

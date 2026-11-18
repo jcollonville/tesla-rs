@@ -34,6 +34,7 @@ pub(crate) fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/v1/vehicles", get(api::list_vehicles))
         .route("/api/v1/vehicles/{id}", get(api::vehicle))
+        .route("/api/v1/vehicles/{id}/car.png", get(render::api_car_png))
         .route("/api/v1/vehicles/{id}/state", get(api::vehicle_state))
         .route("/api/v1/vehicles/{id}/stats/series", get(stats::series))
         .route(

@@ -42,6 +42,38 @@ paths:
               schema: { $ref: "#/components/schemas/Vehicle" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/vehicles/{id}/car.png:
+    get:
+      operationId: getVehicleRender
+      summary: Official car render PNG
+      description: |
+        Cached Tesla configurator render for this vehicle's model, paint, and wheels.
+        `{id}` is the numeric vehicle id, never a VIN. The server fetches Tesla once
+        per option-code combination and does not send a VIN, a vehicle id, or
+        coordinates upstream. `200` is `image/png` with a strong `ETag` and
+        `Cache-Control: private, max-age=86400`. A matching `If-None-Match` returns
+        `304` with an empty body. `404` is the same JSON error as the other routes
+        when renders are disabled, the model or paint has no picture, or the fetch
+        failed, so the client can use its own drawing. Requires the `read` scope;
+        a token that only has `read:live` is rejected.
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200":
+          description: PNG bytes
+          headers:
+            ETag:
+              description: Strong entity tag of the PNG bytes
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string, example: "private, max-age=86400" }
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        "304":
+          description: Not modified. `ETag` and `Cache-Control` are still set.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /api/v1/vehicles/{id}/state:
     get:
       operationId: getVehicleState
@@ -308,6 +340,13 @@ components:
         charger_power_kw: { type: number, nullable: true }
         last_poll_at: { type: string, format: date-time, nullable: true }
         last_error: { type: string, nullable: true }
+        car_render:
+          type: boolean
+          description: |
+            True when `CAR_RENDERS_ENABLED` is on and this model and paint have an
+            official picture. The bytes are `GET /api/v1/vehicles/{id}/car.png`.
+            The flag does not promise the fetch has succeeded; a failed fetch is
+            still `404`. Absent on older servers.
     VehicleState:
       type: object
       required: [vehicle_id, activity]

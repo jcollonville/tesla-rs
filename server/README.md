@@ -74,7 +74,8 @@ Images are published to `ghcr.io/jcollonville/tesla-logger` on `main` and on ver
 
 `GET /api/openapi.yaml` is the contract. Authenticated routes:
 
-* `GET /api/v1/vehicles` and `GET /api/v1/vehicles/{id}`
+* `GET /api/v1/vehicles` and `GET /api/v1/vehicles/{id}` include `car_render`
+* `GET /api/v1/vehicles/{id}/car.png` serves the cached official render (`image/png`, strong `ETag`, `Cache-Control: private, max-age=86400`, `304` on `If-None-Match`). `{id}` is the numeric vehicle id. `404` with `{"error":"not found"}` when no picture is available
 * `GET /api/v1/vehicles/{id}/state`
 * `GET /api/v1/drives?vehicle_id&from&to&page&per_page`
 * `GET /api/v1/drives/{id}?max_points=300` returns an RDP route and a stride time series
@@ -110,4 +111,4 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v drives=5000 -v pts_div=3 -f server/de
 
 ## Car pictures
 
-The overview and fleet cards show Tesla's official render of the car when one is known for its model, paint, and wheels (Model 3, Y, S, and X in the paints Tesla's image service still draws). The server asks `static-assets.tesla.com/v1/compositor/` once per combination with option codes only (never a VIN or vehicle id), keeps the PNG in memory and in `car-renders/` next to `TESLA_TOKEN_STORE_PATH`, and serves it from `/v/{id}/car.png` to signed-in users. The browser therefore loads images from its own origin and the CSP stays `img-src 'self' data:`. When the paint is not available, the car is a Cybertruck, the fetch fails, or `CAR_RENDERS_ENABLED=false`, the page keeps the drawn silhouette. Failures are remembered for a few minutes (a day for a refusal) so a missing picture does not trigger a request per page view.
+The overview and fleet cards show Tesla's official render of the car when one is known for its model, paint, and wheels (Model 3, Y, S, and X in the paints Tesla's image service still draws). The server asks `static-assets.tesla.com/v1/compositor/` once per combination with option codes only (never a VIN or vehicle id), keeps the PNG in memory and in `car-renders/` next to `TESLA_TOKEN_STORE_PATH`, and serves it from `/v/{id}/car.png` to signed-in users. The same bytes are available to a read API token at `GET /api/v1/vehicles/{id}/car.png` (`image/png`, strong `ETag`, `Cache-Control: private, max-age=86400`, `304` when `If-None-Match` matches). `{id}` is the numeric vehicle id, never a VIN. `car_render` on the vehicle JSON is true when that route may have a picture. The browser therefore loads images from its own origin and the CSP stays `img-src 'self' data:`. When the paint is not available, the car is a Cybertruck, the fetch fails, or `CAR_RENDERS_ENABLED=false`, the page keeps the drawn silhouette and the API returns `404` with `{"error":"not found"}`. Failures are remembered for a few minutes (a day for a refusal) so a missing picture does not trigger a request per page view.

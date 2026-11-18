@@ -28,6 +28,7 @@ pub(crate) async fn list_vehicles(
     .await
     .map_err(internal)?;
     rows.retain(|row| super::vehicle_visible(row.id));
+    mark_car_renders(&app, &mut rows);
     Ok(Json(rows))
 }
 
@@ -36,7 +37,7 @@ pub(crate) async fn vehicle(
     Path(id): Path<i64>,
 ) -> Result<Json<VehicleJson>, ApiError> {
     allow_vehicle(id)?;
-    let row = sqlx::query_as::<_, VehicleJson>(
+    let mut row = sqlx::query_as::<_, VehicleJson>(
         "SELECT v.id, v.vin, v.name, v.model, v.exterior_color, s.activity,
                 s.battery_level, s.rated_range_km, s.odometer_km, s.latitude, s.longitude,
                 s.speed_kmh, s.charger_power_kw, s.last_poll_at, s.last_error
@@ -49,7 +50,19 @@ pub(crate) async fn vehicle(
     .await
     .map_err(internal)?
     .ok_or(ApiError::NotFound)?;
+    mark_car_renders(&app, std::slice::from_mut(&mut row));
     Ok(Json(row))
+}
+
+fn mark_car_renders(app: &AppState, rows: &mut [VehicleJson]) {
+    let enabled = app.inner.car_renders.enabled();
+    for row in rows {
+        row.car_render = enabled
+            && super::car::Look::from(row.model.as_deref(), row.exterior_color.as_deref())
+                .with_render(row.exterior_color.as_deref(), None)
+                .render
+                .is_some();
+    }
 }
 
 pub(crate) async fn vehicle_state(
@@ -569,6 +582,11 @@ pub(crate) struct VehicleJson {
     pub charger_power_kw: Option<f64>,
     pub last_poll_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+    /// Official render can be fetched at `/api/v1/vehicles/{id}/car.png`.
+    /// False when renders are disabled or this model and paint have no picture.
+    /// A true value can still 404 if Tesla's fetch fails.
+    #[sqlx(default)]
+    pub car_render: bool,
 }
 
 const STATE_FIELDS: &[&str] = &[
