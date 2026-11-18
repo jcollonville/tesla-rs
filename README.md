@@ -238,7 +238,7 @@ Optional:
 | `NOMINATIM_URL` | `https://nominatim.openstreetmap.org` | Nominatim base URL |
 | `NOMINATIM_CONTACT` | unset | Included in the User-Agent: `tesla-logger/0.1 (self-hosted; …)` |
 | `NOMINATIM_MIN_INTERVAL_MS` | `1100` | Minimum delay between Nominatim requests |
-| `CAR_RENDERS_ENABLED` | `true` | Official Tesla car pictures on the overview. The server fetches each one once from `static-assets.tesla.com` (option codes only, no VIN) and serves it from the `car-renders` folder next to `TESLA_TOKEN_STORE_PATH`; the browser never contacts Tesla. `false` keeps the drawn silhouettes |
+| `CAR_RENDERS_ENABLED` | `true` | Official Tesla car pictures on the overview and at `GET /api/v1/vehicles/{id}/car.png` (read token, numeric vehicle id). The server fetches each one once from `static-assets.tesla.com` (option codes only, no VIN) and serves it from the `car-renders` folder next to `TESLA_TOKEN_STORE_PATH`; the browser never contacts Tesla. `false` keeps the drawn silhouettes and the API returns 404 |
 | `MQTT_ENABLED` | `false` | Home Assistant discovery over plain MQTT |
 | `MQTT_HOST` | `127.0.0.1` | Broker host |
 | `MQTT_PORT` | `1883` | Broker port |

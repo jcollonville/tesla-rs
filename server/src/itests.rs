@@ -22,6 +22,7 @@ const FIXTURE: &str = include_str!("../tests/fixtures/teslamate.sql");
 fn openapi_lists_the_read_api() {
     for path in [
         "/api/v1/vehicles",
+        "/api/v1/vehicles/{id}/car.png",
         "/api/v1/drives",
         "/api/v1/charges",
         "/api/v1/stats",
@@ -49,6 +50,7 @@ fn openapi_lists_the_read_api() {
         "is_preconditioning",
         "scheduled_charging_start_time",
         "stream_status",
+        "car_render",
         "position_mode",
         "range_at_100_km",
         "idle_range_loss_km_per_day",
