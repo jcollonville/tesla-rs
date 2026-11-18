@@ -3,7 +3,7 @@
 
 //! Data behind the overview car card and the fleet cards.
 
-use chrono::{DateTime, Datelike, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use chrono_tz::Tz;
 
 use super::car::Look;
@@ -18,6 +18,7 @@ use crate::rdp::rdp_limit;
 struct Live {
     model: Option<String>,
     exterior_color: Option<String>,
+    wheel_type: Option<String>,
     marketing_name: Option<String>,
     trim_badging: Option<String>,
     activity: Option<String>,
@@ -47,7 +48,7 @@ struct Live {
 
 async fn live(app: &AppState, id: i64) -> Live {
     sqlx::query_as::<_, Live>(
-        "SELECT v.model, v.exterior_color, v.marketing_name, v.trim_badging,
+        "SELECT v.model, v.exterior_color, v.wheel_type, v.marketing_name, v.trim_badging,
                 s.activity, s.battery_level, s.rated_range_km, s.est_range_km, s.odometer_km,
                 s.latitude, s.longitude, s.heading_deg, s.speed_kmh,
                 s.inside_temp_c, s.outside_temp_c, s.locked, s.sentry_mode,
@@ -67,8 +68,13 @@ async fn live(app: &AppState, id: i64) -> Live {
 }
 
 impl Live {
-    fn look(&self) -> Look {
-        Look::from(self.model.as_deref(), self.exterior_color.as_deref())
+    fn look(&self, renders: bool) -> Look {
+        let look = Look::from(self.model.as_deref(), self.exterior_color.as_deref());
+        if renders {
+            look.with_render(self.exterior_color.as_deref(), self.wheel_type.as_deref())
+        } else {
+            look
+        }
     }
 
     fn status(&self) -> Status {
@@ -84,6 +90,13 @@ impl Live {
     }
 }
 
+/// What the car render route should fetch for this vehicle, from its stored model,
+/// paint and wheels.
+pub(super) async fn render_spec(app: &AppState, id: i64) -> Option<super::render::Spec> {
+    let state = live(app, id).await;
+    state.look(true).render
+}
+
 /// Last known position: the live state, then the newest archived point.
 async fn position(app: &AppState, id: i64, state: &Live) -> Option<(f64, f64)> {
     if let (Some(lat), Some(lon)) = (state.latitude, state.longitude) {
@@ -91,11 +104,12 @@ async fn position(app: &AppState, id: i64, state: &Live) -> Option<(f64, f64)> {
     }
     sqlx::query_as::<_, (f64, f64)>(
         "SELECT latitude, longitude FROM positions
-         WHERE vehicle_id = $1 AND recorded_at >= now() - interval '30 days'
+         WHERE vehicle_id = $1 AND recorded_at >= $2
            AND latitude IS NOT NULL AND longitude IS NOT NULL
          ORDER BY recorded_at DESC LIMIT 1",
     )
     .bind(id)
+    .bind(Utc::now() - Duration::days(30))
     .fetch_optional(&app.inner.db)
     .await
     .ok()
@@ -148,30 +162,53 @@ async fn place_at(app: &AppState, lat: f64, lon: f64) -> Option<Place> {
     Place::from(address.as_deref(), fence.as_deref())
 }
 
+const NEARBY_POSITIONS_SQL: &str = "SELECT drive_id, latitude, longitude FROM positions
+     WHERE drive_id = ANY($1)
+       AND recorded_at >= $2 AND recorded_at <= $3
+       AND latitude BETWEEN $4 - $6 AND $4 + $6
+       AND longitude BETWEEN $5 - $7 AND $5 + $7
+     ORDER BY drive_id, recorded_at
+     LIMIT 60000";
+
 /// Recent drives that pass near the car, as separate polylines.
+///
+/// `positions` is range-partitioned by month, and a `drive_id IN (SELECT ...)`
+/// filter cannot be pruned: Postgres then scans every partition. The window of
+/// the newest drives is read first so the position query carries plain
+/// `recorded_at` bounds, which prune to the one or two months that matter.
 async fn nearby_tracks(app: &AppState, id: i64, lat: f64, lon: f64) -> Vec<Vec<(f64, f64)>> {
     let span_lat = 0.03;
     let span_lon = 0.045 / lat.to_radians().cos().max(0.05);
-    let rows: Vec<(i64, f64, f64)> = sqlx::query_as(
-        "SELECT drive_id, latitude, longitude FROM positions
-         WHERE drive_id IN (
-                SELECT id FROM drives
-                WHERE vehicle_id = $1 AND deleted_at IS NULL
-                ORDER BY start_at DESC LIMIT 30
-           )
-           AND latitude BETWEEN $2 - $4 AND $2 + $4
-           AND longitude BETWEEN $3 - $5 AND $3 + $5
-         ORDER BY drive_id, recorded_at
-         LIMIT 60000",
+    let drives: Vec<(i64, DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT id, start_at, end_at FROM drives
+         WHERE vehicle_id = $1 AND deleted_at IS NULL
+         ORDER BY start_at DESC LIMIT 30",
     )
     .bind(id)
-    .bind(lat)
-    .bind(lon)
-    .bind(span_lat)
-    .bind(span_lon)
     .fetch_all(&app.inner.db)
     .await
     .unwrap_or_default();
+    let Some(first) = drives.iter().map(|drive| drive.1).min() else {
+        return Vec::new();
+    };
+    let from = first - Duration::minutes(10);
+    let until = drives
+        .iter()
+        .map(|drive| drive.2.unwrap_or_else(Utc::now))
+        .max()
+        .map_or(first, |last| last + Duration::minutes(10));
+    let drive_ids: Vec<i64> = drives.iter().map(|drive| drive.0).collect();
+    let rows: Vec<(i64, f64, f64)> = sqlx::query_as(NEARBY_POSITIONS_SQL)
+        .bind(&drive_ids)
+        .bind(from)
+        .bind(until)
+        .bind(lat)
+        .bind(lon)
+        .bind(span_lat)
+        .bind(span_lon)
+        .fetch_all(&app.inner.db)
+        .await
+        .unwrap_or_default();
     let mut tracks: Vec<Vec<(f64, f64)>> = Vec::new();
     let mut last: Option<(i64, f64, f64)> = None;
     for (drive, p_lat, p_lon) in rows {
@@ -298,7 +335,7 @@ pub(super) async fn car_card(app: &AppState, id: i64) -> CarCard {
         .or_else(|| state.trim_badging.clone())
         .filter(|text| !text.is_empty());
     CarCard {
-        look: state.look(),
+        look: state.look(app.inner.car_renders.enabled()),
         trim,
         status,
         battery_pct: state.battery_level,
@@ -316,7 +353,7 @@ pub(super) async fn car_card(app: &AppState, id: i64) -> CarCard {
 /// Fills the drawing and gauge fields of a fleet card.
 pub(super) async fn decorate_fleet_card(app: &AppState, card: &mut FleetCard) {
     let state = live(app, card.id).await;
-    card.look = state.look();
+    card.look = state.look(app.inner.car_renders.enabled());
     card.status = state.status();
     card.battery_pct = state.battery_level;
     card.limit_pct = state.charge_limit_soc;
@@ -502,4 +539,96 @@ pub(super) async fn month(app: &AppState, id: i64, tz: Tz) -> Vec<(&'static str,
         out.push(("Coût des charges", format::money(cost)));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, Utc};
+
+    use super::{NEARBY_POSITIONS_SQL, nearby_tracks};
+
+    async fn drive_with_points(
+        pool: &sqlx::PgPool,
+        vehicle: i64,
+        started: chrono::DateTime<Utc>,
+        open: bool,
+        points: &[(f64, f64)],
+    ) -> i64 {
+        let end = (!open).then(|| started + Duration::minutes(30));
+        let drive: (i64,) = sqlx::query_as(
+            "INSERT INTO drives (vehicle_id, start_at, end_at, source)
+             VALUES ($1, $2, $3, 'import') RETURNING id",
+        )
+        .bind(vehicle)
+        .bind(started)
+        .bind(end)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        for (index, (lat, lon)) in points.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO positions (vehicle_id, recorded_at, latitude, longitude, drive_id, source)
+                 VALUES ($1, $2, $3, $4, $5, 'import')",
+            )
+            .bind(vehicle)
+            .bind(started + Duration::minutes(i64::try_from(index).unwrap()))
+            .bind(lat)
+            .bind(lon)
+            .bind(drive.0)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        drive.0
+    }
+
+    #[tokio::test]
+    async fn nearby_tracks_span_months_and_keep_open_drives() {
+        let Some(db) = crate::test_util::TestDb::migrated("nearby-tracks").await else {
+            return;
+        };
+        let state = crate::app::test_state(db.pool.clone()).await;
+        let vehicle: (i64,) = sqlx::query_as(
+            "INSERT INTO vehicles (vin, name) VALUES ('5YJ30000000000077', 'Trace') RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let near = [(0.0100, 0.0100), (0.0110, 0.0110), (0.0120, 0.0120)];
+        drive_with_points(&db.pool, vehicle.0, now - Duration::days(70), false, &near).await;
+        drive_with_points(&db.pool, vehicle.0, now - Duration::days(3), false, &near).await;
+        drive_with_points(&db.pool, vehicle.0, now - Duration::minutes(5), true, &near).await;
+        let far = [(2.0, 2.0), (2.1, 2.1), (2.2, 2.2)];
+        drive_with_points(&db.pool, vehicle.0, now - Duration::days(2), false, &far).await;
+        let tracks = nearby_tracks(&state, vehicle.0, 0.011, 0.011).await;
+        assert_eq!(tracks.len(), 3, "{tracks:?}");
+        assert!(tracks.iter().all(|track| track.len() >= 2));
+        let other = nearby_tracks(&state, vehicle.0 + 1, 0.011, 0.011).await;
+        assert_eq!(other.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn nearby_positions_query_prunes_to_the_months_of_the_window() {
+        let Some(db) = crate::test_util::TestDb::migrated("nearby-plan").await else {
+            return;
+        };
+        let now = Utc::now();
+        let plan: Vec<(String,)> = sqlx::query_as(&format!("EXPLAIN {NEARBY_POSITIONS_SQL}"))
+            .bind(vec![1_i64, 2])
+            .bind(now - Duration::days(6))
+            .bind(now)
+            .bind(0.011_f64)
+            .bind(0.011_f64)
+            .bind(0.03_f64)
+            .bind(0.045_f64)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        let plan: String = plan.into_iter().map(|row| row.0 + "\n").collect();
+        assert!(!plan.contains("positions_2012_"), "{plan}");
+        assert!(!plan.contains("positions_default"), "{plan}");
+        let touched = plan.matches("on positions_20").count();
+        assert!(touched <= 6, "{touched} partitions scanned:\n{plan}");
+    }
 }

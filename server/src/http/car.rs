@@ -6,10 +6,14 @@
 //! The silhouettes are drawn here from a handful of profile points per body
 //! style. They are not Tesla artwork. Colours come from `vehicles.exterior_color`
 //! and are set with presentation attributes because the CSP forbids inline styles.
+//! When an official render is known for the car (see `render`), the drawing stays
+//! in the page as the fallback and `car.js` swaps the render in once it loads.
 
 use std::fmt::Write as _;
 
 use maud::{Markup, PreEscaped, html};
+
+use super::render::Spec;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Body {
@@ -26,6 +30,8 @@ pub(crate) struct Look {
     /// Known model name, `None` when the archive does not say.
     pub model: Option<&'static str>,
     pub paint: &'static Paint,
+    /// Official render to try first, `None` when the car has none.
+    pub render: Option<Spec>,
 }
 
 #[derive(Debug)]
@@ -136,7 +142,14 @@ impl Look {
             body,
             model: name,
             paint,
+            render: None,
         }
+    }
+
+    /// Adds the official render for a stored wheel name, when one exists.
+    pub(crate) fn with_render(mut self, color: Option<&str>, wheel: Option<&str>) -> Self {
+        self.render = Spec::from_vehicle(self.body, color, wheel);
+        self
     }
 
     pub(crate) fn label(&self) -> String {
@@ -389,6 +402,22 @@ fn shade(hex: &str, amount: f64) -> String {
 }
 
 /// The car drawing. `key` keeps gradient ids unique when a page shows several cars.
+/// The car picture: the drawing, plus the official render on top when `look`
+/// has one. The render is a same-origin image; `car.js` shows it only after it
+/// has loaded, so a missing render leaves the drawing in place.
+pub(crate) fn visual(look: &Look, key: &str, vehicle_id: i64) -> Markup {
+    let Some(spec) = &look.render else {
+        return drawing(look, key);
+    };
+    html! {
+        div class="car-stage has-render" {
+            img class="car-photo" src=(format!("/v/{vehicle_id}/car.png?v={}", spec.version()))
+                alt=(look.label()) width="720" height="405" decoding="async";
+            (drawing(look, key))
+        }
+    }
+}
+
 pub(crate) fn drawing(look: &Look, key: &str) -> Markup {
     let shape = profile(look.body);
     let body = body_path(shape);

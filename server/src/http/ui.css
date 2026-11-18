@@ -665,6 +665,22 @@ svg.car {
   .car-floor { opacity: 1; }
 }
 
+/* Official render: the drawing stays underneath until the picture has loaded. */
+.car-stage { display: grid; }
+.car-stage.has-render { aspect-ratio: 2 / 1; overflow: hidden; }
+.car-stage > * { grid-area: 1 / 1; align-self: center; }
+.car-photo {
+  display: none;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  scale: 1.14;
+  -webkit-mask-image: radial-gradient(ellipse 47% 60% at 50% 54%, #000 62%, transparent 100%);
+  mask-image: radial-gradient(ellipse 47% 60% at 50% 54%, #000 62%, transparent 100%);
+}
+.car-stage.photo-ready .car-photo { display: block; }
+.car-stage.photo-ready svg.car { display: none; }
+
 /* Battery */
 svg.battery-meter { display: block; width: 100%; height: 8px; overflow: visible; }
 .battery-track { fill: var(--surface-3); }
@@ -686,7 +702,7 @@ svg.soc-bar { display: block; width: 100%; max-width: 9rem; height: 6px; margin-
 .hero-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space); }
 .hero-name { margin: 6px 0 0; font-size: clamp(1.5rem, 5vw, 2rem); font-weight: 500; letter-spacing: -0.02em; }
 .hero-car { margin: calc(var(--space) * 2) -12px calc(var(--space) * 1); }
-.hero-car svg.car { animation: arrive 900ms var(--ease) both; }
+.hero-car svg.car, .hero-car .car-photo { animation: arrive 900ms var(--ease) both; }
 .hero-energy { display: flex; justify-content: space-between; align-items: flex-end; gap: calc(var(--space) * 2); margin: 0 0 12px; }
 .hero-energy p { display: flex; flex-direction: column; margin: 0; }
 .hero-range { text-align: right; align-items: flex-end; }

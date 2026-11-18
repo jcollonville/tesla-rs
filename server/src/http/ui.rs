@@ -28,6 +28,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/", get(home).post(login))
         .route("/logout", post(logout))
         .route("/v/{id}", get(overview))
+        .route("/v/{id}/car.png", get(super::render::car_png))
         .route("/v/{id}/drives", get(super::trips::drives))
         .route("/v/{id}/drives.csv", get(super::trips::drives_csv))
         .route("/v/{id}/drives/{drive_id}", get(super::trips::drive_detail))
@@ -76,6 +77,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/static/ui.css", get(ui_css))
         .route("/static/debug.js", get(debug_js))
         .route("/static/tabs.js", get(tabs_js))
+        .route("/static/car.js", get(car_js))
         .route("/static/setup.js", get(setup_js))
         .route("/static/charts.js", get(charts_js))
 }
@@ -205,6 +207,12 @@ async fn overview(
     let mode = app.inner.archive.gps.mode_name(id).await;
     let (latest_sample, queue_depth) = app.inner.stream_board.snapshot().await.ingestion(id);
     let tz = super::format::zone(&app, Some(id)).await;
+    let (last_drive, last_charge, car, month) = tokio::join!(
+        super::overview::recent_drive(&app, id, tz),
+        super::overview::recent_charge(&app, id, tz),
+        super::overview::car_card(&app, id),
+        super::overview::month(&app, id, tz),
+    );
     let view = Overview {
         name: vehicle.name.clone(),
         activity: vehicle
@@ -218,10 +226,10 @@ async fn overview(
         last_error: vehicle.last_error.clone().unwrap_or_else(|| "—".to_owned()),
         stream_lag: fmt_lag(latest_sample),
         stream_queue: queue_depth.to_string(),
-        last_drive: super::overview::recent_drive(&app, id, tz).await,
-        last_charge: super::overview::recent_charge(&app, id, tz).await,
-        car: super::overview::car_card(&app, id).await,
-        month: super::overview::month(&app, id, tz).await,
+        last_drive,
+        last_charge,
+        car,
+        month,
     };
     html_page(
         overview_page(
@@ -1825,6 +1833,23 @@ async fn tabs_js() -> Response {
             ),
         ],
         include_str!("tabs.js"),
+    )
+        .into_response()
+}
+
+async fn car_js() -> Response {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/javascript; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400"),
+            ),
+        ],
+        include_str!("car.js"),
     )
         .into_response()
 }

@@ -101,3 +101,13 @@ Database tests create throwaway databases and skip when `DATABASE_URL` is unset 
 ```bash
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f server/demo/seed.sql
 ```
+
+`demo/bench-seed.sql` builds a synthetic archive of a few years (5000 drives, about 3.2 million positions by default, invented places near 0°N 0°E) on an empty migrated database, to time the console pages. Never run it against real data:
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v drives=5000 -v pts_div=3 -f server/demo/bench-seed.sql
+```
+
+## Car pictures
+
+The overview and fleet cards show Tesla's official render of the car when one is known for its model, paint, and wheels (Model 3, Y, S, and X in the paints Tesla's image service still draws). The server asks `static-assets.tesla.com/v1/compositor/` once per combination with option codes only (never a VIN or vehicle id), keeps the PNG in memory and in `car-renders/` next to `TESLA_TOKEN_STORE_PATH`, and serves it from `/v/{id}/car.png` to signed-in users. The browser therefore loads images from its own origin and the CSP stays `img-src 'self' data:`. When the paint is not available, the car is a Cybertruck, the fetch fails, or `CAR_RENDERS_ENABLED=false`, the page keeps the drawn silhouette. Failures are remembered for a few minutes (a day for a refusal) so a missing picture does not trigger a request per page view.

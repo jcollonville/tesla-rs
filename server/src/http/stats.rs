@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use chrono::{
-    DateTime, Datelike, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc,
-    Weekday,
+    DateTime, Datelike, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Offset,
+    TimeZone, Utc, Weekday,
 };
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -852,19 +852,31 @@ async fn quality(app: &AppState, id: i64) -> Quality {
     let charges_without_energy: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM charges WHERE vehicle_id = $1 AND deleted_at IS NULL AND end_at IS NOT NULL AND energy_used_kwh IS NULL",
     ).bind(id).fetch_one(&app.inner.db).await.unwrap_or(0);
-    let gap_days: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM generate_series((now() - interval '30 days')::date, now()::date, '1 day') AS day
-         WHERE NOT EXISTS (
-            SELECT 1 FROM positions
-            WHERE vehicle_id = $1 AND recorded_at >= day AND recorded_at < day + interval '1 day'
-         )",
-    ).bind(id).fetch_one(&app.inner.db).await.unwrap_or(0);
+    // `positions` is partitioned by month. Plain `recorded_at` bounds prune it to
+    // the months of the window; a per-day correlated `NOT EXISTS` could not, and
+    // probed every partition once per day.
+    let since = (Utc::now() - chrono::Duration::days(30))
+        .date_naive()
+        .and_time(NaiveTime::MIN)
+        .and_utc();
+    let days_with_points: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT (recorded_at AT TIME ZONE 'UTC')::date) FROM positions
+         WHERE vehicle_id = $1 AND recorded_at >= $2",
+    )
+    .bind(id)
+    .bind(since)
+    .fetch_one(&app.inner.db)
+    .await
+    .unwrap_or(0);
+    let window_days = (Utc::now().date_naive() - since.date_naive()).num_days() + 1;
+    let gap_days = (window_days - days_with_points).max(0);
     let points = sqlx::query_as(
         "SELECT source, COUNT(*)::bigint FROM positions
-         WHERE vehicle_id = $1 AND recorded_at >= now() - interval '30 days'
+         WHERE vehicle_id = $1 AND recorded_at >= $2
          GROUP BY source ORDER BY source",
     )
     .bind(id)
+    .bind(Utc::now() - chrono::Duration::days(30))
     .fetch_all(&app.inner.db)
     .await
     .unwrap_or_default();
@@ -1317,5 +1329,51 @@ mod tests {
         assert!(page.contains("height=\"180\""));
         assert!(page.contains("chart-labels"));
         assert!(!page.contains("<text"));
+    }
+
+    #[tokio::test]
+    async fn quality_counts_days_without_positions() {
+        let Some(db) = crate::test_util::TestDb::migrated("quality-gaps").await else {
+            return;
+        };
+        let state = crate::app::test_state(db.pool.clone()).await;
+        let vehicle: (i64,) = sqlx::query_as(
+            "INSERT INTO vehicles (vin, name) VALUES ('5YJ30000000000088', 'Trous') RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let noon = Utc::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc();
+        for (days_ago, source) in [(1, "poll"), (1, "stream"), (2, "poll"), (5, "poll")] {
+            sqlx::query(
+                "INSERT INTO positions (vehicle_id, recorded_at, latitude, longitude, source)
+                 VALUES ($1, $2, 0.01, 0.01, $3)",
+            )
+            .bind(vehicle.0)
+            .bind(noon - chrono::Duration::days(days_ago))
+            .bind(source)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO positions (vehicle_id, recorded_at, latitude, longitude, source)
+             VALUES ($1, $2, 0.01, 0.01, 'poll')",
+        )
+        .bind(vehicle.0)
+        .bind(noon - chrono::Duration::days(45))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let quality = super::quality(&state, vehicle.0).await;
+        assert_eq!(quality.gap_days, 31 - 3);
+        assert_eq!(
+            quality.points,
+            vec![("poll".to_owned(), 3), ("stream".to_owned(), 1)]
+        );
     }
 }

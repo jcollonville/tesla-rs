@@ -5,7 +5,7 @@
 
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
-use super::car::{Look, drawing};
+use super::car::{Look, visual};
 use super::format::Place;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -425,7 +425,7 @@ pub(super) fn fleet_page(chrome: &Chrome, cards: &[FleetCard], month_total: &str
                             }
                             span class="status-wrap" title=(card.activity) { (status_chip(card.status)) }
                         }
-                        div class="fleet-car" { (drawing(&card.look, &format!("f{}", card.id))) }
+                        div class="fleet-car" { (visual(&card.look, &format!("f{}", card.id), card.id)) }
                         div class="fleet-battery" {
                             span class="figure" { (card.battery) }
                             span class="muted" { (card.range) }
@@ -544,7 +544,7 @@ pub(super) fn overview_page(chrome: &Chrome, overview: &Overview) -> String {
                     }
                     (status_chip(car.status))
                 }
-                div class="hero-car" { (drawing(&car.look, "hero")) }
+                div class="hero-car" { (visual(&car.look, "hero", id.unwrap_or_default())) }
                 div class="hero-energy" {
                     p class="hero-battery" {
                         span class="hero-figure" { (overview.battery) }
@@ -1198,6 +1198,7 @@ pub(crate) fn document(debug_script: bool, body: Markup) -> String {
                 title { "Tesla Logger" }
                 link rel="stylesheet" href="/static/ui.css";
                 script src="/static/tabs.js" defer {}
+                script src="/static/car.js" defer {}
                 @if debug_script {
                     script src="/static/debug.js" defer {}
                 }
