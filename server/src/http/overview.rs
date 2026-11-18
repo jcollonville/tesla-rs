@@ -9,7 +9,7 @@ use chrono_tz::Tz;
 use super::car::Look;
 use super::format::{self, NNBSP, Place};
 use super::markup::{CarCard, FleetCard, Recent, Status};
-use super::viz::{MiniMap, mini_map, mini_map_empty};
+use super::viz::{MiniMap, mini_map_empty_model, mini_map_model};
 use crate::app::AppState;
 use crate::geofence::{Fence, haversine_m, matching_geofence};
 use crate::rdp::rdp_limit;
@@ -286,7 +286,7 @@ pub(super) async fn car_card(app: &AppState, id: i64) -> CarCard {
         Some((lat, lon)) => {
             let tracks = nearby_tracks(app, id, lat, lon).await;
             let label = Place::name_or_unknown(place.as_ref());
-            mini_map(&MiniMap {
+            mini_map_model(&MiniMap {
                 lat,
                 lon,
                 heading: state.heading_deg,
@@ -295,7 +295,7 @@ pub(super) async fn car_card(app: &AppState, id: i64) -> CarCard {
                 label: &label,
             })
         }
-        None => mini_map_empty(),
+        None => mini_map_empty_model(),
     };
     let mut facts = Vec::new();
     if let Some(locked) = state.locked {

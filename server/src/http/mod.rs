@@ -15,6 +15,7 @@ mod tiles;
 mod trips;
 mod ui;
 mod viz;
+mod widget;
 
 pub(crate) use render::CarRenders;
 pub(crate) use tiles::Basemap;

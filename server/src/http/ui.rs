@@ -77,9 +77,9 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/static/ui.css", get(ui_css))
         .route("/static/debug.js", get(debug_js))
         .route("/static/tabs.js", get(tabs_js))
-        .route("/static/car.js", get(car_js))
         .route("/static/setup.js", get(setup_js))
         .route("/static/charts.js", get(charts_js))
+        .route("/static/tesla-logger-ui.js", get(ui_js))
         .route("/static/map.js", get(map_js))
         .route("/static/maplibre-gl.css", get(maplibre_css))
         .route("/static/maplibre-gl-csp.js", get(maplibre_js))
@@ -1875,7 +1875,7 @@ async fn tabs_js() -> Response {
         .into_response()
 }
 
-async fn car_js() -> Response {
+async fn ui_js() -> Response {
     (
         [
             (
@@ -1887,7 +1887,7 @@ async fn car_js() -> Response {
                 HeaderValue::from_static("public, max-age=86400"),
             ),
         ],
-        include_str!("car.js"),
+        include_str!("../../../ui/dist/tesla-logger-ui.js"),
     )
         .into_response()
 }

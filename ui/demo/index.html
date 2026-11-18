@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tesla Logger UI</title>
+    <link rel="stylesheet" href="../dist/tokens.css" />
+    <style>
+      body { margin: 0; background: var(--tl-bg); color: var(--tl-text); font-family: var(--tl-font); }
+      .shell { width: min(62rem, calc(100% - 2rem)); margin: 0 auto; padding-bottom: 40px; }
+      header { display: flex; align-items: center; min-height: 56px; border-bottom: 1px solid var(--tl-line); }
+      .word { font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.16em; text-transform: uppercase; }
+      .grid { display: grid; gap: 16px; }
+      @media (min-width: 900px) {
+        .grid { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
+        .grid > tl-vehicle-card { grid-row: span 3; }
+        .grid > tl-summary-strip { grid-column: 1 / -1; }
+      }
+      .place { overflow: hidden; border: 1px solid var(--tl-line); border-radius: var(--tl-radius); background: var(--tl-surface); box-shadow: var(--tl-shadow); }
+      .place p { margin: 0; padding: 0 24px 24px; }
+      h1 { font-weight: 500; letter-spacing: -0.02em; }
+      .toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 8px 0 16px; }
+      .charts { display: grid; gap: 16px; }
+      @media (min-width: 720px) { .charts { grid-template-columns: 1fr 1fr; } }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <header><span class="word">Tesla Logger</span></header>
+      <h1>Démo</h1>
+      <div id="tabs"></div>
+      <section class="grid" id="overview"></section>
+      <div class="toolbar" id="periods"></div>
+      <div id="totals"></div>
+      <div id="days"></div>
+      <h2>Charges</h2>
+      <div id="charges"></div>
+      <h2>Stats</h2>
+      <div class="charts" id="charts"></div>
+    </main>
+    <script type="module" src="./boot.js"></script>
+  </body>
+</html>

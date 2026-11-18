@@ -1,0 +1,68 @@
+/* Tesla Logger design tokens. Inherit into shadow DOM.
+   Home Assistant themes can override any --tl-* variable. */
+
+:root {
+  color-scheme: light;
+  --tl-bg: #f4f4f4;
+  --tl-surface: #ffffff;
+  --tl-surface-2: #f4f4f4;
+  --tl-surface-3: #e9e9eb;
+  --tl-line: rgba(23, 26, 32, 0.08);
+  --tl-line-strong: rgba(23, 26, 32, 0.16);
+  --tl-text: #171a20;
+  --tl-muted: #5c5e62;
+  --tl-faint: #8e9095;
+  --tl-accent: #3e6ae1;
+  --tl-accent-strong: #2f56c6;
+  --tl-accent-soft: rgba(62, 106, 225, 0.1);
+  --tl-on-accent: #ffffff;
+  --tl-green: #1d9b52;
+  --tl-green-soft: rgba(29, 155, 82, 0.12);
+  --tl-amber: #c27c0e;
+  --tl-violet: #7258e8;
+  --tl-slate: #6b7280;
+  --tl-danger: #c8332f;
+  --tl-danger-soft: rgba(200, 51, 47, 0.1);
+  --tl-map-bg: #eef0f3;
+  --tl-map-dot: rgba(23, 26, 32, 0.12);
+  --tl-map-road: rgba(23, 26, 32, 0.16);
+  --tl-shadow: 0 1px 2px rgba(23, 26, 32, 0.04), 0 8px 24px rgba(23, 26, 32, 0.04);
+  --tl-radius: 14px;
+  --tl-radius-sm: 10px;
+  --tl-space: 8px;
+  --tl-font: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --tl-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --tl-ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --tl-fast: 160ms;
+  --tl-slow: 420ms;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --tl-bg: #111318;
+    --tl-surface: #181b21;
+    --tl-surface-2: #20242b;
+    --tl-surface-3: #2a2e36;
+    --tl-line: rgba(255, 255, 255, 0.07);
+    --tl-line-strong: rgba(255, 255, 255, 0.14);
+    --tl-text: #f2f3f5;
+    --tl-muted: #a3a6ad;
+    --tl-faint: #7b7f87;
+    --tl-accent: #6f93ff;
+    --tl-accent-strong: #8fabff;
+    --tl-accent-soft: rgba(111, 147, 255, 0.14);
+    --tl-on-accent: #0b1430;
+    --tl-green: #4fd17c;
+    --tl-green-soft: rgba(79, 209, 124, 0.14);
+    --tl-amber: #f2b441;
+    --tl-violet: #a892ff;
+    --tl-slate: #9aa1ad;
+    --tl-danger: #ff7a70;
+    --tl-danger-soft: rgba(255, 122, 112, 0.12);
+    --tl-map-bg: #1d2128;
+    --tl-map-dot: rgba(255, 255, 255, 0.08);
+    --tl-map-road: rgba(255, 255, 255, 0.14);
+    --tl-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  }
+}
