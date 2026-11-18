@@ -5,6 +5,9 @@
 
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
+use super::car::{Look, drawing};
+use super::format::Place;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum GlobalTab {
     None,
@@ -41,6 +44,7 @@ pub(super) struct Chrome {
     pub remembered: Option<i64>,
 }
 
+#[derive(Default)]
 pub(super) struct FleetCard {
     pub id: i64,
     pub name: String,
@@ -50,8 +54,106 @@ pub(super) struct FleetCard {
     pub last_seen: String,
     pub last_error: Option<String>,
     pub month: String,
+    pub look: Look,
+    pub status: Status,
+    pub battery_pct: Option<f64>,
+    pub limit_pct: Option<f64>,
+    pub range: String,
+    pub place: Option<String>,
 }
 
+/// What the car is doing, from `vehicle_state`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Status {
+    Driving,
+    Charging,
+    Plugged,
+    Parked,
+    Asleep,
+    Offline,
+    Updating,
+    #[default]
+    Unknown,
+}
+
+impl Status {
+    pub(crate) fn from(
+        activity: Option<&str>,
+        charging_state: Option<&str>,
+        plugged_in: Option<bool>,
+    ) -> Self {
+        let charging = charging_state.unwrap_or("").to_ascii_lowercase();
+        match activity.unwrap_or("") {
+            "driving" => Self::Driving,
+            "charging" => Self::Charging,
+            _ if matches!(charging.as_str(), "charging" | "starting") => Self::Charging,
+            "updating" => Self::Updating,
+            "asleep" => Self::Asleep,
+            "offline" => Self::Offline,
+            _ if plugged_in == Some(true)
+                || matches!(charging.as_str(), "complete" | "stopped" | "nopower") =>
+            {
+                Self::Plugged
+            }
+            "online" => Self::Parked,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Driving => "En route",
+            Self::Charging => "En charge",
+            Self::Plugged => "Branchée",
+            Self::Parked => "Garée",
+            Self::Asleep => "Endormie",
+            Self::Offline => "Hors ligne",
+            Self::Updating => "Mise à jour",
+            Self::Unknown => "État inconnu",
+        }
+    }
+
+    fn tone(self) -> &'static str {
+        match self {
+            Self::Driving => "status drive",
+            Self::Charging | Self::Plugged => "status charge",
+            Self::Parked => "status park",
+            Self::Updating => "status note",
+            Self::Asleep | Self::Offline | Self::Unknown => "status idle",
+        }
+    }
+}
+
+/// Live state for the car card on the overview.
+#[derive(Default)]
+pub(super) struct CarCard {
+    pub look: Look,
+    pub trim: Option<String>,
+    pub status: Status,
+    pub battery_pct: Option<f64>,
+    pub limit_pct: Option<f64>,
+    pub range: String,
+    /// One line under the battery, such as the charging power and time to full.
+    pub note: Option<String>,
+    pub facts: Vec<(&'static str, String)>,
+    pub map: Markup,
+    pub place: Option<Place>,
+    pub updated: String,
+    pub updated_iso: Option<String>,
+}
+
+/// A recent drive or charge on the overview.
+pub(super) struct Recent {
+    pub href: String,
+    pub when: String,
+    pub from: Option<String>,
+    pub to: String,
+    pub primary: String,
+    pub secondary: String,
+    pub open: bool,
+}
+
+#[derive(Default)]
 pub(super) struct Overview {
     pub name: String,
     pub activity: String,
@@ -62,8 +164,10 @@ pub(super) struct Overview {
     pub last_error: String,
     pub stream_lag: String,
     pub stream_queue: String,
-    pub last_drive: String,
-    pub last_charge: String,
+    pub last_drive: Option<Recent>,
+    pub last_charge: Option<Recent>,
+    pub car: CarCard,
+    pub month: Vec<(&'static str, String)>,
 }
 
 pub(super) struct Party {
@@ -302,30 +406,41 @@ fn setup_steps(current: u8) -> Markup {
 
 pub(super) fn fleet_page(chrome: &Chrome, cards: &[FleetCard], month_total: &str) -> String {
     let body = html! {
-        (toolbar(chrome, "Flotte"))
-        p class="muted" { "Totaux du mois : " (month_total) }
+        (toolbar(chrome, "Voitures"))
         @if cards.is_empty() {
-            section class="card" {
-                h2 { "Véhicules" }
-                p class="muted" { "Aucun véhicule pour l'instant." }
+            section class="card empty-state" {
+                h2 { "Aucune voiture pour l'instant" }
+                p class="muted" { "Connectez un compte Tesla pour commencer l'archive." }
                 a class="button" href="/connection" { "Connexion Tesla" }
             }
         } @else {
-            div class="vehicles" {
+            p class="lede" { "Ce mois-ci : " (month_total) }
+            div class="fleet" {
                 @for card in cards {
-                    article class="vehicle" {
-                        div class="vehicle-head" {
-                            h3 { a href=(format!("/v/{}", card.id)) { (card.name) } }
-                            span class="chip" { (card.activity) }
-                        }
-                        dl class="facts" {
-                            div { dt { "Batterie" } dd { (card.battery) } }
-                            div { dt { "Mode GPS" } dd { (card.position_mode) } }
-                            div { dt { "Dernière activité" } dd { (card.last_seen) } }
-                            div { dt { "Ce mois" } dd { (card.month) } }
-                            @if let Some(error) = &card.last_error {
-                                div { dt { "Dernière erreur" } dd { (error) } }
+                    a class="card fleet-card" href=(format!("/v/{}", card.id)) {
+                        div class="fleet-head" {
+                            div {
+                                h2 class="fleet-name" { (card.name) }
+                                p class="eyebrow" { (card.look.model.unwrap_or("Voiture")) }
                             }
+                            span class="status-wrap" title=(card.activity) { (status_chip(card.status)) }
+                        }
+                        div class="fleet-car" { (drawing(&card.look, &format!("f{}", card.id))) }
+                        div class="fleet-battery" {
+                            span class="figure" { (card.battery) }
+                            span class="muted" { (card.range) }
+                        }
+                        (battery_meter(card.battery_pct, card.limit_pct, card.status == Status::Charging))
+                        dl class="fleet-facts" {
+                            @if let Some(place) = &card.place {
+                                div { dt { "Position" } dd { (place) } }
+                            }
+                            div { dt { "Ce mois" } dd { (card.month) } }
+                            div { dt { "Dernière activité" } dd { (card.last_seen) } }
+                            div { dt { "Mode GPS" } dd { (card.position_mode) } }
+                        }
+                        @if let Some(error) = &card.last_error {
+                            p class="banner bad" { "Dernière erreur : " (error) }
                         }
                     }
                 }
@@ -335,13 +450,160 @@ pub(super) fn fleet_page(chrome: &Chrome, cards: &[FleetCard], month_total: &str
     document(chrome.debug_script, body)
 }
 
+pub(super) fn status_chip(status: Status) -> Markup {
+    html! {
+        span class=(format!("chip {}", status.tone())) {
+            span class="status-dot" aria-hidden="true" {}
+            (status.label())
+        }
+    }
+}
+
+/// Battery gauge with the charge limit as a tick.
+pub(super) fn battery_meter(pct: Option<f64>, limit: Option<f64>, charging: bool) -> Markup {
+    let Some(pct) = pct else {
+        return html! {};
+    };
+    let pct = pct.clamp(0.0, 100.0);
+    let class = if charging {
+        "battery-meter charging"
+    } else if pct <= 20.0 {
+        "battery-meter low"
+    } else {
+        "battery-meter"
+    };
+    html! {
+        svg class=(class) viewBox="0 0 100 8" preserveAspectRatio="none" role="img" aria-label=(format!("Batterie {pct:.0} %")) focusable="false" {
+            rect class="battery-track" width="100" height="8" rx="4" {}
+            rect class="battery-fill" width=(format!("{:.1}", pct.max(2.0))) height="8" rx="4" {}
+            @if let Some(limit) = limit.filter(|limit| *limit > 0.0 && *limit < 100.0) {
+                rect class="battery-limit" x=(format!("{:.1}", limit - 0.4)) y="0" width="0.8" height="8" {}
+            }
+        }
+    }
+}
+
+fn recent_card(
+    id: &str,
+    title: &str,
+    item: Option<&Recent>,
+    empty: &str,
+    all_href: Option<&str>,
+    all_label: &str,
+) -> Markup {
+    html! {
+        section class="card recent" id=(id) {
+            div class="card-head" {
+                h2 { (title) }
+                @if let Some(href) = all_href {
+                    a class="text-link" href=(href) { (all_label) }
+                }
+            }
+            @if let Some(item) = item {
+                a class="recent-link" href=(item.href) {
+                    p class="recent-when" {
+                        (item.when)
+                        @if item.open { " · " span class="live-dot" {} "en cours" }
+                    }
+                    div class="route" {
+                        @if let Some(from) = &item.from {
+                            span class="route-stop start" { (from) }
+                        }
+                        span class="route-stop end" { (item.to) }
+                    }
+                    p class="recent-metrics" {
+                        span class="figure" { (item.primary) }
+                        span class="muted" { (item.secondary) }
+                    }
+                }
+            } @else {
+                p class="muted" { (empty) }
+            }
+        }
+    }
+}
+
 pub(super) fn overview_page(chrome: &Chrome, overview: &Overview) -> String {
+    let car = &overview.car;
+    let id = current_id(chrome);
     let body = html! {
         (toolbar(chrome, &overview.name))
         (vehicle_tabs(chrome))
-        div id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" {
-            section class="card" {
-                h2 { "Aperçu" }
+        div id="panel-overview" class="overview" role="tabpanel" aria-labelledby="tab-overview" {
+            @if overview.last_error != "—" && !overview.last_error.is_empty() {
+                div class="banner bad overview-alert" role="status" { p { "Dernière erreur : " (overview.last_error) } }
+            }
+            section class="card hero" aria-labelledby="hero-name" {
+                div class="hero-head" {
+                    div {
+                        p class="eyebrow" {
+                            (car.look.model.unwrap_or("Voiture"))
+                            @if let Some(trim) = &car.trim { " · " (trim) }
+                        }
+                        h2 id="hero-name" class="hero-name" { (overview.name) }
+                    }
+                    (status_chip(car.status))
+                }
+                div class="hero-car" { (drawing(&car.look, "hero")) }
+                div class="hero-energy" {
+                    p class="hero-battery" {
+                        span class="hero-figure" { (overview.battery) }
+                        span class="hero-label" { "Batterie" }
+                    }
+                    p class="hero-range" {
+                        span class="hero-figure" { (car.range) }
+                        span class="hero-label" { "Autonomie" }
+                    }
+                }
+                (battery_meter(car.battery_pct, car.limit_pct, car.status == Status::Charging))
+                @if let Some(note) = &car.note {
+                    p class="hero-note" { (note) }
+                }
+                @if !car.facts.is_empty() {
+                    dl class="hero-facts" {
+                        @for (label, value) in &car.facts {
+                            div { dt { (label) } dd { (value) } }
+                        }
+                    }
+                }
+            }
+            section class="card place-card" aria-labelledby="place-title" {
+                h2 id="place-title" class="visually-hidden" { "Position" }
+                div class="map-frame" { (car.map) }
+                div class="place-text" {
+                    p class="place-name" { (Place::name_or_unknown(car.place.as_ref())) }
+                    @if let Some(detail) = car.place.as_ref().and_then(|place| place.detail.as_ref()) {
+                        p class="muted place-detail" { (detail) }
+                    }
+                    p class="updated" {
+                        "Mis à jour "
+                        @if let Some(iso) = &car.updated_iso {
+                            time datetime=(iso) { (car.updated) }
+                        } @else {
+                            (car.updated)
+                        }
+                    }
+                }
+            }
+            (recent_card("dernier-trajet", "Dernier trajet", overview.last_drive.as_ref(), "Aucun trajet", id.map(|id| format!("/v/{id}/drives")).as_deref(), "Tous les trajets"))
+            (recent_card("derniere-charge", "Dernière charge", overview.last_charge.as_ref(), "Aucune charge", id.map(|id| format!("/v/{id}/charges")).as_deref(), "Toutes les charges"))
+            @if !overview.month.is_empty() {
+                section class="card month-card" aria-labelledby="month-title" {
+                    div class="card-head" {
+                        h2 id="month-title" { "Ce mois-ci" }
+                        @if let Some(id) = id {
+                            a class="text-link" href=(format!("/v/{id}/stats")) { "Statistiques" }
+                        }
+                    }
+                    dl class="metrics" {
+                        @for (label, value) in &overview.month {
+                            div { dt { (label) } dd { (value) } }
+                        }
+                    }
+                }
+            }
+            details class="card diagnostics" {
+                summary { "Diagnostic" span class="muted" { " · " (overview.activity) " · GPS " (overview.position_mode) } }
                 dl class="facts" {
                     div { dt { "Activité" } dd { (overview.activity) } }
                     div { dt { "Batterie" } dd { (overview.battery) } }
@@ -351,20 +613,6 @@ pub(super) fn overview_page(chrome: &Chrome, overview: &Overview) -> String {
                     div { dt { "Dernière erreur" } dd { (overview.last_error) } }
                     div { dt { "Retard stream" } dd { (overview.stream_lag) } }
                     div { dt { "File stream" } dd { (overview.stream_queue) } }
-                }
-            }
-            section class="card" id="dernier-trajet" {
-                h2 { "Dernier trajet" }
-                p { (overview.last_drive) }
-                @if let Some(id) = current_id(chrome) {
-                    p { a href=(format!("/v/{id}/drives")) { "Ouvrir Trajets" } }
-                }
-            }
-            section class="card" id="derniere-charge" {
-                h2 { "Dernière charge" }
-                p { (overview.last_charge) }
-                @if let Some(id) = current_id(chrome) {
-                    p { a href=(format!("/v/{id}/charges")) { "Ouvrir Charges" } }
                 }
             }
         }
@@ -770,10 +1018,20 @@ fn vehicle_field(vehicle_id: Option<i64>) -> Markup {
 pub(crate) fn toolbar(chrome: &Chrome, title: &str) -> Markup {
     let current = chrome.vehicles.iter().find(|vehicle| vehicle.current);
     html! {
-        header class="toolbar app-bar" {
+        a class="skip-link" href="#contenu" { "Aller au contenu" }
+        header class="topbar" {
+            div class="topbar-inner" {
+                a class="wordmark" href="/" { (brand_mark()) span { "Tesla Logger" } }
+                (global_nav(chrome.global))
+                form class="logout" method="post" action="/logout" {
+                    input type="hidden" name="csrf" value=(&chrome.csrf);
+                    button class="ghost small" type="submit" { "Déconnexion" }
+                }
+            }
+        }
+        div class="page-head" id="contenu" tabindex="-1" {
             (back_link(chrome))
-            div class="app-bar-title" {
-                p class="kicker" { (brand_mark()) a href="/" { "Tesla Logger" } }
+            div class="page-title" {
                 h1 { (title) }
                 @if chrome.vehicles.len() >= 2 {
                     nav class="vehicle-select" aria-label="Véhicule" {
@@ -786,14 +1044,9 @@ pub(crate) fn toolbar(chrome: &Chrome, title: &str) -> Markup {
                         }
                     }
                 } @else if let Some(vehicle) = current {
-                    p class="kicker" { "Véhicule " (vehicle.name) }
-                }
-            }
-            div class="toolbar-actions" {
-                (global_nav(chrome.global))
-                form method="post" action="/logout" {
-                    input type="hidden" name="csrf" value=(&chrome.csrf);
-                    button class="ghost" type="submit" { "Déconnexion" }
+                    @if vehicle.name != title {
+                        p class="kicker" { (vehicle.name) }
+                    }
                 }
             }
         }
@@ -931,9 +1184,11 @@ pub(crate) fn document(debug_script: bool, body: Markup) -> String {
         html lang="fr" {
             head {
                 meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
+                meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover";
                 meta name="robots" content="noindex";
-                meta name="theme-color" content="#111318";
+                meta name="color-scheme" content="light dark";
+                meta name="theme-color" content="#111318" media="(prefers-color-scheme: dark)";
+                meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)";
                 link rel="icon" href="/favicon.ico" sizes="any";
                 link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32";
                 link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192";
@@ -1087,6 +1342,7 @@ mod tests {
             last_seen: "—".to_owned(),
             last_error: Some("poll failed".to_owned()),
             month: "1.0 km".to_owned(),
+            ..FleetCard::default()
         }];
         let html = fleet_page(&chrome, &cards, "1.0 km · 0.0 kWh");
         assert!(html.contains("href=\"/v/7\""));
@@ -1124,8 +1380,9 @@ mod tests {
                 last_error: "—".to_owned(),
                 stream_lag: "3 s".to_owned(),
                 stream_queue: "0".to_owned(),
-                last_drive: "Aucun trajet".to_owned(),
-                last_charge: "Aucune charge".to_owned(),
+                last_drive: None,
+                last_charge: None,
+                ..Overview::default()
             },
         );
         assert!(html.contains("role=\"tablist\""));
@@ -1133,6 +1390,8 @@ mod tests {
         assert!(html.contains(">Aperçu<"));
         assert!(html.contains("hybrid"));
         assert!(html.contains("Retard stream"));
+        assert!(html.contains("class=\"car\""));
+        assert!(html.contains("Aucun trajet"));
         assert!(html.contains("href=\"/v/4/drives\""));
         assert!(html.contains("href=\"/v/4/connection\""));
         preview("overview.html", &html);
@@ -1262,8 +1521,9 @@ mod tests {
                 last_error: "—".to_owned(),
                 stream_lag: "3 s".to_owned(),
                 stream_queue: "0".to_owned(),
-                last_drive: "Aucun trajet".to_owned(),
-                last_charge: "Aucune charge".to_owned(),
+                last_drive: None,
+                last_charge: None,
+                ..Overview::default()
             },
         );
         let drives = super::placeholder_page(&chrome, "Trajets", "bientôt", None);
@@ -1344,8 +1604,9 @@ mod tests {
                         last_error: "—".to_owned(),
                         stream_lag: "—".to_owned(),
                         stream_queue: "0".to_owned(),
-                        last_drive: "—".to_owned(),
-                        last_charge: "—".to_owned(),
+                        last_drive: None,
+                        last_charge: None,
+                        ..Overview::default()
                     },
                 ),
             ),

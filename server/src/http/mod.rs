@@ -3,12 +3,16 @@
 
 pub(crate) mod api;
 mod assets;
+mod car;
 mod edits;
+mod format;
 mod markup;
+mod overview;
 mod owner;
 pub(crate) mod stats;
 mod trips;
 mod ui;
+mod viz;
 
 use axum::body::Body;
 use axum::extract::State;
