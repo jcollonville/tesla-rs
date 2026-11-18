@@ -87,6 +87,16 @@ Distances are kilometres. Fleet API miles are converted on ingest. Temperatures 
 
 TeslaMate rows are already metric and are copied as stored. TeslaMate does not store drive battery levels on `drives`. The importer reads them from the start and end positions (`battery_level`, then `usable_battery_level`). Every `import-teslamate` run fills any still-null drive levels from the stored positions after the position copy finishes, including a resume that only imports the remaining positions. Migration `0003_backfill_drive_battery` does the same fill once at startup. Live drives keep the state of charge from the moment the drive opens (or the last stored level) and the last level seen before it closes.
 
+## Maps
+
+Opening a drive or a charge draws that track, or that charge's location, on an OpenFreeMap basemap: Positron when the console is light, Dark when it is dark. MapLibre GL JS 5.24.0 (BSD-3-Clause) is served from `/static/` with the other console files. The browser does not load the library from a CDN.
+
+Tiles, fonts, and sprites are fetched by this server from `https://tiles.openfreemap.org` and cached next to the token store, in `map-tiles/`. The browser only talks to this process, so `img-src` and `connect-src` stay `'self'`. OpenFreeMap sees the logger's address and the tiles for the area on screen, not the visitor's address and not a VIN. Cached tiles are kept for seven days; style documents are refreshed after six hours. `TILE_UPSTREAM=off` keeps the drawn track and makes no tile request. Set `TILE_UPSTREAM` to another HTTPS origin when you host a compatible tile set yourself.
+
+That proxy is the privacy choice. A direct browser request would send the visitor's address and the viewed area to the tile host, and this server's `Referrer-Policy: same-origin` would strip the `Referer` those hosts expect from web pages. The cost of proxying is bandwidth on the logger and that the operator's address is what the tile host records. The GPS is already in this database. Tile paths are not written to the request log, because a tile coordinate is a place.
+
+MapLibre positions its canvas with style attributes, so the page policy allows `style-src-attr 'unsafe-inline'`. Stylesheets and scripts stay on this origin. The worker is the CSP build (`worker-src 'self'`), not a `blob:` worker. Attribution (OpenFreeMap, OpenMapTiles, OpenStreetMap) is on the map. The overview mini-map stays a local drawing and does not request tiles, so opening the home page does not publish where the car is parked.
+
 ## Develop
 
 ```bash

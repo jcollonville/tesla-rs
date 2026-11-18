@@ -625,6 +625,7 @@
       member.clear();
     });
     if (this.mapCursor) this.mapCursor.classList.remove("on");
+    if (this.sync && window.teslaMapHide) window.teslaMapHide(this.sync);
   };
 
   Chart.prototype.clear = function () {
@@ -640,12 +641,13 @@
   };
 
   Chart.prototype.moveMap = function (index) {
-    if (!this.mapCursor || !this.mapXY || !this.mapXY[index]) return;
-    var point = this.mapXY[index];
-    if (point[0] < -50) return;
-    this.mapCursor.setAttribute("cx", point[0]);
-    this.mapCursor.setAttribute("cy", point[1]);
-    this.mapCursor.classList.add("on");
+    if (this.mapCursor && this.mapXY && this.mapXY[index] && this.mapXY[index][0] >= -50) {
+      var point = this.mapXY[index];
+      this.mapCursor.setAttribute("cx", point[0]);
+      this.mapCursor.setAttribute("cy", point[1]);
+      this.mapCursor.classList.add("on");
+    }
+    if (this.sync && window.teslaMapMove) window.teslaMapMove(this.sync, index);
   };
 
   Chart.prototype.showIndex = function (index, withTip) {
