@@ -31,6 +31,38 @@
   --space: 8px;
   --font: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --tl-bg: var(--bg);
+  --tl-surface: var(--surface);
+  --tl-surface-2: var(--surface-2);
+  --tl-surface-3: var(--surface-3);
+  --tl-line: var(--line);
+  --tl-line-strong: var(--line-strong);
+  --tl-text: var(--text);
+  --tl-muted: var(--muted);
+  --tl-faint: var(--faint);
+  --tl-accent: var(--accent);
+  --tl-accent-strong: var(--accent-strong);
+  --tl-accent-soft: var(--accent-soft);
+  --tl-on-accent: var(--on-accent);
+  --tl-green: var(--green);
+  --tl-green-soft: var(--green-soft);
+  --tl-amber: var(--amber);
+  --tl-violet: var(--violet);
+  --tl-slate: var(--slate);
+  --tl-danger: var(--danger);
+  --tl-danger-soft: var(--danger-soft);
+  --tl-map-bg: var(--map-bg);
+  --tl-map-dot: var(--map-dot);
+  --tl-map-road: var(--map-road);
+  --tl-shadow: var(--shadow);
+  --tl-radius: var(--radius);
+  --tl-radius-sm: var(--radius-sm);
+  --tl-space: var(--space);
+  --tl-font: var(--font);
+  --tl-mono: var(--mono);
+  --tl-ease: var(--ease);
+  --tl-fast: var(--fast);
+  --tl-slow: var(--slow);
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
   --fast: 160ms;
   --slow: 420ms;
@@ -653,33 +685,7 @@ dl.fleet-facts {
 }
 .fleet-card .banner { margin: 0; }
 
-/* Car drawing */
-svg.car {
-  display: block;
-  width: 100%;
-  height: auto;
-  aspect-ratio: 400 / 160;
-}
-.car-floor { opacity: 0.85; }
-@media (prefers-color-scheme: dark) {
-  .car-floor { opacity: 1; }
-}
-
-/* Official render: the drawing stays underneath until the picture has loaded. */
-.car-stage { display: grid; }
-.car-stage.has-render { aspect-ratio: 2 / 1; overflow: hidden; }
-.car-stage > * { grid-area: 1 / 1; align-self: center; }
-.car-photo {
-  display: none;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  scale: 1.14;
-  -webkit-mask-image: radial-gradient(ellipse 47% 60% at 50% 54%, #000 62%, transparent 100%);
-  mask-image: radial-gradient(ellipse 47% 60% at 50% 54%, #000 62%, transparent 100%);
-}
-.car-stage.photo-ready .car-photo { display: block; }
-.car-stage.photo-ready svg.car { display: none; }
+/* The official render lives in tl-car-image. There is no drawn fallback. */
 
 /* Battery */
 svg.battery-meter { display: block; width: 100%; height: 8px; overflow: visible; }
@@ -702,7 +708,6 @@ svg.soc-bar { display: block; width: 100%; max-width: 9rem; height: 6px; margin-
 .hero-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space); }
 .hero-name { margin: 6px 0 0; font-size: clamp(1.5rem, 5vw, 2rem); font-weight: 500; letter-spacing: -0.02em; }
 .hero-car { margin: calc(var(--space) * 2) -12px calc(var(--space) * 1); }
-.hero-car svg.car, .hero-car .car-photo { animation: arrive 900ms var(--ease) both; }
 .hero-energy { display: flex; justify-content: space-between; align-items: flex-end; gap: calc(var(--space) * 2); margin: 0 0 12px; }
 .hero-energy p { display: flex; flex-direction: column; margin: 0; }
 .hero-range { text-align: right; align-items: flex-end; }
@@ -1011,7 +1016,11 @@ ol.route-ends .muted { font-size: 0.875rem; font-weight: 400; }
 .charts > .card-head { margin-bottom: 0; }
 .chart-hint { font-size: 0.8125rem; }
 .chart-grid { display: grid; gap: calc(var(--space) * 2); grid-template-columns: minmax(0, 1fr); margin: 0 0 calc(var(--space) * 2); }
-.chart-grid > figure.chart { padding: calc(var(--space) * 2.5); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+.chart-grid > figure.chart,
+.chart-grid > tl-chart > figure.chart { padding: calc(var(--space) * 2.5); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+tl-chart.ready > figure.chart { display: none; }
+tl-vehicle-card, tl-recent-card, tl-summary-strip, tl-day-group, tl-chart, tl-mini-map, tl-car-image, tl-drive-row, tl-charge-row, tl-battery { display: block; }
+tl-tabs, tl-period-chips { display: flex; width: max-content; max-width: 100%; }
 
 figure.chart {
   position: relative;
@@ -1194,8 +1203,8 @@ figure.chart.chart-lead.zoomed .chart-summary { visibility: hidden; }
   .stat-label { display: block; color: var(--faint); font-size: 0.6875rem; letter-spacing: 0.02em; }
   .trip .chip.source { grid-column: 2; grid-row: 2; }
   .overview { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); align-items: start; }
-  .overview > .hero { grid-row: span 3; }
-  .overview > .overview-alert, .overview > .diagnostics, .overview > .month-card { grid-column: 1 / -1; }
+  .overview > .hero, .overview > tl-vehicle-card { grid-row: span 3; }
+  .overview > .overview-alert, .overview > .diagnostics, .overview > .month-card, .overview > tl-summary-strip { grid-column: 1 / -1; }
   .month-card dl.metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .detail { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .detail > .detail-head, .detail > .charts, .detail > .edit { grid-column: 1 / -1; }

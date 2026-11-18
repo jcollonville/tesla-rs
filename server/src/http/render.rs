@@ -14,7 +14,7 @@
 //!
 //! Only combinations known to render are requested. The compositor answers an
 //! unknown paint with HTTP 200 and a car without a body, so unknown paints,
-//! Cybertruck, and any failed fetch fall back to the drawn silhouette.
+//! Cybertruck, and any failed fetch are not shown. The card uses a text placeholder.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -640,18 +640,16 @@ mod tests {
 
         let (_, _, page) = fetch(&state, &format!("/v/{}", known.0), &cookie).await;
         let page = String::from_utf8(page).unwrap();
-        assert!(page.contains("class=\"car-stage has-render\""));
-        assert!(page.contains(&format!("src=\"/v/{}/car.png?v=", known.0)));
-        assert!(
-            page.contains("<svg class=\"car\""),
-            "the drawing stays as the fallback"
-        );
+        assert!(page.contains(&format!("image-url=\"/v/{}/car.png?v=", known.0)));
+        assert!(!page.contains("<svg class=\"car\""));
+        assert!(page.contains("Image du véhicule indisponible"));
         assert!(!page.contains(VIN));
         assert!(!page.contains("tesla.com/v1/compositor"));
         let (_, _, page) = fetch(&state, &format!("/v/{}", plain.0), &cookie).await;
         let page = String::from_utf8(page).unwrap();
-        assert!(!page.contains("car-stage"));
-        assert!(page.contains("<svg class=\"car\""));
+        assert!(!page.contains("car.png"));
+        assert!(page.contains("Image du véhicule indisponible"));
+        assert!(!page.contains("<svg class=\"car\""));
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);

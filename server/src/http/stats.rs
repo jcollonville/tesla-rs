@@ -742,7 +742,9 @@ pub(super) async fn console_page(
     count: i32,
 ) -> String {
     use super::markup::{document, toolbar, vehicle_tabs};
+    use super::widget::{element, to_json};
     use maud::html;
+    use serde::Serialize;
     let series = load_series(app, id, period, count).await.ok();
     let bins = load_bins(app, id, period, count).await.unwrap_or_default();
     let quality = quality(app, id).await;
@@ -751,21 +753,29 @@ pub(super) async fn console_page(
         ("month", 12, "Mois"),
         ("year", 5, "Années"),
     ];
+    #[derive(Serialize)]
+    struct GroupChip<'a> {
+        id: &'a str,
+        label: &'a str,
+        href: String,
+        current: bool,
+    }
+    let chips: Vec<GroupChip<'_>> = presets
+        .iter()
+        .map(|(value, preset, label)| GroupChip {
+            id: value,
+            label,
+            href: format!("/v/{id}/stats?period={value}&count={preset}"),
+            current: period == *value,
+        })
+        .collect();
+    let chips_json = to_json(&chips);
     let body = html! {
         (toolbar(chrome, "Statistiques"))
         (vehicle_tabs(chrome))
         div id="panel-stats" role="tabpanel" aria-labelledby="tab-stats" {
             div class="list-toolbar" {
-                nav class="segmented" aria-label="Regroupement" {
-                    @for (value, preset, label) in presets {
-                        @let href = format!("/v/{id}/stats?period={value}&count={preset}");
-                        @if period == value {
-                            a href=(href) aria-current="page" { (label) }
-                        } @else {
-                            a href=(href) { (label) }
-                        }
-                    }
-                }
+                (element("tl-period-chips", &[("label", "Regroupement")], Some(&chips_json), html! {}))
                 a class="button ghost small" href=(format!("/v/{id}/stats.csv?period={period}&count={count}")) download { "Exporter en CSV" }
             }
             details class="filters-panel" {
@@ -833,7 +843,7 @@ pub(super) async fn console_page(
                 }
             }
         }
-        script src="/static/charts.js" defer {}
+        script type="module" src="/static/charts.js" {}
     };
     document(chrome.debug_script, body)
 }

@@ -4,9 +4,12 @@
 //! Compile-time HTML. Maud escapes text and attributes.
 
 use maud::{DOCTYPE, Markup, PreEscaped, html};
+use serde::Serialize;
 
-use super::car::{Look, visual};
+use super::car::{IMAGE_UNAVAILABLE, Look, image_url};
 use super::format::Place;
+use super::viz::MiniMapModel;
+use super::widget::{element, to_json};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum GlobalTab {
@@ -122,6 +125,16 @@ impl Status {
             Self::Asleep | Self::Offline | Self::Unknown => "status idle",
         }
     }
+
+    pub(super) fn tone_key(self) -> &'static str {
+        match self {
+            Self::Driving => "drive",
+            Self::Charging | Self::Plugged => "charge",
+            Self::Parked => "park",
+            Self::Updating => "note",
+            Self::Asleep | Self::Offline | Self::Unknown => "idle",
+        }
+    }
 }
 
 /// Live state for the car card on the overview.
@@ -136,7 +149,7 @@ pub(super) struct CarCard {
     /// One line under the battery, such as the charging power and time to full.
     pub note: Option<String>,
     pub facts: Vec<(&'static str, String)>,
-    pub map: Markup,
+    pub map: MiniMapModel,
     pub place: Option<Place>,
     pub updated: String,
     pub updated_iso: Option<String>,
@@ -425,12 +438,12 @@ pub(super) fn fleet_page(chrome: &Chrome, cards: &[FleetCard], month_total: &str
                             }
                             span class="status-wrap" title=(card.activity) { (status_chip(card.status)) }
                         }
-                        div class="fleet-car" { (visual(&card.look, &format!("f{}", card.id), card.id)) }
+                        div class="fleet-car" { (car_media(image_url(&card.look, card.id).as_deref(), &card.look.label())) }
                         div class="fleet-battery" {
                             span class="figure" { (card.battery) }
                             span class="muted" { (card.range) }
                         }
-                        (battery_meter(card.battery_pct, card.limit_pct, card.status == Status::Charging))
+                        (battery_el(card.battery_pct, card.limit_pct, card.status == Status::Charging))
                         dl class="fleet-facts" {
                             @if let Some(place) = &card.place {
                                 div { dt { "Position" } dd { (place) } }
@@ -459,28 +472,73 @@ pub(super) fn status_chip(status: Status) -> Markup {
     }
 }
 
-/// Battery gauge with the charge limit as a tick.
-pub(super) fn battery_meter(pct: Option<f64>, limit: Option<f64>, charging: bool) -> Markup {
-    let Some(pct) = pct else {
-        return html! {};
-    };
-    let pct = pct.clamp(0.0, 100.0);
-    let class = if charging {
-        "battery-meter charging"
-    } else if pct <= 20.0 {
-        "battery-meter low"
-    } else {
-        "battery-meter"
-    };
-    html! {
-        svg class=(class) viewBox="0 0 100 8" preserveAspectRatio="none" role="img" aria-label=(format!("Batterie {pct:.0} %")) focusable="false" {
-            rect class="battery-track" width="100" height="8" rx="4" {}
-            rect class="battery-fill" width=(format!("{:.1}", pct.max(2.0))) height="8" rx="4" {}
-            @if let Some(limit) = limit.filter(|limit| *limit > 0.0 && *limit < 100.0) {
-                rect class="battery-limit" x=(format!("{:.1}", limit - 0.4)) y="0" width="0.8" height="8" {}
-            }
-        }
+fn battery_el(level: Option<f64>, limit: Option<f64>, charging: bool) -> Markup {
+    let level_text = level.map(|value| value.to_string());
+    let limit_text = limit.map(|value| value.to_string());
+    let mut attrs = Vec::new();
+    if let Some(level) = level_text.as_deref() {
+        attrs.push(("level", level));
     }
+    if let Some(limit) = limit_text.as_deref() {
+        attrs.push(("limit", limit));
+    }
+    if charging {
+        attrs.push(("charging", ""));
+    }
+    element("tl-battery", &attrs, None, html! {})
+}
+
+fn car_media(url: Option<&str>, alt: &str) -> Markup {
+    let mut attrs = vec![
+        ("alt", alt),
+        ("unavailable", IMAGE_UNAVAILABLE),
+        ("locale", "fr"),
+    ];
+    if let Some(url) = url {
+        attrs.push(("image-url", url));
+    }
+    element("tl-car-image", &attrs, None, html! {})
+}
+
+#[derive(Serialize)]
+struct FactJson<'a> {
+    label: &'a str,
+    value: &'a str,
+}
+
+#[derive(Serialize)]
+struct VehicleJson<'a> {
+    name: &'a str,
+    model: Option<&'a str>,
+    trim: Option<&'a str>,
+    status_label: &'a str,
+    status_tone: &'a str,
+    charging: bool,
+    battery_level: Option<f64>,
+    charge_limit_soc: Option<f64>,
+    battery_text: &'a str,
+    range_text: &'a str,
+    note: Option<&'a str>,
+    facts: Vec<FactJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct RecentJson<'a> {
+    href: &'a str,
+    when: &'a str,
+    from: Option<&'a str>,
+    to: &'a str,
+    primary: &'a str,
+    secondary: &'a str,
+    open: bool,
+}
+
+#[derive(Serialize)]
+struct TabJson<'a> {
+    id: &'a str,
+    label: &'a str,
+    href: String,
+    selected: bool,
 }
 
 fn recent_card(
@@ -491,41 +549,91 @@ fn recent_card(
     all_href: Option<&str>,
     all_label: &str,
 ) -> Markup {
-    html! {
-        section class="card recent" id=(id) {
-            div class="card-head" {
-                h2 { (title) }
-                @if let Some(href) = all_href {
-                    a class="text-link" href=(href) { (all_label) }
-                }
-            }
-            @if let Some(item) = item {
-                a class="recent-link" href=(item.href) {
-                    p class="recent-when" {
-                        (item.when)
-                        @if item.open { " · " span class="live-dot" {} "en cours" }
-                    }
-                    div class="route" {
-                        @if let Some(from) = &item.from {
-                            span class="route-stop start" { (from) }
-                        }
-                        span class="route-stop end" { (item.to) }
-                    }
-                    p class="recent-metrics" {
-                        span class="figure" { (item.primary) }
-                        span class="muted" { (item.secondary) }
-                    }
-                }
-            } @else {
-                p class="muted" { (empty) }
-            }
-        }
+    let mut attrs = vec![
+        ("id", id),
+        ("title", title),
+        ("empty", empty),
+        ("locale", "fr"),
+    ];
+    if let Some(href) = all_href {
+        attrs.push(("link-href", href));
+        attrs.push(("link-label", all_label));
     }
+    let json = item.map(|item| {
+        to_json(&RecentJson {
+            href: &item.href,
+            when: &item.when,
+            from: item.from.as_deref(),
+            to: &item.to,
+            primary: &item.primary,
+            secondary: &item.secondary,
+            open: item.open,
+        })
+    });
+    element("tl-recent-card", &attrs, json.as_deref(), html! {})
 }
 
 pub(super) fn overview_page(chrome: &Chrome, overview: &Overview) -> String {
     let car = &overview.car;
     let id = current_id(chrome);
+    let facts: Vec<FactJson<'_>> = car
+        .facts
+        .iter()
+        .map(|(label, value)| FactJson { label, value })
+        .collect();
+    let vehicle = to_json(&VehicleJson {
+        name: &overview.name,
+        model: car.look.model,
+        trim: car.trim.as_deref(),
+        status_label: car.status.label(),
+        status_tone: car.status.tone_key(),
+        charging: car.status == Status::Charging,
+        battery_level: car.battery_pct,
+        charge_limit_soc: car.limit_pct,
+        battery_text: &overview.battery,
+        range_text: &car.range,
+        note: car.note.as_deref(),
+        facts,
+    });
+    let image = id.and_then(|vehicle_id| image_url(&car.look, vehicle_id));
+    let mut card_attrs = vec![
+        ("locale", "fr"),
+        ("unavailable", IMAGE_UNAVAILABLE),
+        ("alt", overview.name.as_str()),
+    ];
+    if let Some(url) = image.as_deref() {
+        card_attrs.push(("image-url", url));
+    }
+    let map = to_json(&car.map);
+    let drives_href = id.map(|vehicle_id| format!("/v/{vehicle_id}/drives"));
+    let charges_href = id.map(|vehicle_id| format!("/v/{vehicle_id}/charges"));
+    let stats_href = id.map(|vehicle_id| format!("/v/{vehicle_id}/stats"));
+    let month: Vec<FactJson<'_>> = overview
+        .month
+        .iter()
+        .map(|(label, value)| FactJson { label, value })
+        .collect();
+    let month_json = to_json(&month);
+    let month_card = if overview.month.is_empty() {
+        html! {}
+    } else {
+        let mut month_attrs = vec![
+            ("variant", "card"),
+            ("title", "Ce mois-ci"),
+            ("label", "Ce mois-ci"),
+            ("locale", "fr"),
+        ];
+        if let Some(href) = stats_href.as_deref() {
+            month_attrs.push(("link-href", href));
+            month_attrs.push(("link-label", "Statistiques"));
+        }
+        element(
+            "tl-summary-strip",
+            &month_attrs,
+            Some(&month_json),
+            html! {},
+        )
+    };
     let body = html! {
         (toolbar(chrome, &overview.name))
         (vehicle_tabs(chrome))
@@ -533,43 +641,12 @@ pub(super) fn overview_page(chrome: &Chrome, overview: &Overview) -> String {
             @if overview.last_error != "—" && !overview.last_error.is_empty() {
                 div class="banner bad overview-alert" role="status" { p { "Dernière erreur : " (overview.last_error) } }
             }
-            section class="card hero" aria-labelledby="hero-name" {
-                div class="hero-head" {
-                    div {
-                        p class="eyebrow" {
-                            (car.look.model.unwrap_or("Voiture"))
-                            @if let Some(trim) = &car.trim { " · " (trim) }
-                        }
-                        h2 id="hero-name" class="hero-name" { (overview.name) }
-                    }
-                    (status_chip(car.status))
-                }
-                div class="hero-car" { (visual(&car.look, "hero", id.unwrap_or_default())) }
-                div class="hero-energy" {
-                    p class="hero-battery" {
-                        span class="hero-figure" { (overview.battery) }
-                        span class="hero-label" { "Batterie" }
-                    }
-                    p class="hero-range" {
-                        span class="hero-figure" { (car.range) }
-                        span class="hero-label" { "Autonomie" }
-                    }
-                }
-                (battery_meter(car.battery_pct, car.limit_pct, car.status == Status::Charging))
-                @if let Some(note) = &car.note {
-                    p class="hero-note" { (note) }
-                }
-                @if !car.facts.is_empty() {
-                    dl class="hero-facts" {
-                        @for (label, value) in &car.facts {
-                            div { dt { (label) } dd { (value) } }
-                        }
-                    }
-                }
-            }
+            (element("tl-vehicle-card", &card_attrs, Some(&vehicle), html! {}))
             section class="card place-card" aria-labelledby="place-title" {
                 h2 id="place-title" class="visually-hidden" { "Position" }
-                div class="map-frame" { (car.map) }
+                div class="map-frame" {
+                    (element("tl-mini-map", &[("locale", "fr")], Some(&map), html! {}))
+                }
                 div class="place-text" {
                     p class="place-name" { (Place::name_or_unknown(car.place.as_ref())) }
                     @if let Some(detail) = car.place.as_ref().and_then(|place| place.detail.as_ref()) {
@@ -585,23 +662,9 @@ pub(super) fn overview_page(chrome: &Chrome, overview: &Overview) -> String {
                     }
                 }
             }
-            (recent_card("dernier-trajet", "Dernier trajet", overview.last_drive.as_ref(), "Aucun trajet", id.map(|id| format!("/v/{id}/drives")).as_deref(), "Tous les trajets"))
-            (recent_card("derniere-charge", "Dernière charge", overview.last_charge.as_ref(), "Aucune charge", id.map(|id| format!("/v/{id}/charges")).as_deref(), "Toutes les charges"))
-            @if !overview.month.is_empty() {
-                section class="card month-card" aria-labelledby="month-title" {
-                    div class="card-head" {
-                        h2 id="month-title" { "Ce mois-ci" }
-                        @if let Some(id) = id {
-                            a class="text-link" href=(format!("/v/{id}/stats")) { "Statistiques" }
-                        }
-                    }
-                    dl class="metrics" {
-                        @for (label, value) in &overview.month {
-                            div { dt { (label) } dd { (value) } }
-                        }
-                    }
-                }
-            }
+            (recent_card("dernier-trajet", "Dernier trajet", overview.last_drive.as_ref(), "Aucun trajet", drives_href.as_deref(), "Tous les trajets"))
+            (recent_card("derniere-charge", "Dernière charge", overview.last_charge.as_ref(), "Aucune charge", charges_href.as_deref(), "Toutes les charges"))
+            (month_card)
             details class="card diagnostics" {
                 summary { "Diagnostic" span class="muted" { " · " (overview.activity) " · GPS " (overview.position_mode) } }
                 dl class="facts" {
@@ -1141,17 +1204,21 @@ pub(crate) fn vehicle_tabs(chrome: &Chrome) -> Markup {
             "Connexion Tesla",
         ),
     ];
-    html! {
-        nav class="tabs" role="tablist" aria-label="Sections du véhicule" {
-            @for (tab, href, tab_id, label) in tabs {
-                @if tab == section {
-                    a id=(tab_id) role="tab" href=(href) aria-selected="true" aria-current="page" { (label) }
-                } @else {
-                    a id=(tab_id) role="tab" href=(href) aria-selected="false" { (label) }
-                }
-            }
-        }
-    }
+    let payload: Vec<TabJson<'_>> = tabs
+        .iter()
+        .map(|(tab, href, tab_id, label)| TabJson {
+            id: tab_id,
+            label,
+            href: href.clone(),
+            selected: *tab == section,
+        })
+        .collect();
+    element(
+        "tl-tabs",
+        &[("label", "Sections du véhicule")],
+        Some(&to_json(&payload)),
+        html! {},
+    )
 }
 
 fn current_id(chrome: &Chrome) -> Option<i64> {
@@ -1197,8 +1264,8 @@ pub(crate) fn document(debug_script: bool, body: Markup) -> String {
                 link rel="manifest" href="/site.webmanifest";
                 title { "Tesla Logger" }
                 link rel="stylesheet" href="/static/ui.css";
+                script type="module" src="/static/tesla-logger-ui.js" {}
                 script src="/static/tabs.js" defer {}
-                script src="/static/car.js" defer {}
                 @if debug_script {
                     script src="/static/debug.js" defer {}
                 }
@@ -1386,15 +1453,16 @@ mod tests {
                 ..Overview::default()
             },
         );
-        assert!(html.contains("role=\"tablist\""));
-        assert!(html.contains("aria-selected=\"true\""));
-        assert!(html.contains(">Aperçu<"));
+        assert!(html.contains("<tl-tabs"));
+        assert!(html.contains("\"selected\":true"));
+        assert!(html.contains("Aperçu"));
         assert!(html.contains("hybrid"));
         assert!(html.contains("Retard stream"));
-        assert!(html.contains("class=\"car\""));
+        assert!(!html.contains("<svg class=\"car\""));
+        assert!(html.contains("Image du véhicule indisponible"));
         assert!(html.contains("Aucun trajet"));
-        assert!(html.contains("href=\"/v/4/drives\""));
-        assert!(html.contains("href=\"/v/4/connection\""));
+        assert!(html.contains("link-href=\"/v/4/drives\""));
+        assert!(html.contains("/v/4/connection"));
         preview("overview.html", &html);
     }
 
@@ -1467,7 +1535,9 @@ mod tests {
         assert!(html.contains("Ce compte gère aussi"));
         assert!(html.contains("Millenium"));
         assert!(!html.contains("OWNER_STREAM_ENABLED"));
-        assert!(html.contains("aria-selected=\"true\""));
+        assert!(html.contains("<tl-tabs"));
+        assert!(html.contains("\"selected\":true"));
+        assert!(html.contains("Connexion Tesla"));
         preview("connection.html", &html);
     }
 

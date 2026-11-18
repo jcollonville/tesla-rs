@@ -20,6 +20,8 @@ The library crates are written to be reused by other programs. They do not depen
 
 `tesla-logger` is licensed separately from the libraries. See `server/README.md` and `server/LICENSE`.
 
+`ui/` is `@jcollonville/tesla-logger-ui`, the console's custom elements (`MIT OR Apache-2.0`). The Home Assistant card installs a pinned release tarball at build time. See `ui/README.md`.
+
 ## Run locally
 
 Run every command from the repository root. Relative paths below are relative to that directory.

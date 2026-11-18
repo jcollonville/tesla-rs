@@ -17,6 +17,8 @@ use std::fmt::Write as _;
 use maud::{Markup, PreEscaped, html};
 use serde::Serialize;
 
+use super::widget::element;
+
 use crate::rdp::rdp_limit;
 
 /// Metres per degree of latitude.
@@ -248,7 +250,9 @@ pub(crate) struct MiniMap<'a> {
     pub label: &'a str,
 }
 
-/// Small abstract map: recent drives near the car, the car, its heading.
+/// Small abstract map kept for the coordinate-leak test. The console draws this
+/// through `tl-mini-map` instead.
+#[cfg(test)]
 pub(crate) fn mini_map(map: &MiniMap<'_>) -> Markup {
     let frame = Frame::centred(map.lat, map.lon, MINI_W, MINI_H, 1_100.0);
     let mut roads = String::new();
@@ -298,19 +302,62 @@ pub(crate) fn mini_map(map: &MiniMap<'_>) -> Markup {
     }
 }
 
-/// Placeholder when the position is unknown.
-pub(crate) fn mini_map_empty() -> Markup {
-    html! {
-        svg class="mini-map empty" viewBox=(format!("0 0 {MINI_W} {MINI_H}")) role="img" aria-label="Position inconnue" focusable="false" {
-            defs {
-                pattern id="mini-dots" width="18" height="18" patternUnits="userSpaceOnUse" {
-                    circle class="map-dot" cx="1.5" cy="1.5" r="1" {}
-                }
-            }
-            rect class="map-bg" width=(MINI_W) height=(MINI_H) {}
-            rect width=(MINI_W) height=(MINI_H) fill="url(#mini-dots)" {}
-            circle class="map-halo" cx=(MINI_W / 2.0) cy=(MINI_H / 2.0) r="15" {}
+/// Projected mini-map. Screen units only: latitude and longitude never leave `Frame`.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct MiniMapModel {
+    pub label: String,
+    pub moving: bool,
+    pub empty: bool,
+    pub width: f64,
+    pub height: f64,
+    pub roads: Vec<String>,
+    pub heading: Option<f64>,
+    pub scale_width: f64,
+    pub scale_label: String,
+}
+
+impl Default for MiniMapModel {
+    fn default() -> Self {
+        mini_map_empty_model()
+    }
+}
+
+pub(crate) fn mini_map_model(map: &MiniMap<'_>) -> MiniMapModel {
+    let frame = Frame::centred(map.lat, map.lon, MINI_W, MINI_H, 1_100.0);
+    let mut roads = Vec::new();
+    for track in map.tracks {
+        if track.len() < 2 {
+            continue;
         }
+        roads.push(path_of(
+            track.iter().map(|(lat, lon)| frame.point(*lat, *lon)),
+        ));
+    }
+    let (bar, label) = scale_bar(&frame, MINI_W);
+    MiniMapModel {
+        label: format!("Position : {}", map.label),
+        moving: map.moving,
+        empty: false,
+        width: MINI_W,
+        height: MINI_H,
+        roads,
+        heading: map.heading,
+        scale_width: bar,
+        scale_label: label,
+    }
+}
+
+pub(crate) fn mini_map_empty_model() -> MiniMapModel {
+    MiniMapModel {
+        label: "Position inconnue".to_owned(),
+        moving: false,
+        empty: true,
+        width: MINI_W,
+        height: MINI_H,
+        roads: Vec::new(),
+        heading: None,
+        scale_width: 0.0,
+        scale_label: String::new(),
     }
 }
 
@@ -420,7 +467,7 @@ pub(crate) fn bar_figure(title: &str, summary: &str, chart: &BarChart<'_>) -> Ma
         .collect();
     let max = totals.iter().copied().fold(0.0_f64, f64::max).max(1e-9);
     let width = u32::try_from(totals.len().max(1)).unwrap_or(1) * 8;
-    html! {
+    let figure = html! {
         figure class="chart" data-chart=(payload) tabindex="0" aria-label=(format!("{title}. {summary}")) {
             figcaption {
                 span class="chart-title" { (title) }
@@ -452,7 +499,13 @@ pub(crate) fn bar_figure(title: &str, summary: &str, chart: &BarChart<'_>) -> Ma
                 }
             }
         }
-    }
+    };
+    element(
+        "tl-chart",
+        &[("variant", "card"), ("title", title), ("summary", summary)],
+        None,
+        figure,
+    )
 }
 
 /// Static line used when scripts are off, and as the first paint.
@@ -508,7 +561,10 @@ pub(crate) fn soc_bar(start: Option<f64>, end: Option<f64>) -> Markup {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, MiniMap, chart_svg, map_json, mini_map, point_json, route_map, stride};
+    use super::{
+        Frame, MiniMap, chart_svg, map_json, mini_map, mini_map_model, point_json, route_map,
+        stride,
+    };
 
     #[test]
     fn chart_svg_has_no_style_attribute() {
@@ -562,6 +618,18 @@ mod tests {
         assert!(payload.contains("null"), "{payload}");
         assert!(point_json(0.0, 0.0).is_some());
         assert!(point_json(120.0, 0.0).is_none());
+        let model = serde_json::to_string(&mini_map_model(&MiniMap {
+            lat: points[0].0,
+            lon: points[0].1,
+            heading: Some(90.0),
+            moving: false,
+            tracks: &tracks,
+            label: "Maison",
+        }))
+        .unwrap();
+        assert!(!model.contains("0.0123"), "{model}");
+        assert!(!model.contains("0.0678"), "{model}");
+        assert!(!model.contains("latitude"), "{model}");
     }
 
     #[test]

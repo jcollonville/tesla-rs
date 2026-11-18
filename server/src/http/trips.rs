@@ -12,7 +12,9 @@ use axum::response::{IntoResponse, Redirect, Response};
 use chrono::{DateTime, Datelike, NaiveDate, Offset, Utc};
 use chrono_tz::Tz;
 use maud::{Markup, html};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+use super::widget::{element, to_json};
 
 use super::format::{self, Place};
 use super::markup::{GlobalTab, VehicleTab, document, missing_page, toolbar, vehicle_tabs};
@@ -171,17 +173,11 @@ pub(super) async fn drives(
                 }
             }
             @for (day, items) in &groups {
-                section class="day" aria-label=(day_title(*day, today, bounds.sort)) {
-                    header class="day-head" {
-                        h2 { (day_title(*day, today, bounds.sort)) }
-                        p class="muted" { (drive_day_totals(items)) }
+                (day_group(&day_title(*day, today, bounds.sort), &drive_day_totals(items), html! {
+                    @for row in items {
+                        (drive_item(id, row, tz))
                     }
-                    ul class="trips" role="list" {
-                        @for row in items {
-                            li { (drive_item(id, row, tz)) }
-                        }
-                    }
-                }
+                }))
             }
             (pager(id, Kind::Drives, &query, next.as_deref()))
         }
@@ -231,53 +227,62 @@ fn drive_day_totals(items: &[&DriveRow]) -> String {
     )
 }
 
+#[derive(Serialize)]
+struct DriveView<'a> {
+    id: i64,
+    start_at: String,
+    end_at: Option<String>,
+    distance_km: Option<f64>,
+    duration_s: Option<i32>,
+    energy_used_kwh: Option<f64>,
+    energy_kwh: Option<f64>,
+    start_battery_level: Option<f64>,
+    end_battery_level: Option<f64>,
+    source: &'a str,
+    start_address: Option<&'a str>,
+    end_address: Option<&'a str>,
+    start_geofence: Option<&'a str>,
+    end_geofence: Option<&'a str>,
+}
+
+fn day_group(heading: &str, summary: &str, rows: Markup) -> Markup {
+    element(
+        "tl-day-group",
+        &[("heading", heading), ("summary", summary)],
+        None,
+        rows,
+    )
+}
+
 fn drive_item(id: i64, row: &DriveRow, tz: Tz) -> Markup {
-    let from = Place::from(row.start_address.as_deref(), row.start_geofence.as_deref());
-    let to = Place::from(row.end_address.as_deref(), row.end_geofence.as_deref());
-    let from_name = Place::name_or_unknown(from.as_ref());
-    let to_name = if row.end_at.is_none() {
-        "En route".to_owned()
-    } else {
-        Place::name_or_unknown(to.as_ref())
-    };
-    let efficiency = format::efficiency(row.energy_kwh, row.distance_km);
-    let label = format!(
-        "{} à {}, de {from_name} à {to_name}, {}",
-        format::capitalize(&format::long_date(
-            format::local_date(row.start_at, tz),
-            false
-        )),
-        format::clock(row.start_at, tz),
-        format::km(row.distance_km)
-    );
-    html! {
-        a class="trip" href=(format!("/v/{id}/drives/{}", row.id)) aria-label=(label) {
-            span class="trip-times" {
-                time datetime=(row.start_at.to_rfc3339()) { (format::clock(row.start_at, tz)) }
-                @if let Some(end) = row.end_at {
-                    span { (format::clock(end, tz)) }
-                } @else {
-                    span class="live" { span class="live-dot" {} "en cours" }
-                }
-            }
-            span class="route" {
-                span class="route-stop start" title=[from.as_ref().and_then(|place| place.detail.clone())] { (from_name) }
-                span class="route-stop end" title=[to.as_ref().and_then(|place| place.detail.clone())] { (to_name) }
-            }
-            span class="trip-figures" {
-                span class="figure" { (format::km(row.distance_km)) }
-                span class="muted" { (format::duration_i32(row.duration_s)) }
-            }
-            span class="trip-stats" {
-                span { span class="stat-label" { "Énergie" } (energy_label(row.energy_kwh, row.energy_used_kwh.is_none())) }
-                span { span class="stat-label" { "Efficacité" } (format::unit(efficiency, 0, "Wh/km")) }
-                span { span class="stat-label" { "Batterie" } (battery_span(row.start_battery_level, row.end_battery_level)) }
-            }
-            @if row.source != "poll" && row.source != "stream" {
-                span class="chip source" { (row.source) }
-            }
-        }
-    }
+    let href = format!("/v/{id}/drives/{}", row.id);
+    let zone = tz.to_string();
+    let json = to_json(&DriveView {
+        id: row.id,
+        start_at: row.start_at.to_rfc3339(),
+        end_at: row.end_at.map(|end| end.to_rfc3339()),
+        distance_km: row.distance_km,
+        duration_s: row.duration_s,
+        energy_used_kwh: row.energy_used_kwh,
+        energy_kwh: row.energy_kwh,
+        start_battery_level: row.start_battery_level,
+        end_battery_level: row.end_battery_level,
+        source: &row.source,
+        start_address: row.start_address.as_deref(),
+        end_address: row.end_address.as_deref(),
+        start_geofence: row.start_geofence.as_deref(),
+        end_geofence: row.end_geofence.as_deref(),
+    });
+    element(
+        "tl-drive-row",
+        &[
+            ("href", href.as_str()),
+            ("locale", "fr"),
+            ("time-zone", zone.as_str()),
+        ],
+        Some(&json),
+        html! {},
+    )
 }
 
 /// Stored duration, else measured from the bounds; open sessions run until now.
@@ -561,138 +566,138 @@ pub(super) async fn drive_detail(
     };
     let csrf = &page.csrf;
     let body = html! {
-        (toolbar(&chrome, &title))
-        (vehicle_tabs(&chrome))
-        div class="detail" role="tabpanel" aria-labelledby="tab-drives" {
-            div class="detail-head" {
-                a class="text-link back-inline" href=(format!("/v/{id}/drives")) { "← Retour à la liste" }
-                p class="eyebrow" { (when) }
-            }
-            section class="card route-card" aria-label="Tracé" {
-                @if map_payload.is_some() || map.is_some() {
-                    div class="map-frame map-stage" {
-                        @if let Some(map) = &map { (map) }
-                        @if let Some(payload) = &map_payload {
-                            div class="basemap" data-sync=(sync) data-map=(payload) role="application" aria-label="Carte du trajet" {}
-                        }
-                        p class="map-credit" {
-                            a href="https://openfreemap.org/" { "OpenFreeMap" }
-                            " © "
-                            a href="https://openmaptiles.org/" { "OpenMapTiles" }
-                            " · données "
-                            a href="https://www.openstreetmap.org/copyright" { "OpenStreetMap" }
-                        }
-                    }
-                } @else {
-                    p class="muted" { "Pas de points GPS." }
+            (toolbar(&chrome, &title))
+            (vehicle_tabs(&chrome))
+            div class="detail" role="tabpanel" aria-labelledby="tab-drives" {
+                div class="detail-head" {
+                    a class="text-link back-inline" href=(format!("/v/{id}/drives")) { "← Retour à la liste" }
+                    p class="eyebrow" { (when) }
                 }
-                ol class="route-ends" {
-                    li class="route-stop start" {
-                        span class="stop-name" { (Place::name_or_unknown(from.as_ref())) }
-                        @if let Some(detail) = from.as_ref().and_then(|place| place.detail.as_ref()) {
-                            span class="muted" { (detail) }
-                        }
-                        span class="muted" { (format::clock(drive.start_at, tz)) }
-                    }
-                    li class="route-stop end" {
-                        span class="stop-name" { (if drive.end_at.is_some() { Place::name_or_unknown(to.as_ref()) } else { "En route".to_owned() }) }
-                        @if let Some(detail) = to.as_ref().and_then(|place| place.detail.as_ref()) {
-                            span class="muted" { (detail) }
-                        }
-                        @if let Some(end) = drive.end_at {
-                            span class="muted" { (format::clock(end, tz)) }
-                        }
-                    }
-                }
-            }
-            section class="card" aria-labelledby="drive-metrics" {
-                h2 id="drive-metrics" class="visually-hidden" { "Mesures" }
-                dl class="metrics" {
-                    @for (label, value) in &metrics {
-                        div { dt { (label) } dd { (value) } }
-                    }
-                }
-                @if drive.note.is_some() || drive.tag.is_some() {
-                    p class="note" {
-                        @if let Some(tag) = &drive.tag { span class="chip" { (tag) } " " }
-                        @if let Some(note) = &drive.note { (note) }
-                    }
-                }
-            }
-            section class="card charts" aria-labelledby="drive-charts" data-sync-root=(sync) {
-                div class="card-head" {
-                    h2 id="drive-charts" { "Télémétrie" }
-                    p class="hint chart-hint" { "Survolez pour lire, faites glisser pour zoomer." }
-                }
-                @if sampled.len() < 2 {
-                    p class="muted" { "Pas assez de points." }
-                } @else {
-                    @for (name, summary, data) in charts {
-                        @if data.values.iter().filter(|value| value.is_some()).count() >= 2 {
-                            (viz::line_figure(name, &summary, Some(&sync), &LineChart { kind: "line", x: &axis, t: &t, series: vec![data] }))
-                        }
-                    }
-                }
-            }
-            details class="card edit" {
-                summary { "Modifier ce trajet" }
-                div class="edit-grid" {
-                    form class="stack" method="post" action=(format!("/v/{id}/drives/{drive_id}/edit")) {
-                        h3 { "Notes et lieux" }
-                        input type="hidden" name="csrf" value=(csrf);
-                        label class="field" for="note" { "Note" input id="note" name="note" value=[drive.note.as_deref()]; }
-                        label class="field" for="tag" { "Tag" input id="tag" name="tag" value=[drive.tag.as_deref()]; }
-                        label class="field" for="start_geofence_id" { "Géofence départ (id, 0 pour vider)" input id="start_geofence_id" name="start_geofence_id" inputmode="numeric"; }
-                        label class="field" for="end_geofence_id" { "Géofence arrivée" input id="end_geofence_id" name="end_geofence_id" inputmode="numeric"; }
-                        label class="field" for="start_address_id" { "Adresse départ" input id="start_address_id" name="start_address_id" inputmode="numeric"; }
-                        label class="field" for="end_address_id" { "Adresse arrivée" input id="end_address_id" name="end_address_id" inputmode="numeric"; }
-                        button type="submit" { "Enregistrer" }
-                    }
-                    div class="stack" {
-                        h3 { "Découpage" }
-                        form method="post" action=(format!("/v/{id}/drives/{drive_id}/recompute")) {
-                            input type="hidden" name="csrf" value=(csrf);
-                            button class="tonal" type="submit" { "Recalculer" }
-                        }
-                        form class="stack" method="post" action=(format!("/v/{id}/drives/{drive_id}/split")) {
-                            input type="hidden" name="csrf" value=(csrf);
-                            label class="field" for="split_at" { "Couper à" input id="split_at" name="at" required placeholder=(drive.start_at.to_rfc3339()); }
-                            button class="tonal" type="submit" { "Couper" }
-                        }
-                        form class="stack" method="post" action=(format!("/v/{id}/drives/{drive_id}/merge")) {
-                            input type="hidden" name="csrf" value=(csrf);
-                            label class="field" for="other" { "Fusionner avec l'id" input id="other" name="other" required inputmode="numeric"; }
-                            button class="tonal" type="submit" { "Fusionner" }
-                        }
-                    }
-                    div class="stack danger-zone" {
-                        h3 { "Zone sensible" }
-                        p class="hint" { "Trajet n° " (drive.id) " · source " (drive.source) }
-                        form method="post" action=(format!("/v/{id}/drives/{drive_id}/trash")) {
-                            input type="hidden" name="csrf" value=(csrf);
-                            button class="danger" type="submit" { "Mettre à la corbeille" }
-                        }
-                        form class="stack" method="post" action=(format!("/v/{id}/drives/{drive_id}/purge")) {
-                            input type="hidden" name="csrf" value=(csrf);
-                            label class="field" for="confirm_id" { "Retaper l'id pour purger" input id="confirm_id" name="confirm_id" required inputmode="numeric"; }
-                            label class="field" for="positions" {
-                                "Positions"
-                                select id="positions" name="positions" {
-                                    option value="detach" { "Détacher" }
-                                    option value="delete" { "Supprimer sur la plage" }
-                                }
+                section class="card route-card" aria-label="Tracé" {
+                    @if map_payload.is_some() || map.is_some() {
+                        div class="map-frame map-stage" {
+                            @if let Some(map) = &map { (map) }
+                            @if let Some(payload) = &map_payload {
+                                div class="basemap" data-sync=(sync) data-map=(payload) role="application" aria-label="Carte du trajet" {}
                             }
-                            button class="danger" type="submit" { "Purger" }
+                            p class="map-credit" {
+                                a href="https://openfreemap.org/" { "OpenFreeMap" }
+                                " © "
+                                a href="https://openmaptiles.org/" { "OpenMapTiles" }
+                                " · données "
+                                a href="https://www.openstreetmap.org/copyright" { "OpenStreetMap" }
+                            }
+                        }
+                    } @else {
+                        p class="muted" { "Pas de points GPS." }
+                    }
+                    ol class="route-ends" {
+                        li class="route-stop start" {
+                            span class="stop-name" { (Place::name_or_unknown(from.as_ref())) }
+                            @if let Some(detail) = from.as_ref().and_then(|place| place.detail.as_ref()) {
+                                span class="muted" { (detail) }
+                            }
+                            span class="muted" { (format::clock(drive.start_at, tz)) }
+                        }
+                        li class="route-stop end" {
+                            span class="stop-name" { (if drive.end_at.is_some() { Place::name_or_unknown(to.as_ref()) } else { "En route".to_owned() }) }
+                            @if let Some(detail) = to.as_ref().and_then(|place| place.detail.as_ref()) {
+                                span class="muted" { (detail) }
+                            }
+                            @if let Some(end) = drive.end_at {
+                                span class="muted" { (format::clock(end, tz)) }
+                            }
+                        }
+                    }
+                }
+                section class="card" aria-labelledby="drive-metrics" {
+                    h2 id="drive-metrics" class="visually-hidden" { "Mesures" }
+                    dl class="metrics" {
+                        @for (label, value) in &metrics {
+                            div { dt { (label) } dd { (value) } }
+                        }
+                    }
+                    @if drive.note.is_some() || drive.tag.is_some() {
+                        p class="note" {
+                            @if let Some(tag) = &drive.tag { span class="chip" { (tag) } " " }
+                            @if let Some(note) = &drive.note { (note) }
+                        }
+                    }
+                }
+                section class="card charts" aria-labelledby="drive-charts" data-sync-root=(sync) {
+                    div class="card-head" {
+                        h2 id="drive-charts" { "Télémétrie" }
+                        p class="hint chart-hint" { "Survolez pour lire, faites glisser pour zoomer." }
+                    }
+                    @if sampled.len() < 2 {
+                        p class="muted" { "Pas assez de points." }
+                    } @else {
+                        @for (name, summary, data) in charts {
+                            @if data.values.iter().filter(|value| value.is_some()).count() >= 2 {
+                                (viz::line_figure(name, &summary, Some(&sync), &LineChart { kind: "line", x: &axis, t: &t, series: vec![data] }))
+                            }
+                        }
+                    }
+                }
+                details class="card edit" {
+                    summary { "Modifier ce trajet" }
+                    div class="edit-grid" {
+                        form class="stack" method="post" action=(format!("/v/{id}/drives/{drive_id}/edit")) {
+                            h3 { "Notes et lieux" }
+                            input type="hidden" name="csrf" value=(csrf);
+                            label class="field" for="note" { "Note" input id="note" name="note" value=[drive.note.as_deref()]; }
+                            label class="field" for="tag" { "Tag" input id="tag" name="tag" value=[drive.tag.as_deref()]; }
+                            label class="field" for="start_geofence_id" { "Géofence départ (id, 0 pour vider)" input id="start_geofence_id" name="start_geofence_id" inputmode="numeric"; }
+                            label class="field" for="end_geofence_id" { "Géofence arrivée" input id="end_geofence_id" name="end_geofence_id" inputmode="numeric"; }
+                            label class="field" for="start_address_id" { "Adresse départ" input id="start_address_id" name="start_address_id" inputmode="numeric"; }
+                            label class="field" for="end_address_id" { "Adresse arrivée" input id="end_address_id" name="end_address_id" inputmode="numeric"; }
+                            button type="submit" { "Enregistrer" }
+                        }
+                        div class="stack" {
+                            h3 { "Découpage" }
+                            form method="post" action=(format!("/v/{id}/drives/{drive_id}/recompute")) {
+                                input type="hidden" name="csrf" value=(csrf);
+                                button class="tonal" type="submit" { "Recalculer" }
+                            }
+                            form class="stack" method="post" action=(format!("/v/{id}/drives/{drive_id}/split")) {
+                                input type="hidden" name="csrf" value=(csrf);
+                                label class="field" for="split_at" { "Couper à" input id="split_at" name="at" required placeholder=(drive.start_at.to_rfc3339()); }
+                                button class="tonal" type="submit" { "Couper" }
+                            }
+                            form class="stack" method="post" action=(format!("/v/{id}/drives/{drive_id}/merge")) {
+                                input type="hidden" name="csrf" value=(csrf);
+                                label class="field" for="other" { "Fusionner avec l'id" input id="other" name="other" required inputmode="numeric"; }
+                                button class="tonal" type="submit" { "Fusionner" }
+                            }
+                        }
+                        div class="stack danger-zone" {
+                            h3 { "Zone sensible" }
+                            p class="hint" { "Trajet n° " (drive.id) " · source " (drive.source) }
+                            form method="post" action=(format!("/v/{id}/drives/{drive_id}/trash")) {
+                                input type="hidden" name="csrf" value=(csrf);
+                                button class="danger" type="submit" { "Mettre à la corbeille" }
+                            }
+                            form class="stack" method="post" action=(format!("/v/{id}/drives/{drive_id}/purge")) {
+                                input type="hidden" name="csrf" value=(csrf);
+                                label class="field" for="confirm_id" { "Retaper l'id pour purger" input id="confirm_id" name="confirm_id" required inputmode="numeric"; }
+                                label class="field" for="positions" {
+                                    "Positions"
+                                    select id="positions" name="positions" {
+                                        option value="detach" { "Détacher" }
+                                        option value="delete" { "Supprimer sur la plage" }
+                                    }
+                                }
+                                button class="danger" type="submit" { "Purger" }
+                            }
                         }
                     }
                 }
             }
-        }
-        link rel="stylesheet" href="/static/maplibre-gl.css";
-        script src="/static/maplibre-gl-csp.js" defer {}
-        script src="/static/map.js" defer {}
-        script src="/static/charts.js" defer {}
-    };
+    link rel="stylesheet" href="/static/maplibre-gl.css";
+            script src="/static/maplibre-gl-csp.js" defer {}
+            script src="/static/map.js" defer {}
+            script type="module" src="/static/charts.js" {}
+        };
     html_page(document(false, body), page.cookie)
 }
 
@@ -831,17 +836,11 @@ pub(super) async fn charges(
                 }
             }
             @for (day, items) in &groups {
-                section class="day" aria-label=(charge_day_title(*day, today, bounds.sort)) {
-                    header class="day-head" {
-                        h2 { (charge_day_title(*day, today, bounds.sort)) }
-                        p class="muted" { (charge_day_totals(items)) }
+                (day_group(&charge_day_title(*day, today, bounds.sort), &charge_day_totals(items), html! {
+                    @for row in items {
+                        (charge_item(id, row, tz))
                     }
-                    ul class="trips" role="list" {
-                        @for row in items {
-                            li { (charge_item(id, row, tz)) }
-                        }
-                    }
-                }
+                }))
             }
             (pager(id, Kind::Charges, &query, next.as_deref()))
         }
@@ -878,64 +877,53 @@ fn charge_kind(row_dc: Option<bool>, charger: Option<&str>) -> String {
     }
 }
 
+#[derive(Serialize)]
+struct ChargeView<'a> {
+    id: i64,
+    start_at: String,
+    end_at: Option<String>,
+    energy_added_kwh: Option<f64>,
+    duration_s: Option<i32>,
+    cost: Option<f64>,
+    is_dc: Option<bool>,
+    charger_type: Option<&'a str>,
+    max_power_kw: Option<f64>,
+    start_battery_level: Option<f64>,
+    end_battery_level: Option<f64>,
+    source: &'a str,
+    address: Option<&'a str>,
+    geofence: Option<&'a str>,
+}
+
 fn charge_item(id: i64, row: &ChargeRow, tz: Tz) -> Markup {
-    let place = Place::from(row.address.as_deref(), row.geofence.as_deref());
-    let name = Place::name_or_unknown(place.as_ref());
-    let duration = elapsed(row.start_at, row.end_at, row.duration_s);
-    let label = format!(
-        "{} à {}, {name}, {}",
-        format::capitalize(&format::long_date(
-            format::local_date(row.start_at, tz),
-            false
-        )),
-        format::clock(row.start_at, tz),
-        row.energy_added_kwh.map_or_else(
-            || "en cours".to_owned(),
-            |kwh| format!("+{}", format::kwh(Some(kwh)))
-        )
-    );
-    let dc = row.is_dc == Some(true);
-    html! {
-        a class=(if dc { "trip charge dc" } else { "trip charge" }) href=(format!("/v/{id}/charges/{}", row.id)) aria-label=(label) {
-            span class="trip-times" {
-                time datetime=(row.start_at.to_rfc3339()) { (format::clock(row.start_at, tz)) }
-                @if let Some(end) = row.end_at {
-                    span { (format::clock(end, tz)) }
-                } @else {
-                    span class="live" { span class="live-dot" {} "en cours" }
-                }
-            }
-            span class="route single" {
-                span class="route-stop charge-stop" title=[place.as_ref().and_then(|place| place.detail.clone())] { (name) }
-                span class="muted kind" {
-                    @if dc { span class="chip dc" { "DC" } " " }
-                    (row.charger_type.as_deref().filter(|text| !text.is_empty()).unwrap_or(match row.is_dc {
-                        Some(true) => "",
-                        Some(false) => "AC",
-                        None => "Charge",
-                    }))
-                }
-            }
-            span class="trip-figures" {
-                span class="figure" {
-                    (row.energy_added_kwh.map_or_else(|| "En cours".to_owned(), |kwh| format!("+{}", format::kwh(Some(kwh)))))
-                }
-                span class="muted" { (format::duration(duration)) }
-            }
-            span class="trip-stats" {
-                span class="soc" {
-                    span class="stat-label" { "Batterie" }
-                    (battery_span(row.start_battery_level, row.end_battery_level))
-                    (viz::soc_bar(row.start_battery_level, row.end_battery_level))
-                }
-                span { span class="stat-label" { "Puissance max" } (format::unit(row.max_power_kw, 0, "kW")) }
-                span { span class="stat-label" { "Coût" } (format::money(row.cost)) }
-            }
-            @if row.source != "poll" && row.source != "stream" {
-                span class="chip source" { (row.source) }
-            }
-        }
-    }
+    let href = format!("/v/{id}/charges/{}", row.id);
+    let zone = tz.to_string();
+    let json = to_json(&ChargeView {
+        id: row.id,
+        start_at: row.start_at.to_rfc3339(),
+        end_at: row.end_at.map(|end| end.to_rfc3339()),
+        energy_added_kwh: row.energy_added_kwh,
+        duration_s: row.duration_s,
+        cost: row.cost,
+        is_dc: row.is_dc,
+        charger_type: row.charger_type.as_deref(),
+        max_power_kw: row.max_power_kw,
+        start_battery_level: row.start_battery_level,
+        end_battery_level: row.end_battery_level,
+        source: &row.source,
+        address: row.address.as_deref(),
+        geofence: row.geofence.as_deref(),
+    });
+    element(
+        "tl-charge-row",
+        &[
+            ("href", href.as_str()),
+            ("locale", "fr"),
+            ("time-zone", zone.as_str()),
+        ],
+        Some(&json),
+        html! {},
+    )
 }
 
 pub(super) async fn charges_csv(
@@ -1151,112 +1139,112 @@ pub(super) async fn charge_detail(
     );
     let csrf = &page.csrf;
     let body = html! {
-        (toolbar(&chrome, &title))
-        (vehicle_tabs(&chrome))
-        div class="detail" role="tabpanel" aria-labelledby="tab-charges" {
-            @if let Some(payload) = &charge_map {
-                section class="card route-card" aria-label="Lieu" {
-                    div class="map-frame map-stage" {
-                        div class="basemap" data-map=(payload) role="application" aria-label="Lieu de la charge" {}
-                        p class="map-credit" {
-                            a href="https://openfreemap.org/" { "OpenFreeMap" }
-                            " © "
-                            a href="https://openmaptiles.org/" { "OpenMapTiles" }
-                            " · données "
-                            a href="https://www.openstreetmap.org/copyright" { "OpenStreetMap" }
-                        }
-                    }
-                }
-            }
-            div class="detail-head" {
-                a class="text-link back-inline" href=(format!("/v/{id}/charges")) { "← Retour à la liste" }
-                p class="eyebrow" {
-                    (when)
-                    @if dc { " · " span class="chip dc" { "DC" } }
-                }
-                @if let Some(detail) = place.as_ref().and_then(|place| place.detail.as_ref()) {
-                    p class="muted" { (detail) }
-                }
-            }
-            section class="card charge-hero" aria-labelledby="charge-metrics" {
-                h2 id="charge-metrics" class="visually-hidden" { "Mesures" }
-                div class="charge-soc" {
-                    span class="hero-figure" { (battery_span(charge.start_battery_level, charge.end_battery_level)) }
-                    (viz::soc_bar(charge.start_battery_level, charge.end_battery_level))
-                }
-                dl class="metrics" {
-                    @for (label, value) in &metrics {
-                        div { dt { (label) } dd { (value) } }
-                    }
-                }
-                @if let Some(note) = &charge.note {
-                    p class="note" { (note) }
-                }
-            }
-            section class="card charts" aria-labelledby="charge-charts" data-sync-root=(sync) {
-                div class="card-head" {
-                    h2 id="charge-charts" { "Courbes" }
-                    p class="hint chart-hint" { "Survolez pour lire, faites glisser pour zoomer." }
-                }
-                @if sampled.len() < 2 {
-                    p class="muted" { "Pas assez de points." }
-                } @else {
-                    @if curve.len() >= 2 {
-                        (viz::line_figure(
-                            "Courbe de charge",
-                            "Puissance selon le niveau de batterie",
-                            None,
-                            &LineChart {
-                                kind: "line",
-                                x: &curve_axis,
-                                t: &curve_t,
-                                series: vec![series("Puissance", "kW", 1, "green", curve.iter().map(|point| Some(point.1)).collect(), true, false)],
-                            },
-                        ))
-                    }
-                    (viz::line_figure("Puissance", &power_summary(&power), Some(&sync), &LineChart { kind: "line", x: &axis, t: &t, series: vec![series("Puissance", "kW", 1, "green", power, true, false)] }))
-                    (viz::line_figure("Niveau de batterie", &range_summary(&soc, "%", 0), Some(&sync), &LineChart { kind: "line", x: &axis, t: &t, series: vec![series("Batterie", "%", 0, "accent", soc, true, false)] }))
-                    @if voltage.iter().filter(|value| value.is_some()).count() >= 2 {
-                        (viz::line_figure("Tension", &range_summary(&voltage, "V", 0), Some(&sync), &LineChart { kind: "line", x: &axis, t: &t, series: vec![series("Tension", "V", 0, "amber", voltage, false, false)] }))
-                    }
-                }
-            }
-            details class="card edit" {
-                summary { "Modifier cette charge" }
-                div class="edit-grid" {
-                    form class="stack" method="post" action=(format!("/v/{id}/charges/{charge_id}/edit")) {
-                        h3 { "Détails" }
-                        input type="hidden" name="csrf" value=(csrf);
-                        label class="field" for="cost" { "Coût" input id="cost" name="cost" inputmode="decimal" value=[charge.cost.map(|cost| format!("{cost:.2}"))]; }
-                        label class="field" for="is_dc" {
-                            "Courant"
-                            select id="is_dc" name="is_dc" {
-                                option value="" selected[charge.is_dc.is_none()] { "Inconnu" }
-                                option value="ac" selected[charge.is_dc == Some(false)] { "AC" }
-                                option value="dc" selected[charge.is_dc == Some(true)] { "DC" }
+            (toolbar(&chrome, &title))
+            (vehicle_tabs(&chrome))
+            div class="detail" role="tabpanel" aria-labelledby="tab-charges" {
+                @if let Some(payload) = &charge_map {
+                    section class="card route-card" aria-label="Lieu" {
+                        div class="map-frame map-stage" {
+                            div class="basemap" data-map=(payload) role="application" aria-label="Lieu de la charge" {}
+                            p class="map-credit" {
+                                a href="https://openfreemap.org/" { "OpenFreeMap" }
+                                " © "
+                                a href="https://openmaptiles.org/" { "OpenMapTiles" }
+                                " · données "
+                                a href="https://www.openstreetmap.org/copyright" { "OpenStreetMap" }
                             }
                         }
-                        label class="field" for="charger_type" { "Borne" input id="charger_type" name="charger_type" value=[charge.charger_type.as_deref()]; }
-                        label class="field" for="geofence_id" { "Géofence (id, 0 pour vider)" input id="geofence_id" name="geofence_id" inputmode="numeric"; }
-                        label class="field" for="charge-note" { "Note" input id="charge-note" name="note" value=[charge.note.as_deref()]; }
-                        button type="submit" { "Enregistrer" }
                     }
-                    div class="stack danger-zone" {
-                        h3 { "Zone sensible" }
-                        p class="hint" { "Charge n° " (charge.id) " · source " (charge.source) }
-                        form method="post" action=(format!("/v/{id}/charges/{charge_id}/trash")) {
+                }
+                div class="detail-head" {
+                    a class="text-link back-inline" href=(format!("/v/{id}/charges")) { "← Retour à la liste" }
+                    p class="eyebrow" {
+                        (when)
+                        @if dc { " · " span class="chip dc" { "DC" } }
+                    }
+                    @if let Some(detail) = place.as_ref().and_then(|place| place.detail.as_ref()) {
+                        p class="muted" { (detail) }
+                    }
+                }
+                section class="card charge-hero" aria-labelledby="charge-metrics" {
+                    h2 id="charge-metrics" class="visually-hidden" { "Mesures" }
+                    div class="charge-soc" {
+                        span class="hero-figure" { (battery_span(charge.start_battery_level, charge.end_battery_level)) }
+                        (viz::soc_bar(charge.start_battery_level, charge.end_battery_level))
+                    }
+                    dl class="metrics" {
+                        @for (label, value) in &metrics {
+                            div { dt { (label) } dd { (value) } }
+                        }
+                    }
+                    @if let Some(note) = &charge.note {
+                        p class="note" { (note) }
+                    }
+                }
+                section class="card charts" aria-labelledby="charge-charts" data-sync-root=(sync) {
+                    div class="card-head" {
+                        h2 id="charge-charts" { "Courbes" }
+                        p class="hint chart-hint" { "Survolez pour lire, faites glisser pour zoomer." }
+                    }
+                    @if sampled.len() < 2 {
+                        p class="muted" { "Pas assez de points." }
+                    } @else {
+                        @if curve.len() >= 2 {
+                            (viz::line_figure(
+                                "Courbe de charge",
+                                "Puissance selon le niveau de batterie",
+                                None,
+                                &LineChart {
+                                    kind: "line",
+                                    x: &curve_axis,
+                                    t: &curve_t,
+                                    series: vec![series("Puissance", "kW", 1, "green", curve.iter().map(|point| Some(point.1)).collect(), true, false)],
+                                },
+                            ))
+                        }
+                        (viz::line_figure("Puissance", &power_summary(&power), Some(&sync), &LineChart { kind: "line", x: &axis, t: &t, series: vec![series("Puissance", "kW", 1, "green", power, true, false)] }))
+                        (viz::line_figure("Niveau de batterie", &range_summary(&soc, "%", 0), Some(&sync), &LineChart { kind: "line", x: &axis, t: &t, series: vec![series("Batterie", "%", 0, "accent", soc, true, false)] }))
+                        @if voltage.iter().filter(|value| value.is_some()).count() >= 2 {
+                            (viz::line_figure("Tension", &range_summary(&voltage, "V", 0), Some(&sync), &LineChart { kind: "line", x: &axis, t: &t, series: vec![series("Tension", "V", 0, "amber", voltage, false, false)] }))
+                        }
+                    }
+                }
+                details class="card edit" {
+                    summary { "Modifier cette charge" }
+                    div class="edit-grid" {
+                        form class="stack" method="post" action=(format!("/v/{id}/charges/{charge_id}/edit")) {
+                            h3 { "Détails" }
                             input type="hidden" name="csrf" value=(csrf);
-                            button class="danger" type="submit" { "Mettre à la corbeille" }
+                            label class="field" for="cost" { "Coût" input id="cost" name="cost" inputmode="decimal" value=[charge.cost.map(|cost| format!("{cost:.2}"))]; }
+                            label class="field" for="is_dc" {
+                                "Courant"
+                                select id="is_dc" name="is_dc" {
+                                    option value="" selected[charge.is_dc.is_none()] { "Inconnu" }
+                                    option value="ac" selected[charge.is_dc == Some(false)] { "AC" }
+                                    option value="dc" selected[charge.is_dc == Some(true)] { "DC" }
+                                }
+                            }
+                            label class="field" for="charger_type" { "Borne" input id="charger_type" name="charger_type" value=[charge.charger_type.as_deref()]; }
+                            label class="field" for="geofence_id" { "Géofence (id, 0 pour vider)" input id="geofence_id" name="geofence_id" inputmode="numeric"; }
+                            label class="field" for="charge-note" { "Note" input id="charge-note" name="note" value=[charge.note.as_deref()]; }
+                            button type="submit" { "Enregistrer" }
+                        }
+                        div class="stack danger-zone" {
+                            h3 { "Zone sensible" }
+                            p class="hint" { "Charge n° " (charge.id) " · source " (charge.source) }
+                            form method="post" action=(format!("/v/{id}/charges/{charge_id}/trash")) {
+                                input type="hidden" name="csrf" value=(csrf);
+                                button class="danger" type="submit" { "Mettre à la corbeille" }
+                            }
                         }
                     }
                 }
             }
-        }
-        link rel="stylesheet" href="/static/maplibre-gl.css";
-        script src="/static/maplibre-gl-csp.js" defer {}
-        script src="/static/map.js" defer {}
-        script src="/static/charts.js" defer {}
-    };
+    link rel="stylesheet" href="/static/maplibre-gl.css";
+            script src="/static/maplibre-gl-csp.js" defer {}
+            script src="/static/map.js" defer {}
+            script type="module" src="/static/charts.js" {}
+        };
     html_page(document(false, body), page.cookie)
 }
 
@@ -1568,16 +1556,38 @@ async fn charge_totals(
     ]
 }
 
+#[derive(Serialize)]
+struct TotalJson<'a> {
+    label: &'a str,
+    value: &'a str,
+}
+
+#[derive(Serialize)]
+struct Chip<'a> {
+    id: &'a str,
+    label: &'a str,
+    href: String,
+    current: bool,
+}
+
 fn summary_strip(totals: &[(&'static str, String)]) -> Markup {
-    html! {
-        @if !totals.is_empty() {
-            dl class="metrics summary" aria-label="Totaux de la sélection" {
-                @for (label, value) in totals {
-                    div { dt { (label) } dd { (value) } }
-                }
-            }
-        }
+    if totals.is_empty() {
+        return html! {};
     }
+    let items: Vec<TotalJson<'_>> = totals
+        .iter()
+        .map(|(label, value)| TotalJson { label, value })
+        .collect();
+    element(
+        "tl-summary-strip",
+        &[
+            ("label", "Totaux de la sélection"),
+            ("variant", "strip"),
+            ("locale", "fr"),
+        ],
+        Some(&to_json(&items)),
+        html! {},
+    )
 }
 
 fn sort_name(sort: Sort) -> &'static str {
@@ -1705,23 +1715,29 @@ fn list_toolbar(id: i64, kind: Kind, query: &ListQuery, tz: Tz) -> Markup {
     } else {
         format!("/v/{id}/{}.csv?{}", kind.path(), encode(&csv_pairs))
     };
+    let mut chips: Vec<Chip<'_>> = ranges
+        .iter()
+        .map(|&(label, from)| {
+            let value = from.format("%Y-%m-%d").to_string();
+            let current = quick && current_from == value;
+            Chip {
+                id: label,
+                label,
+                href: list_href(id, kind, &[("from", value)]),
+                current,
+            }
+        })
+        .collect();
+    chips.push(Chip {
+        id: "all",
+        label: "Tout",
+        href: list_href(id, kind, &[]),
+        current: quick && current_from.is_empty(),
+    });
+    let chips_json = to_json(&chips);
     html! {
         div class="list-toolbar" {
-            nav class="segmented" aria-label="Période" {
-                @for (label, from) in ranges {
-                    @let value = from.format("%Y-%m-%d").to_string();
-                    @if quick && current_from == value {
-                        a href=(list_href(id, kind, &[("from", value.clone())])) aria-current="page" { (label) }
-                    } @else {
-                        a href=(list_href(id, kind, &[("from", value.clone())])) { (label) }
-                    }
-                }
-                @if quick && current_from.is_empty() {
-                    a href=(list_href(id, kind, &[])) aria-current="page" { "Tout" }
-                } @else {
-                    a href=(list_href(id, kind, &[])) { "Tout" }
-                }
-            }
+            (element("tl-period-chips", &[("label", "Période")], Some(&chips_json), html! {}))
             a class="button ghost small" href=(csv) download { "Exporter en CSV" }
         }
         details class="filters-panel" open[advanced] {
@@ -1838,8 +1854,8 @@ mod tests {
             &cookie,
         )
         .await;
-        assert!(first.contains("datetime=\"2024-06-01T11:00:00+00:00\""));
-        assert!(first.contains("datetime=\"2024-06-01T10:00:00+00:00\""));
+        assert!(first.contains("2024-06-01T11:00:00+00:00"));
+        assert!(first.contains("2024-06-01T10:00:00+00:00"));
         assert!(first.contains("Samedi 1 juin 2024"));
         assert!(first.contains("<main class=\"shell\">"));
         let zero = get(
@@ -1848,8 +1864,8 @@ mod tests {
             &cookie,
         )
         .await;
-        assert!(zero.contains("datetime=\"2024-06-01T10:00:00+00:00\""));
-        assert!(!zero.contains("datetime=\"2024-06-01T11:00:00+00:00\""));
+        assert!(zero.contains("2024-06-01T10:00:00+00:00"));
+        assert!(!zero.contains("2024-06-01T11:00:00+00:00"));
         assert!(zero.contains("<option value=\"zero_km\" selected>"));
         let later: (i64,) =
             sqlx::query_as("SELECT id FROM drives WHERE vehicle_id = $1 AND distance_km = 12")
@@ -2025,8 +2041,8 @@ mod tests {
             .unwrap();
         let cookie = format!("__Host-tl_session={}", issued.id);
         let drives = get(&state, &format!("/v/{}/drives", vehicle.0), &cookie).await;
-        assert!(drives.contains(">Fixture Bay<"));
-        assert!(drives.contains("title=\"Fixture Origin\""));
+        assert!(drives.contains("Fixture Bay"));
+        assert!(drives.contains("Fixture Origin"));
         let detail = get(
             &state,
             &format!("/v/{}/drives/{}", vehicle.0, drive.0),
