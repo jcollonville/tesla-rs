@@ -236,6 +236,8 @@ Optional:
 | `POLL_BACKOFF_SECS` | `720` | Poll interval after a backoff |
 | `POLL_PARKED_LIVE_LIMIT` | `2` | Live `vehicle_data` reads while parked |
 | `POLL_GPS_FALLBACK_SECS` | `300` | Drive GPS poll interval when the Owner stream is down or silent |
+| `DRIVE_END_GRACE_SECS` | `300` | Keep one drive open across a signal gap, asleep, offline, or incomplete poll until this long after the last driving evidence. 30–1800. Must be at least `DRIVE_PARK_GRACE_SECS` |
+| `DRIVE_PARK_GRACE_SECS` | `90` | Close a drive this long after a confirmed park (shift P and speed about 0). 15–900 |
 | `NOMINATIM_ENABLED` | `true` | Reverse geocoding. The URL must be `https` when enabled |
 | `NOMINATIM_URL` | `https://nominatim.openstreetmap.org` | Nominatim base URL |
 | `NOMINATIM_CONTACT` | unset | Included in the User-Agent: `tesla-logger/0.1 (self-hosted; …)` |

@@ -126,6 +126,26 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
         )
         .await;
     });
+    let grace_state = state.clone();
+    let mut grace_rx = shutdown_rx.clone();
+    let grace_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                changed = grace_rx.changed() => {
+                    if changed.is_err() || *grace_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = tick.tick() => {
+                    if let Err(err) = ingest::expire_drives(&grace_state.inner.archive, chrono::Utc::now()).await {
+                        tracing::warn!(error = %err, "drive grace tick failed");
+                    }
+                }
+            }
+        }
+    });
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(%listen, "listening");
     axum::serve(listener, http::router(state))
@@ -139,6 +159,7 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
     let _ = telemetry_task.await;
     let _ = mqtt_task.await;
     let _ = owner_task.await;
+    let _ = grace_task.await;
     Ok(())
 }
 
@@ -187,6 +208,10 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
     let mut archive = Archive::new(db.clone(), geocoder, events.clone(), stream_kick, gps);
     archive.fleet_account_id = Some(imported.fleet_id);
     archive.owner_account_id = Some(imported.owner_id);
+    archive.drive_grace = crate::state::DriveGrace::from_secs(
+        config.drive_end_grace.as_secs(),
+        config.drive_park_grace.as_secs(),
+    );
     let archive = Arc::new(archive);
     let car_renders = CarRenders::from_config(&config);
     let basemap = Basemap::from_config(&config);

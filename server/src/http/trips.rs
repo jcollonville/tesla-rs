@@ -165,6 +165,11 @@ pub(super) async fn drives(
         (vehicle_tabs(&chrome))
         div id="panel-drives" role="tabpanel" aria-labelledby="tab-drives" {
             (list_toolbar(id, Kind::Drives, &query, tz))
+            p class="muted" {
+                a class="text-link" href=(format!("/v/{id}/drives/split-candidates")) {
+                    "Trajets peut-être coupés"
+                }
+            }
             (summary_strip(&totals))
             @if shown.is_empty() {
                 section class="card empty-state" {
@@ -183,6 +188,113 @@ pub(super) async fn drives(
         }
     };
     html_page(document(false, body), page.cookie)
+}
+
+/// Read-only list of drives that look split by a short moving gap.
+pub(super) async fn split_candidates_page(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    let Some(opened) = open_vehicle(&app, &headers, id).await else {
+        return Redirect::to("/").into_response();
+    };
+    let page = match opened {
+        Ok(page) => page,
+        Err(response) => return response,
+    };
+    let tz = format::zone(&app, Some(id)).await;
+    let grace_secs = i64::try_from(app.inner.config.drive_end_grace.as_secs()).unwrap_or(300);
+    let rows = match crate::persist::split_candidates(&app.inner.db, id, grace_secs).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(error = %err, "split candidate list failed");
+            Vec::new()
+        }
+    };
+    let chrome = chrome(
+        &page,
+        Some(id),
+        Some(VehicleTab::Drives),
+        GlobalTab::None,
+        false,
+    );
+    let csrf = page.csrf.clone();
+    let body = html! {
+        (toolbar(&chrome, "Trajets peut-être coupés"))
+        (vehicle_tabs(&chrome))
+        div role="tabpanel" aria-labelledby="tab-drives" {
+            p class="muted" {
+                a class="text-link back-inline" href=(format!("/v/{id}/drives")) { "← Retour à la liste" }
+            }
+            section class="card" {
+                h2 { "Trajets peut-être coupés" }
+                p class="muted" {
+                    "Lecture seule. Écart plus court que "
+                    (grace_secs)
+                    " s, sans charge entre les deux, et du mouvement pendant l'écart. Rien n'est fusionné automatiquement."
+                }
+                @if rows.is_empty() {
+                    p { "Aucun candidat." }
+                } @else {
+                    ul class="list" {
+                        @for row in &rows {
+                            li {
+                                span {
+                                    (format::moment(row.earlier_start, tz))
+                                    " – "
+                                    (format::clock(row.earlier_end, tz))
+                                    " · "
+                                    (format::moment(row.later_start, tz))
+                                    " – "
+                                    (format::clock(row.later_end, tz))
+                                    " · écart "
+                                    (format::duration(Some(row.gap_secs)))
+                                    " · "
+                                    (gap_distance_label(row.gap_m))
+                                    " · compteur "
+                                    (odometer_delta_label(row.odometer_delta_km))
+                                }
+                                span class="row" {
+                                    a class="text-link" href=(format!("/v/{id}/drives/{}", row.earlier_id)) {
+                                        "Ouvrir"
+                                    }
+                                    form method="post" action=(format!("/v/{id}/drives/{}/merge", row.earlier_id)) {
+                                        input type="hidden" name="csrf" value=(&csrf);
+                                        input type="hidden" name="other" value=(row.later_id);
+                                        button class="tonal" type="submit" { "Fusionner" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    html_page(document(false, body), page.cookie)
+}
+
+fn gap_distance_label(metres: Option<f64>) -> String {
+    let Some(metres) = metres.filter(|metres| metres.is_finite() && *metres >= 0.0) else {
+        return "—".to_owned();
+    };
+    if metres < 50.0 {
+        return format!("< 50{}m", format::NNBSP);
+    }
+    if metres < 1_000.0 {
+        let rounded = (metres / 10.0).round() * 10.0;
+        return format!("{}{}m", format::number(rounded, 0), format::NNBSP);
+    }
+    format::km(Some(metres / 1_000.0))
+}
+
+fn odometer_delta_label(delta_km: Option<f64>) -> String {
+    let Some(delta) = delta_km.filter(|delta| delta.is_finite()) else {
+        return "—".to_owned();
+    };
+    let sign = if delta > 0.0 { "+" } else { "" };
+    format!("{sign}{}", format::unit(Some(delta), 2, "km"))
 }
 
 fn day_title(day: Option<NaiveDate>, today: NaiveDate, sort: Sort) -> String {
@@ -1953,6 +2065,113 @@ mod tests {
         assert!(charge_page.contains("0.02870"));
         assert!(charge_page.contains("0.04120"));
         assert!(!charge_page.contains("tiles.openfreemap.org"));
+    }
+
+    #[tokio::test]
+    async fn split_candidates_list_a_short_moving_gap_without_coordinates() {
+        let Some(db) = crate::test_util::TestDb::migrated("splits").await else {
+            return;
+        };
+        let state = crate::app::test_state(db.pool.clone()).await;
+        let vehicle: (i64,) = sqlx::query_as(
+            "INSERT INTO vehicles (vin, name) VALUES ('5YJ30000000000077', 'Liste') RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let earlier: (i64,) = sqlx::query_as(
+            "INSERT INTO drives (
+                vehicle_id, start_at, end_at, start_odometer_km, end_odometer_km,
+                end_latitude, end_longitude, source
+             ) VALUES ($1, '2024-08-01T12:30:00Z', '2024-08-01T12:42:00Z', 90, 100, 10, 20, 'poll')
+             RETURNING id",
+        )
+        .bind(vehicle.0)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let later: (i64,) = sqlx::query_as(
+            "INSERT INTO drives (
+                vehicle_id, start_at, end_at, start_odometer_km, end_odometer_km,
+                start_latitude, start_longitude, source
+             ) VALUES ($1, '2024-08-01T12:42:10Z', '2024-08-01T13:00:00Z', 100.18, 110, 10.0016, 20, 'poll')
+             RETURNING id",
+        )
+        .bind(vehicle.0)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO positions (vehicle_id, recorded_at, latitude, longitude, speed_kmh, odometer_km, shift_state, drive_id, source)
+             VALUES
+               ($1, '2024-08-01T12:42:00Z', 10, 20, 61, 100, 'D', $2, 'poll'),
+               ($1, '2024-08-01T12:42:10Z', 10.0016, 20, 71, 100.18, 'D', $3, 'poll')",
+        )
+        .bind(vehicle.0)
+        .bind(earlier.0)
+        .bind(later.0)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let stopped: (i64,) = sqlx::query_as(
+            "INSERT INTO drives (
+                vehicle_id, start_at, end_at, end_odometer_km, end_latitude, end_longitude, source
+             ) VALUES ($1, '2024-08-02T08:00:00Z', '2024-08-02T08:10:00Z', 50, 10, 20, 'poll')
+             RETURNING id",
+        )
+        .bind(vehicle.0)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let departed: (i64,) = sqlx::query_as(
+            "INSERT INTO drives (
+                vehicle_id, start_at, end_at, start_odometer_km, start_latitude, start_longitude, source
+             ) VALUES ($1, '2024-08-02T08:13:24Z', '2024-08-02T08:20:00Z', 50, 10, 20, 'poll')
+             RETURNING id",
+        )
+        .bind(vehicle.0)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO positions (vehicle_id, recorded_at, latitude, longitude, speed_kmh, odometer_km, shift_state, drive_id, source)
+             VALUES
+               ($1, '2024-08-02T08:10:00Z', 10, 20, 0, 50, 'P', $2, 'poll'),
+               ($1, '2024-08-02T08:13:24Z', 10, 20, 30, 50, 'D', $3, 'poll')",
+        )
+        .bind(vehicle.0)
+        .bind(stopped.0)
+        .bind(departed.0)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let login = crate::identity::login(&state, "admin", "test-password", "", "127.0.0.1")
+            .await
+            .unwrap();
+        let crate::identity::LoginResult::Session(issued) = login else {
+            panic!("session");
+        };
+        sqlx::query("UPDATE users SET must_change_password = false, totp_enabled = true")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let cookie = format!("__Host-tl_session={}", issued.id);
+        let list = get(&state, &format!("/v/{}/drives", vehicle.0), &cookie).await;
+        assert!(list.contains("Trajets peut-être coupés"));
+        let page = get(
+            &state,
+            &format!("/v/{}/drives/split-candidates", vehicle.0),
+            &cookie,
+        )
+        .await;
+        assert!(page.contains("Fusionner"));
+        assert!(page.contains("180"));
+        assert!(page.contains("0,18"));
+        assert!(page.contains(&format!("/v/{}/drives/{}/merge", vehicle.0, earlier.0)));
+        assert!(!page.contains("10.0016"));
+        assert!(!page.contains("latitude"));
+        assert!(!page.contains("2024-08-02T08:10"));
+        assert_eq!(page.matches("Fusionner").count(), 1);
     }
 
     #[tokio::test]

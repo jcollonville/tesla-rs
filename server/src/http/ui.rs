@@ -30,6 +30,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/v/{id}", get(overview))
         .route("/v/{id}/car.png", get(super::render::car_png))
         .route("/v/{id}/drives", get(super::trips::drives))
+        .route(
+            "/v/{id}/drives/split-candidates",
+            get(super::trips::split_candidates_page),
+        )
         .route("/v/{id}/drives.csv", get(super::trips::drives_csv))
         .route("/v/{id}/drives/{drive_id}", get(super::trips::drive_detail))
         .route("/v/{id}/charges", get(super::trips::charges))

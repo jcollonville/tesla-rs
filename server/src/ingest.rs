@@ -162,6 +162,8 @@ pub(crate) struct Archive {
     /// 429 pause deadlines keyed by Tesla account id.
     pub account_backoff: Arc<Mutex<HashMap<i64, Instant>>>,
     pub fences: crate::persist::FenceCache,
+    /// How long an open drive survives a gap or a confirmed park.
+    pub drive_grace: crate::state::DriveGrace,
 }
 
 impl Archive {
@@ -183,6 +185,7 @@ impl Archive {
             owner_account_id: None,
             account_backoff: Arc::new(Mutex::new(HashMap::new())),
             fences: crate::persist::FenceCache::default(),
+            drive_grace: crate::state::DriveGrace::standard(),
         }
     }
 }
@@ -241,7 +244,8 @@ async fn ensure_runtime(
     if let Some(slot) = archive.runtimes.lock().await.get(vin).cloned() {
         return Ok(slot);
     }
-    let loaded = load_runtime(&archive.db, vehicle_id, vin).await?;
+    let mut loaded = load_runtime(&archive.db, vehicle_id, vin).await?;
+    loaded.drive_grace = archive.drive_grace;
     let mut guard = archive.runtimes.lock().await;
     Ok(Arc::clone(
         guard
@@ -299,6 +303,44 @@ async fn write_stream(
         )
         .await?
     };
+    crate::persist::settle_addresses(&archive.db, &archive.geocoder, jobs).await;
+    Ok(())
+}
+
+/// Closes open drives whose grace elapsed with no new driving evidence.
+///
+/// The clock comes from stored positions, so this still runs after a restart.
+pub(crate) async fn expire_drives(
+    archive: &Archive,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), AppError> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT d.vehicle_id, v.vin
+         FROM drives d
+         JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE d.end_at IS NULL
+           AND d.deleted_at IS NULL
+           AND d.source IN ('poll', 'stream')",
+    )
+    .fetch_all(&archive.db)
+    .await?;
+    let fences = archive.fences.get(&archive.db).await?;
+    let mut jobs = Vec::new();
+    for (vehicle_id, vin) in rows {
+        let slot = ensure_runtime(archive, &vin, vehicle_id).await?;
+        let mut runtime = slot.lock().await;
+        runtime.drive_grace = archive.drive_grace;
+        let due = crate::persist::close_drive_if_due(
+            &archive.db,
+            &mut runtime,
+            now,
+            &fences,
+            &archive.events,
+        )
+        .await?;
+        jobs.extend(due);
+    }
+    drop(fences);
     crate::persist::settle_addresses(&archive.db, &archive.geocoder, jobs).await;
     Ok(())
 }
