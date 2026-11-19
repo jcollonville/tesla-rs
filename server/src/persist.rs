@@ -9,10 +9,12 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::error::{AppError, redact_secrets};
 use crate::geocode::{Geocoder, cache_key};
-use crate::geofence::{Fence, matching_geofence};
+use crate::geofence::{Fence, haversine_m, matching_geofence};
 use crate::state::{
-    Activity, ClosedDrive, DriveSummary, Observation, Presence, Sample, Tracker, Transition,
-    gate_stream_sample, keep_closed_drive, soc_level, summarize_charge, summarize_drive,
+    Activity, ClosePlan, ClosedDrive, DriveClock, DriveGrace, DriveMotion, DriveSummary, GapFacts,
+    Observation, PositionCue, Presence, Sample, Tracker, Transition, clock_from_tail,
+    gate_stream_sample, keep_closed_drive, merge_clock, observation_motion, plan_drive_close,
+    should_reopen_drive, soc_level, summarize_charge, summarize_drive,
 };
 
 /// Identity fields learned from a vehicle list response.
@@ -43,6 +45,13 @@ pub(crate) struct Runtime {
     pub next_due: tokio::time::Instant,
     /// Newest drive this vehicle has finished. Late stream samples join it.
     pub last_closed_drive: Option<ClosedDrive>,
+    /// When the open drive last showed driving, and when a confirmed park began.
+    ///
+    /// Rebuilt from position timestamps on load. Not the only copy: the grace tick
+    /// reads the rows again.
+    pub drive_clock: Option<DriveClock>,
+    /// Signal-loss and park windows for this process.
+    pub drive_grace: DriveGrace,
 }
 
 /// Push payload for the read API websocket and the MQTT publisher.
@@ -347,6 +356,11 @@ pub(crate) async fn load_runtime(
             start_at,
             end_at,
         }),
+        drive_clock: match row.drive_id {
+            Some(drive_id) => Some(load_drive_clock(pool, drive_id).await?.0),
+            None => None,
+        },
+        drive_grace: DriveGrace::standard(),
     })
 }
 
@@ -435,12 +449,14 @@ pub(crate) async fn apply_observation(
     live: bool,
     store_position: bool,
 ) -> Result<Vec<AddressJob>, AppError> {
+    let grace = runtime.drive_grace;
     let previous = runtime.tracker.clone();
-    let (next, transitions) = crate::state::reduce(&previous, obs);
+    let (mut next, transitions) = crate::state::reduce(&previous, obs);
     let starting_drive = transitions.contains(&Transition::DriveStarted);
-    let ending_drive = transitions.contains(&Transition::DriveEnded);
+    let mut ending_drive = transitions.contains(&Transition::DriveEnded);
     let starting_charge = transitions.contains(&Transition::ChargeStarted);
     let ending_charge = transitions.contains(&Transition::ChargeEnded);
+    let motion = observation_motion(obs);
 
     let mut tx = pool.begin().await?;
     let fence_id = obs
@@ -450,10 +466,30 @@ pub(crate) async fn apply_observation(
 
     let mut created_drive = false;
     if starting_drive {
-        let (drive_id, created) =
-            insert_drive(&mut tx, runtime.vehicle_id, obs, fence_id, "poll").await?;
-        runtime.open_drive_id = Some(drive_id);
-        created_drive = created;
+        if let Some(drive_id) = try_reopen_drive(&mut tx, runtime.vehicle_id, obs, grace).await? {
+            runtime.open_drive_id = Some(drive_id);
+            runtime.drive_clock = Some(DriveClock {
+                last_driving_at: obs.at,
+                park_since: None,
+            });
+            if runtime
+                .last_closed_drive
+                .is_some_and(|closed| closed.id == drive_id)
+            {
+                runtime.last_closed_drive = None;
+            }
+        } else {
+            let (drive_id, created) =
+                insert_drive(&mut tx, runtime.vehicle_id, obs, fence_id, "poll").await?;
+            runtime.open_drive_id = Some(drive_id);
+            created_drive = created;
+            if created {
+                runtime.drive_clock = Some(DriveClock {
+                    last_driving_at: obs.at,
+                    park_since: None,
+                });
+            }
+        }
     }
     if starting_charge {
         runtime.open_charge_id =
@@ -509,6 +545,28 @@ pub(crate) async fn apply_observation(
     if created_drive && let Some(drive_id) = runtime.open_drive_id {
         push_address(&mut address_jobs, Some(drive_id), None, "start", obs);
     }
+    if !ending_drive && (previous.drive_open || starting_drive) {
+        let clock = match runtime.drive_clock {
+            Some(clock) => clock,
+            None => match runtime.open_drive_id {
+                Some(drive_id) => load_drive_clock(&mut *tx, drive_id).await?.0,
+                None => DriveClock {
+                    last_driving_at: obs.at,
+                    park_since: None,
+                },
+            },
+        };
+        match plan_drive_close(motion, obs.at, clock, grace) {
+            ClosePlan::Continue { clock } | ClosePlan::Wait { clock, .. } => {
+                runtime.drive_clock = Some(clock);
+            }
+            ClosePlan::Close { .. } => {
+                ending_drive = true;
+                next.drive_open = false;
+                runtime.drive_clock = None;
+            }
+        }
+    }
     if ending_drive && let Some(drive_id) = runtime.open_drive_id {
         if let Some(closed) = close_drive(
             &mut tx,
@@ -524,6 +582,8 @@ pub(crate) async fn apply_observation(
             remember_closed(&mut runtime.last_closed_drive, closed);
         }
         runtime.open_drive_id = None;
+        runtime.drive_clock = None;
+        next.drive_open = false;
     }
     if ending_charge && let Some(charge_id) = runtime.open_charge_id {
         close_charge(&mut tx, charge_id, obs, fence_id).await?;
@@ -592,6 +652,7 @@ pub(crate) async fn apply_stream_samples(
     fences: &[Fence],
     events: &broadcast::Sender<LiveEvent>,
 ) -> Result<Vec<AddressJob>, AppError> {
+    let grace = runtime.drive_grace;
     if samples.is_empty() {
         return Ok(Vec::new());
     }
@@ -605,12 +666,18 @@ pub(crate) async fn apply_stream_samples(
     let mut address_jobs = Vec::new();
     let mut refresh_closed: Option<i64> = None;
     let mut last_touch: Option<(Activity, Observation)> = None;
+    let mut drive_clock = runtime.drive_clock;
     let now = Utc::now();
 
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL synchronous_commit = off")
         .execute(&mut *tx)
         .await?;
+    if drive_clock.is_none()
+        && let Some(drive_id) = open_drive_id
+    {
+        drive_clock = Some(load_drive_clock(&mut *tx, drive_id).await?.0);
+    }
 
     for sample in samples {
         let gate = gate_stream_sample(sample.at, now, last_closed);
@@ -662,12 +729,30 @@ pub(crate) async fn apply_stream_samples(
             charge_open = false;
         }
         if decision.start_drive {
-            let (drive_id, created) =
-                insert_drive(&mut tx, runtime.vehicle_id, &obs, fence_id, "stream").await?;
-            open_drive_id = Some(drive_id);
-            drive_open = true;
-            if created {
-                push_address(&mut address_jobs, open_drive_id, None, "start", &obs);
+            if let Some(drive_id) =
+                try_reopen_drive(&mut tx, runtime.vehicle_id, &obs, grace).await?
+            {
+                open_drive_id = Some(drive_id);
+                drive_open = true;
+                drive_clock = Some(DriveClock {
+                    last_driving_at: obs.at,
+                    park_since: None,
+                });
+                if last_closed.is_some_and(|closed| closed.id == drive_id) {
+                    last_closed = None;
+                }
+            } else {
+                let (drive_id, created) =
+                    insert_drive(&mut tx, runtime.vehicle_id, &obs, fence_id, "stream").await?;
+                open_drive_id = Some(drive_id);
+                drive_open = true;
+                if created {
+                    drive_clock = Some(DriveClock {
+                        last_driving_at: obs.at,
+                        park_since: None,
+                    });
+                    push_address(&mut address_jobs, open_drive_id, None, "start", &obs);
+                }
             }
         }
         let attach_drive = if drive_open { open_drive_id } else { None };
@@ -676,7 +761,7 @@ pub(crate) async fn apply_stream_samples(
             decision.end_drive,
             sample.latitude,
             sample.longitude,
-        );
+        ) || (decision.motion == DriveMotion::Park && drive_open);
         if store {
             let external_id = format!("{}:{}", runtime.vehicle_id, obs.at.timestamp_millis());
             insert_stream_position(
@@ -699,28 +784,43 @@ pub(crate) async fn apply_stream_samples(
             .execute(&mut *tx)
             .await?;
         }
-        if decision.end_drive
-            && let Some(drive_id) = open_drive_id
-        {
-            if let Some(closed) = close_drive(
-                &mut tx,
-                runtime.vehicle_id,
-                drive_id,
-                &obs,
-                runtime.efficiency_kwh_per_km,
-                fence_id,
-            )
-            .await?
-            {
-                push_address(&mut address_jobs, Some(drive_id), None, "end", &obs);
-                remember_closed(&mut last_closed, closed);
+        let mut sample_activity = decision.activity;
+        if drive_open {
+            let clock = drive_clock.unwrap_or(DriveClock {
+                last_driving_at: obs.at,
+                park_since: None,
+            });
+            match plan_drive_close(decision.motion, obs.at, clock, grace) {
+                ClosePlan::Continue { clock } | ClosePlan::Wait { clock, .. } => {
+                    drive_clock = Some(clock);
+                    if matches!(decision.motion, DriveMotion::Driving | DriveMotion::Hold) {
+                        sample_activity = Activity::Driving;
+                    }
+                }
+                ClosePlan::Close { .. } => {
+                    if let Some(drive_id) = open_drive_id
+                        && let Some(closed) = close_drive(
+                            &mut tx,
+                            runtime.vehicle_id,
+                            drive_id,
+                            &obs,
+                            runtime.efficiency_kwh_per_km,
+                            fence_id,
+                        )
+                        .await?
+                    {
+                        push_address(&mut address_jobs, Some(drive_id), None, "end", &obs);
+                        remember_closed(&mut last_closed, closed);
+                    }
+                    open_drive_id = None;
+                    drive_open = false;
+                    drive_clock = None;
+                }
             }
-            open_drive_id = None;
-            drive_open = false;
         }
-        activity = decision.activity;
+        activity = sample_activity;
         published = Some(crate::status::merge_stream(published.as_ref(), &obs));
-        last_touch = Some((decision.activity, obs));
+        last_touch = Some((sample_activity, obs));
     }
 
     if let Some(drive_id) = refresh_closed
@@ -740,6 +840,7 @@ pub(crate) async fn apply_stream_samples(
     runtime.tracker.charge_open = charge_open;
     runtime.tracker.activity = activity;
     runtime.last_closed_drive = last_closed;
+    runtime.drive_clock = drive_clock;
     if let Some(merged) = published {
         runtime.published = Some(merged.clone());
         if last_touch.is_some() {
@@ -777,10 +878,10 @@ async fn insert_stream_position(
             vehicle_id, recorded_at, latitude, longitude, speed_kmh, power_kw, odometer_km,
             elevation_m, battery_level, usable_battery_level, ideal_range_km, rated_range_km,
             est_range_km, inside_temp_c, outside_temp_c, heading_deg, drive_id, charge_id,
-            source, external_id
+            source, external_id, shift_state
          )
          SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, $10, $11, NULL, NULL, $12, $13,
-                NULL, 'stream', $14
+                NULL, 'stream', $14, $15
          WHERE NOT EXISTS (
             SELECT 1 FROM positions
             WHERE vehicle_id = $1
@@ -803,6 +904,7 @@ async fn insert_stream_position(
     .bind(obs.heading_deg)
     .bind(drive_id)
     .bind(external_id)
+    .bind(&obs.shift_state)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -971,9 +1073,11 @@ async fn insert_position(
         "INSERT INTO positions (
             vehicle_id, recorded_at, latitude, longitude, speed_kmh, power_kw, odometer_km,
             elevation_m, battery_level, usable_battery_level, ideal_range_km, rated_range_km,
-            est_range_km, inside_temp_c, outside_temp_c, heading_deg, drive_id, charge_id, source
+            est_range_km, inside_temp_c, outside_temp_c, heading_deg, drive_id, charge_id,
+            source, shift_state
          ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'poll'
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+            'poll', $19
          )
          ON CONFLICT (vehicle_id, recorded_at, source) WHERE source = 'poll' DO NOTHING",
     )
@@ -995,6 +1099,7 @@ async fn insert_position(
     .bind(obs.heading_deg)
     .bind(drive_id)
     .bind(charge_id)
+    .bind(&obs.shift_state)
     .execute(&mut **tx)
     .await?;
     // The poll row is the richer sample. Drop streamed fixes from the same moment
@@ -1040,6 +1145,418 @@ async fn insert_charge_sample(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// Position tail for one drive, newest row first, plus whether that tail is a park.
+async fn load_drive_clock<'c, E>(
+    executor: E,
+    drive_id: i64,
+) -> Result<(DriveClock, DriveMotion), AppError>
+where
+    E: sqlx::Executor<'c, Database = Postgres>,
+{
+    let rows: Vec<ClockCue> = sqlx::query_as(
+        "SELECT d.start_at, p.recorded_at, p.speed_kmh, p.shift_state
+         FROM drives d
+         LEFT JOIN LATERAL (
+             SELECT recorded_at, speed_kmh, shift_state
+             FROM positions
+             WHERE drive_id = d.id
+             ORDER BY recorded_at DESC, id DESC
+             LIMIT 400
+         ) p ON TRUE
+         WHERE d.id = $1",
+    )
+    .bind(drive_id)
+    .fetch_all(executor)
+    .await?;
+    let Some(first) = rows.first() else {
+        return Ok((
+            DriveClock {
+                last_driving_at: Utc::now(),
+                park_since: None,
+            },
+            DriveMotion::Gap,
+        ));
+    };
+    let cues: Vec<PositionCue> = rows
+        .iter()
+        .filter_map(|row| {
+            row.recorded_at.map(|at| PositionCue {
+                at,
+                speed_kmh: row.speed_kmh,
+                shift_state: row.shift_state.clone(),
+            })
+        })
+        .collect();
+    Ok(clock_from_tail(&cues, first.start_at))
+}
+
+#[derive(sqlx::FromRow)]
+struct ClockCue {
+    start_at: DateTime<Utc>,
+    recorded_at: Option<DateTime<Utc>>,
+    speed_kmh: Option<f64>,
+    shift_state: Option<String>,
+}
+
+/// Reopens the previous drive when this departure is the same trip after a short gap.
+async fn try_reopen_drive(
+    tx: &mut Transaction<'_, Postgres>,
+    vehicle_id: i64,
+    obs: &Observation,
+    grace: DriveGrace,
+) -> Result<Option<i64>, AppError> {
+    let grace_secs = i32::try_from(grace.end.num_seconds()).unwrap_or(300);
+    let Some(closed) = sqlx::query_as::<_, ReopenRow>(
+        "SELECT d.id, d.end_at, d.end_odometer_km, d.end_latitude, d.end_longitude,
+                p.speed_kmh AS end_speed_kmh
+         FROM drives d
+         LEFT JOIN LATERAL (
+             SELECT speed_kmh FROM positions
+             WHERE drive_id = d.id
+             ORDER BY recorded_at DESC, id DESC
+             LIMIT 1
+         ) p ON TRUE
+         WHERE d.vehicle_id = $1
+           AND d.deleted_at IS NULL
+           AND d.end_at IS NOT NULL
+           AND d.end_at <= $2
+           AND d.end_at > $2 - make_interval(secs => $3)
+         ORDER BY d.end_at DESC
+         LIMIT 1",
+    )
+    .bind(vehicle_id)
+    .bind(obs.at)
+    .bind(grace_secs)
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let blocked: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (
+             SELECT 1 FROM charges
+             WHERE vehicle_id = $1
+               AND deleted_at IS NULL
+               AND start_at < $3
+               AND COALESCE(end_at, $3) > $2
+         )",
+    )
+    .bind(vehicle_id)
+    .bind(closed.end_at)
+    .bind(obs.at)
+    .fetch_one(&mut **tx)
+    .await?;
+    if blocked.0 {
+        return Ok(None);
+    }
+    let gap_m = obs
+        .latitude
+        .zip(obs.longitude)
+        .zip(closed.end_latitude.zip(closed.end_longitude))
+        .map(|((latitude, longitude), (end_latitude, end_longitude))| {
+            haversine_m(end_latitude, end_longitude, latitude, longitude)
+        });
+    let facts = GapFacts {
+        gap_secs: (obs.at - closed.end_at).num_seconds(),
+        end_speed_kmh: closed.end_speed_kmh,
+        start_speed_kmh: obs.speed_kmh,
+        end_odometer_km: closed.end_odometer_km,
+        start_odometer_km: obs.odometer_km,
+        gap_m,
+    };
+    if !should_reopen_drive(&facts, grace.end.num_seconds()) {
+        return Ok(None);
+    }
+    let reopened: Option<(i64,)> = sqlx::query_as(
+        "UPDATE drives SET
+             end_at = NULL,
+             end_latitude = NULL,
+             end_longitude = NULL,
+             end_odometer_km = NULL,
+             distance_km = NULL,
+             duration_s = NULL,
+             end_battery_level = NULL,
+             end_rated_range_km = NULL,
+             end_ideal_range_km = NULL,
+             energy_used_kwh = NULL,
+             max_speed_kmh = NULL,
+             avg_speed_kmh = NULL,
+             max_power_kw = NULL,
+             min_power_kw = NULL,
+             elevation_gain_m = NULL,
+             elevation_loss_m = NULL,
+             inside_temp_avg_c = NULL,
+             outside_temp_avg_c = NULL,
+             end_geofence_id = NULL
+         WHERE id = $1
+           AND vehicle_id = $2
+           AND end_at IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM drives
+               WHERE vehicle_id = $2 AND end_at IS NULL AND id <> $1
+           )
+         RETURNING id",
+    )
+    .bind(closed.id)
+    .bind(vehicle_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(reopened.map(|row| row.0))
+}
+
+#[derive(sqlx::FromRow)]
+struct ReopenRow {
+    id: i64,
+    end_at: DateTime<Utc>,
+    end_odometer_km: Option<f64>,
+    end_latitude: Option<f64>,
+    end_longitude: Option<f64>,
+    end_speed_kmh: Option<f64>,
+}
+
+/// Closes an open drive once its grace has elapsed, using stored position times.
+///
+/// Safe after a restart: the clock is read from `positions`, then merged with any
+/// newer in-memory evidence from this process.
+pub(crate) async fn close_drive_if_due(
+    pool: &PgPool,
+    runtime: &mut Runtime,
+    now: DateTime<Utc>,
+    fences: &[Fence],
+    events: &broadcast::Sender<LiveEvent>,
+) -> Result<Vec<AddressJob>, AppError> {
+    let grace = runtime.drive_grace;
+    let Some(drive_id) = runtime.open_drive_id else {
+        return Ok(Vec::new());
+    };
+    let mut tx = pool.begin().await?;
+    let locked: Option<(DateTime<Utc>, Option<DateTime<Utc>>)> =
+        sqlx::query_as("SELECT start_at, end_at FROM drives WHERE id = $1 FOR UPDATE")
+            .bind(drive_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((_start_at, end_at)) = locked else {
+        tx.commit().await?;
+        runtime.open_drive_id = None;
+        runtime.tracker.drive_open = false;
+        runtime.drive_clock = None;
+        return Ok(Vec::new());
+    };
+    if end_at.is_some() {
+        tx.commit().await?;
+        runtime.open_drive_id = None;
+        runtime.tracker.drive_open = false;
+        runtime.drive_clock = None;
+        return Ok(Vec::new());
+    }
+    let (stored, _) = load_drive_clock(&mut *tx, drive_id).await?;
+    let clock = merge_clock(stored, runtime.drive_clock);
+    let motion = if clock.park_since.is_some() {
+        DriveMotion::Park
+    } else {
+        DriveMotion::Gap
+    };
+    let plan = plan_drive_close(motion, now, clock, grace);
+    let ClosePlan::Close { .. } = plan else {
+        runtime.drive_clock = Some(clock);
+        tx.commit().await?;
+        return Ok(Vec::new());
+    };
+    let end_fix: Option<(Option<f64>, Option<f64>)> = sqlx::query_as(
+        "SELECT latitude, longitude FROM positions
+         WHERE drive_id = $1
+         ORDER BY recorded_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(drive_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (latitude, longitude) = end_fix.unwrap_or((None, None));
+    let fence_id = latitude
+        .zip(longitude)
+        .and_then(|(latitude, longitude)| matching_geofence(latitude, longitude, fences));
+    let mut end_obs = Observation::at(now, Presence::Online);
+    end_obs.latitude = latitude;
+    end_obs.longitude = longitude;
+    let closed = close_drive(
+        &mut tx,
+        runtime.vehicle_id,
+        drive_id,
+        &end_obs,
+        runtime.efficiency_kwh_per_km,
+        fence_id,
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE vehicle_state
+         SET activity = CASE WHEN activity = 'driving' THEN 'online' ELSE activity END,
+             updated_at = now()
+         WHERE vehicle_id = $1",
+    )
+    .bind(runtime.vehicle_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let mut jobs = Vec::new();
+    if let Some(closed) = closed {
+        push_address(&mut jobs, Some(drive_id), None, "end", &end_obs);
+        remember_closed(&mut runtime.last_closed_drive, closed);
+    }
+    runtime.open_drive_id = None;
+    runtime.tracker.drive_open = false;
+    runtime.drive_clock = None;
+    if runtime.tracker.activity == Activity::Driving {
+        runtime.tracker.activity = Activity::Online;
+    }
+    if let Some(published) = runtime.published.clone() {
+        let _ = events.send(live_event(runtime, &published));
+    }
+    Ok(jobs)
+}
+
+/// Consecutive closed drives that look like one trip split by a short gap.
+///
+/// The result has times, the gap, a rounded distance, and the odometer delta.
+/// Coordinates are not returned.
+pub(crate) struct SplitCandidate {
+    /// Earlier drive.
+    pub earlier_id: i64,
+    /// Later drive.
+    pub later_id: i64,
+    /// Start of the earlier drive.
+    pub earlier_start: DateTime<Utc>,
+    /// End of the earlier drive.
+    pub earlier_end: DateTime<Utc>,
+    /// Start of the later drive.
+    pub later_start: DateTime<Utc>,
+    /// End of the later drive.
+    pub later_end: DateTime<Utc>,
+    /// Seconds from the earlier end to the later start.
+    pub gap_secs: i64,
+    /// Distance between the two endpoints, in metres. Already safe to show.
+    pub gap_m: Option<f64>,
+    /// Later start odometer minus earlier end odometer.
+    pub odometer_delta_km: Option<f64>,
+}
+
+pub(crate) async fn split_candidates(
+    pool: &PgPool,
+    vehicle_id: i64,
+    grace_secs: i64,
+) -> Result<Vec<SplitCandidate>, AppError> {
+    let grace_secs_i = i32::try_from(grace_secs).unwrap_or(300);
+    let rows: Vec<PairRow> = sqlx::query_as(
+        "SELECT a.id AS earlier_id, a.start_at AS earlier_start, a.end_at AS earlier_end,
+                a.end_odometer_km, a.end_latitude, a.end_longitude,
+                b.id AS later_id, b.start_at AS later_start, b.end_at AS later_end,
+                b.start_odometer_km, b.start_latitude, b.start_longitude,
+                ae.speed_kmh AS end_speed_kmh, bs.speed_kmh AS start_speed_kmh
+         FROM drives a
+         JOIN drives b
+           ON b.vehicle_id = a.vehicle_id
+          AND b.id <> a.id
+          AND b.deleted_at IS NULL
+          AND b.end_at IS NOT NULL
+          AND b.start_at > a.end_at
+          AND b.start_at < a.end_at + make_interval(secs => $2)
+         LEFT JOIN LATERAL (
+             SELECT speed_kmh FROM positions
+             WHERE drive_id = a.id
+             ORDER BY recorded_at DESC, id DESC
+             LIMIT 1
+         ) ae ON TRUE
+         LEFT JOIN LATERAL (
+             SELECT speed_kmh FROM positions
+             WHERE drive_id = b.id
+             ORDER BY recorded_at ASC, id ASC
+             LIMIT 1
+         ) bs ON TRUE
+         WHERE a.vehicle_id = $1
+           AND a.deleted_at IS NULL
+           AND a.end_at IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM drives m
+               WHERE m.vehicle_id = a.vehicle_id
+                 AND m.deleted_at IS NULL
+                 AND m.start_at > a.end_at
+                 AND m.start_at < b.start_at
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM charges c
+               WHERE c.vehicle_id = a.vehicle_id
+                 AND c.deleted_at IS NULL
+                 AND c.start_at < b.start_at
+                 AND COALESCE(c.end_at, b.start_at) > a.end_at
+           )
+         ORDER BY a.end_at DESC
+         LIMIT 80",
+    )
+    .bind(vehicle_id)
+    .bind(grace_secs_i)
+    .fetch_all(pool)
+    .await?;
+    let mut found = Vec::new();
+    for row in rows {
+        let gap_m = row
+            .end_latitude
+            .zip(row.end_longitude)
+            .zip(row.start_latitude.zip(row.start_longitude))
+            .map(
+                |((end_latitude, end_longitude), (start_latitude, start_longitude))| {
+                    haversine_m(end_latitude, end_longitude, start_latitude, start_longitude)
+                },
+            )
+            .filter(|metres| metres.is_finite());
+        let odometer_delta_km = row
+            .end_odometer_km
+            .zip(row.start_odometer_km)
+            .map(|(end, start)| start - end)
+            .filter(|delta| delta.is_finite());
+        let gap_secs = (row.later_start - row.earlier_end).num_seconds();
+        let facts = GapFacts {
+            gap_secs,
+            end_speed_kmh: row.end_speed_kmh,
+            start_speed_kmh: row.start_speed_kmh,
+            end_odometer_km: row.end_odometer_km,
+            start_odometer_km: row.start_odometer_km,
+            gap_m,
+        };
+        if !crate::state::split_candidate(&facts, grace_secs) {
+            continue;
+        }
+        found.push(SplitCandidate {
+            earlier_id: row.earlier_id,
+            later_id: row.later_id,
+            earlier_start: row.earlier_start,
+            earlier_end: row.earlier_end,
+            later_start: row.later_start,
+            later_end: row.later_end,
+            gap_secs,
+            gap_m,
+            odometer_delta_km,
+        });
+    }
+    Ok(found)
+}
+
+#[derive(sqlx::FromRow)]
+struct PairRow {
+    earlier_id: i64,
+    earlier_start: DateTime<Utc>,
+    earlier_end: DateTime<Utc>,
+    end_odometer_km: Option<f64>,
+    end_latitude: Option<f64>,
+    end_longitude: Option<f64>,
+    later_id: i64,
+    later_start: DateTime<Utc>,
+    later_end: DateTime<Utc>,
+    start_odometer_km: Option<f64>,
+    start_latitude: Option<f64>,
+    start_longitude: Option<f64>,
+    end_speed_kmh: Option<f64>,
+    start_speed_kmh: Option<f64>,
 }
 
 /// Closes `drive_id`. Returns the kept span.

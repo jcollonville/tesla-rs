@@ -53,6 +53,10 @@ pub(crate) struct Config {
     pub timezone: String,
     /// Optional currency per kWh used when a charge has no stored cost.
     pub energy_price_per_kwh: Option<f64>,
+    /// How long a drive stays open after the last driving evidence when the link drops.
+    pub drive_end_grace: Duration,
+    /// How long a confirmed park (shift P, speed about 0) stays open before close.
+    pub drive_park_grace: Duration,
     /// `local` (default), `oidc`, or `proxy`. Proxy requires an IP allowlist.
     pub auth_mode: String,
     /// Fetch and serve official Tesla renders of the cars. Off keeps the drawings.
@@ -92,6 +96,8 @@ impl std::fmt::Debug for Config {
             )
             .field("timezone", &self.timezone)
             .field("energy_price_per_kwh", &self.energy_price_per_kwh)
+            .field("drive_end_grace", &self.drive_end_grace)
+            .field("drive_park_grace", &self.drive_park_grace)
             .finish_non_exhaustive()
     }
 }
@@ -138,6 +144,25 @@ impl Config {
             .unwrap_or_else(|| "0.0.0.0:4443".to_owned())
             .parse::<SocketAddr>()
             .map_err(|_| AppError::message("TELEMETRY_BIND is not a socket address"))?;
+        let drive_end_grace = drive_grace_secs(
+            map,
+            "DRIVE_END_GRACE_SECS",
+            crate::state::DRIVE_END_GRACE_DEFAULT_SECS,
+            crate::state::DRIVE_END_GRACE_MIN_SECS,
+            crate::state::DRIVE_END_GRACE_MAX_SECS,
+        )?;
+        let drive_park_grace = drive_grace_secs(
+            map,
+            "DRIVE_PARK_GRACE_SECS",
+            crate::state::DRIVE_PARK_GRACE_DEFAULT_SECS,
+            crate::state::DRIVE_PARK_GRACE_MIN_SECS,
+            crate::state::DRIVE_PARK_GRACE_MAX_SECS,
+        )?;
+        if drive_park_grace > drive_end_grace {
+            return Err(AppError::message(
+                "DRIVE_PARK_GRACE_SECS must not exceed DRIVE_END_GRACE_SECS",
+            ));
+        }
         Ok(Self {
             database_url: required(map, "DATABASE_URL")?,
             listen_addr,
@@ -188,6 +213,8 @@ impl Config {
             owner_token_store_path,
             timezone: timezone_name(map)?,
             energy_price_per_kwh: optional_f64(map, "ENERGY_PRICE_PER_KWH")?,
+            drive_end_grace: Duration::from_secs(drive_end_grace),
+            drive_park_grace: Duration::from_secs(drive_park_grace),
             auth_mode: auth_mode(map)?,
             car_renders_enabled: optional_bool(map, "CAR_RENDERS_ENABLED")?.unwrap_or(true),
             tile_upstream: tile_upstream(map)?,
@@ -221,6 +248,16 @@ impl Config {
             "Poll conduite (s)",
             "POLL_DRIVE_SECS",
             self.drive_poll.as_secs().to_string(),
+        );
+        push(
+            "Délai fin de trajet (s)",
+            "DRIVE_END_GRACE_SECS",
+            self.drive_end_grace.as_secs().to_string(),
+        );
+        push(
+            "Délai stationnement (s)",
+            "DRIVE_PARK_GRACE_SECS",
+            self.drive_park_grace.as_secs().to_string(),
         );
         push(
             "Poll charge (s)",
@@ -419,6 +456,22 @@ fn optional(map: &BTreeMap<String, String>, key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn drive_grace_secs(
+    map: &BTreeMap<String, String>,
+    key: &'static str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, AppError> {
+    let value = optional_u64(map, key, default)?;
+    if value < min || value > max {
+        return Err(AppError::message(format!(
+            "{key} must be between {min} and {max} seconds"
+        )));
+    }
+    Ok(value)
+}
+
 fn optional_u64(
     map: &BTreeMap<String, String>,
     key: &'static str,
@@ -606,6 +659,8 @@ mod tests {
             config.gps_fallback_poll,
             std::time::Duration::from_secs(300)
         );
+        assert_eq!(config.drive_end_grace, std::time::Duration::from_secs(300));
+        assert_eq!(config.drive_park_grace, std::time::Duration::from_secs(90));
         assert_eq!(
             config.owner_token_store_path,
             std::path::PathBuf::from("/data/owner-tokens.json")
@@ -632,5 +687,30 @@ mod tests {
         let config = Config::from_map(&map).unwrap();
         assert_eq!(config.auth_mode, "proxy");
         assert_eq!(config.proxy_allowlist, vec!["10.0.0.1", "10.0.0.2"]);
+    }
+
+    #[test]
+    fn drive_grace_rejects_out_of_range_and_park_longer_than_the_gap() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("TESLA_CLIENT_ID".into(), "id".into());
+        map.insert("TESLA_CLIENT_SECRET".into(), "secret".into());
+        map.insert(
+            "TESLA_FLEET_AUDIENCE".into(),
+            "https://fleet-api.prd.eu.vn.cloud.tesla.com".into(),
+        );
+        map.insert("TESLA_DOMAIN".into(), "tsl.b-612.fr".into());
+        map.insert("DATABASE_URL".into(), "postgres://localhost/tesla".into());
+        map.insert("TESLA_PRIVATE_KEY_PATH".into(), "/keys/key.pem".into());
+        map.insert("TESLA_TOKEN_STORE_PATH".into(), "/data/tokens.json".into());
+        map.insert("TESLA_LOGGER_UI_PASSWORD".into(), "password-value".into());
+        map.insert("DRIVE_END_GRACE_SECS".into(), "10".into());
+        assert!(Config::from_map(&map).is_err());
+        map.insert("DRIVE_END_GRACE_SECS".into(), "120".into());
+        map.insert("DRIVE_PARK_GRACE_SECS".into(), "200".into());
+        assert!(Config::from_map(&map).is_err());
+        map.insert("DRIVE_PARK_GRACE_SECS".into(), "60".into());
+        let config = Config::from_map(&map).unwrap();
+        assert_eq!(config.drive_end_grace, std::time::Duration::from_secs(120));
+        assert_eq!(config.drive_park_grace, std::time::Duration::from_secs(60));
     }
 }
