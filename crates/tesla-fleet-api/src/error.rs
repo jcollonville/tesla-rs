@@ -121,6 +121,30 @@ impl FleetError {
         matches!(self, Self::DeviceUnavailable { .. })
     }
 
+    /// HTTP 403 whose body or `error` field says the Fleet billing limit is exceeded.
+    ///
+    /// Tesla answers this as 403, not 402, once the account is disabled for
+    /// `EXCEEDED_LIMIT`.
+    #[must_use]
+    pub fn is_exceeded_limit(&self) -> bool {
+        match self {
+            Self::Forbidden { error, description }
+            | Self::Api {
+                status: 403,
+                error,
+                description,
+            } => contains_exceeded(error.as_deref()) || contains_exceeded(description.as_deref()),
+            _ => false,
+        }
+    }
+
+    /// HTTP 403 that is not [`Self::is_exceeded_limit`].
+    #[must_use]
+    pub fn is_forbidden(&self) -> bool {
+        matches!(self, Self::Forbidden { .. } | Self::Api { status: 403, .. })
+            && !self.is_exceeded_limit()
+    }
+
     pub(crate) fn http(err: reqwest::Error) -> Self {
         Self::Http(Box::new(err))
     }
@@ -184,6 +208,10 @@ impl fmt::Display for FleetError {
             Self::InvalidRequest(message) => f.write_str(message),
         }
     }
+}
+
+fn contains_exceeded(value: Option<&str>) -> bool {
+    value.is_some_and(|text| text.contains("EXCEEDED_LIMIT"))
 }
 
 fn write_status(

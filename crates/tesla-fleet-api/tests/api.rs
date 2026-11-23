@@ -414,6 +414,34 @@ async fn incorrect_region_and_payment_required_are_distinct() {
 }
 
 #[tokio::test]
+async fn exceeded_limit_403_body_is_a_billing_limit() {
+    let body =
+        r#"{"response":null,"error":"account disabled: EXCEEDED_LIMIT","error_description":""}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/1/vehicles"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(body))
+        .mount(&server)
+        .await;
+    let error = client(&server).list_all_vehicles(100, 1).await.unwrap_err();
+    assert!(error.is_exceeded_limit(), "{error}");
+    assert!(!error.is_forbidden());
+    assert!(error.to_string().contains("EXCEEDED_LIMIT"), "{error}");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/1/vehicles"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            r#"{"error":"invalid_scope","error_description":"missing vehicle_device_data"}"#,
+        ))
+        .mount(&server)
+        .await;
+    let error = client(&server).list_all_vehicles(100, 1).await.unwrap_err();
+    assert!(error.is_forbidden(), "{error}");
+    assert!(!error.is_exceeded_limit());
+}
+
+#[tokio::test]
 async fn signed_command_posts_base64_routable_message() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

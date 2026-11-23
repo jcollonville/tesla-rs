@@ -221,8 +221,19 @@ pub(crate) enum ObserveResult {
     Live(Observation),
     Resting(Presence),
     RateLimited(Duration),
-    /// HTTP 402. `vehicle_data` stays paused until the next UTC month.
-    PaymentRequired,
+    /// HTTP 402, or 403 `EXCEEDED_LIMIT`. `vehicle_data` pauses until the next UTC month.
+    ///
+    /// `counted` is set when this was a `vehicle_data` call and must be stored.
+    BillingLimit {
+        status: u16,
+        counted: bool,
+    },
+    /// HTTP 403 that is not a billing limit. Use the 429 backoff, not the short error retry.
+    ///
+    /// `counted` is set when this was a `vehicle_data` call.
+    Backoff {
+        counted: bool,
+    },
     /// `vehicle_data` returned this status and no live body. The call is billed.
     DataFault {
         status: u16,
@@ -576,7 +587,7 @@ impl<T: AccessTokenProvider> IngestSource for FleetPoll<T> {
                     started,
                     &err.to_string(),
                 );
-                return map_rate(err);
+                return classify_fleet(err);
             }
         };
         if !vehicle.is_online() || vehicle.in_service == Some(true) {
@@ -621,7 +632,19 @@ impl<T: AccessTokenProvider> IngestSource for FleetPoll<T> {
                     &err.to_string(),
                 );
                 if matches!(err, FleetError::PaymentRequired) {
-                    return Ok(ObserveResult::PaymentRequired);
+                    return Ok(ObserveResult::BillingLimit {
+                        status: 402,
+                        counted: true,
+                    });
+                }
+                if err.is_exceeded_limit() {
+                    return Ok(ObserveResult::BillingLimit {
+                        status: status.unwrap_or(403),
+                        counted: true,
+                    });
+                }
+                if err.is_forbidden() {
+                    return Ok(ObserveResult::Backoff { counted: true });
                 }
                 if err.is_device_unavailable() {
                     return Ok(ObserveResult::DataFault {
@@ -660,9 +683,60 @@ fn fleet_http_status(err: &FleetError) -> Option<u16> {
 }
 
 fn map_rate(err: FleetError) -> Result<ObserveResult, AppError> {
+    classify_fleet(err)
+}
+
+/// Turn a Fleet error into a poll result. 403 `EXCEEDED_LIMIT` pauses like 402.
+/// Any other 403 is a backoff, not a short error retry.
+fn classify_fleet(err: FleetError) -> Result<ObserveResult, AppError> {
+    if matches!(err, FleetError::PaymentRequired) {
+        return Ok(ObserveResult::BillingLimit {
+            status: 402,
+            counted: false,
+        });
+    }
+    if err.is_exceeded_limit() {
+        return Ok(ObserveResult::BillingLimit {
+            status: fleet_http_status(&err).unwrap_or(403),
+            counted: false,
+        });
+    }
+    if err.is_forbidden() {
+        return Ok(ObserveResult::Backoff { counted: false });
+    }
     match fleet_error(err) {
         AppError::RateLimited { retry_after } => Ok(ObserveResult::RateLimited(retry_after)),
+        AppError::PaymentRequired => Ok(ObserveResult::BillingLimit {
+            status: 402,
+            counted: false,
+        }),
+        AppError::ExceededLimit => Ok(ObserveResult::BillingLimit {
+            status: 403,
+            counted: false,
+        }),
+        AppError::Forbidden => Ok(ObserveResult::Backoff { counted: false }),
         other => Err(other),
+    }
+}
+
+async fn pause_for_billing_limit(archive: &Archive, stop_list: bool) -> CycleControl {
+    let until = match crate::budget::pause_billing(&archive.db, Utc::now()).await {
+        Ok(until) => until,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not store the fleet billing pause");
+            return CycleControl::Wait(Duration::from_secs(3_600));
+        }
+    };
+    if stop_list && let Err(err) = crate::budget::pause_list(&archive.db, until).await {
+        tracing::warn!(error = %err, "could not stop the vehicle list");
+    }
+    if stop_list {
+        let wait = (until - Utc::now())
+            .to_std()
+            .unwrap_or(Duration::from_secs(3_600));
+        CycleControl::Wait(wait.max(Duration::from_secs(60)))
+    } else {
+        CycleControl::Wait(Duration::from_secs(60))
     }
 }
 
@@ -918,6 +992,12 @@ async fn run_cycle(
     {
         return Ok(CycleControl::Pause(wait));
     }
+    let now_utc = Utc::now();
+    let gate =
+        crate::budget::gate(&archive.db, policy.daily_cap, policy.monthly_cap, now_utc).await;
+    if let Some(wait) = gate.list_wait(now_utc) {
+        return Ok(CycleControl::Wait(wait));
+    }
     let vehicles = match source.discover().await {
         Ok(vehicles) => vehicles,
         Err(AppError::RateLimited { retry_after }) => {
@@ -928,6 +1008,14 @@ async fn run_cycle(
         Err(AppError::PaymentRequired) => {
             let _ = crate::budget::pause_billing(&archive.db, Utc::now()).await;
             return Ok(CycleControl::Wait(Duration::from_secs(60)));
+        }
+        Err(AppError::ExceededLimit) => {
+            return Ok(pause_for_billing_limit(archive, true).await);
+        }
+        Err(AppError::Forbidden) => {
+            let wait = note_fleet_limit(archive, None).await;
+            note_rate_limit(archive, account_id, wait).await;
+            return Ok(CycleControl::Pause(wait));
         }
         Err(err) => return Err(err),
     };
@@ -1193,12 +1281,20 @@ async fn handle_summary(
             let wait = note_fleet_limit(archive, Some(retry_after)).await;
             Ok(CycleControl::Pause(wait))
         }
-        ObserveResult::PaymentRequired => {
-            note_vehicle_data(archive, 402).await;
-            let _ = crate::budget::pause_billing(&archive.db, Utc::now()).await;
+        ObserveResult::BillingLimit { status, counted } => {
+            if counted {
+                note_vehicle_data(archive, status).await;
+            }
             remember_snap(&slot, snap_choice).await;
-            slot.lock().await.next_due = Instant::now() + plan.wait.max(Duration::from_secs(60));
-            Ok(CycleControl::Wait(plan.wait.max(Duration::from_secs(60))))
+            Ok(pause_for_billing_limit(archive, false).await)
+        }
+        ObserveResult::Backoff { counted } => {
+            if counted {
+                note_vehicle_data(archive, 403).await;
+            }
+            let wait = note_fleet_limit(archive, None).await;
+            slot.lock().await.next_due = Instant::now() + wait;
+            Ok(CycleControl::Pause(wait))
         }
         ObserveResult::DataFault { status } => {
             note_vehicle_data(archive, status).await;
@@ -1886,5 +1982,169 @@ mod tests {
             "list calls {list_calls}; the free list should keep running"
         );
         assert!(elapsed >= Duration::from_secs(3_600), "{elapsed:?}");
+    }
+
+    const EXCEEDED_LIMIT_BODY: &str =
+        r#"{"response":null,"error":"account disabled: EXCEEDED_LIMIT","error_description":""}"#;
+
+    fn count_paths(requests: &[wiremock::Request], suffix: &str) -> usize {
+        requests
+            .iter()
+            .filter(|request| request.url.path().ends_with(suffix))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn exceeded_limit_403_on_the_list_pauses_until_resume_and_does_not_call_again() {
+        let Some(db) = crate::test_util::TestDb::migrated("exceeded").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/1/vehicles"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(EXCEEDED_LIMIT_BODY))
+            .mount(&server)
+            .await;
+        let client = FleetClient::builder(&server.uri(), BearerToken::new("token"))
+            .unwrap()
+            .build()
+            .unwrap();
+        let source = FleetPoll::new(client);
+        let archive = super::Archive::new(
+            db.pool.clone(),
+            crate::geocode::Geocoder::disabled(),
+            tokio::sync::broadcast::channel(4).0,
+            tokio::sync::broadcast::channel(4).0,
+            crate::position_mode::GpsBoard::default(),
+        );
+        let first = super::run_cycle(&source, &archive, &policy(), None)
+            .await
+            .expect("cycle");
+        let wait = match first {
+            super::CycleControl::Wait(wait) => wait,
+            super::CycleControl::Pause(wait) => {
+                panic!("billing limit must not use the 30s retry: {wait:?}")
+            }
+        };
+        assert!(wait > Duration::from_secs(3_600), "{wait:?}");
+        let second = super::run_cycle(&source, &archive, &policy(), None)
+            .await
+            .expect("paused cycle");
+        assert!(matches!(second, super::CycleControl::Wait(_)));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(count_paths(&requests, "/vehicles"), 1, "the list must stop");
+        assert_eq!(count_paths(&requests, "/vehicle_data"), 0);
+        crate::budget::resume_billing(&db.pool).await.unwrap();
+        let _ = super::run_cycle(&source, &archive, &policy(), None)
+            .await
+            .expect("resumed cycle");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            count_paths(&requests, "/vehicles"),
+            2,
+            "resume calls the list again"
+        );
+        assert_eq!(count_paths(&requests, "/vehicle_data"), 0);
+    }
+
+    #[tokio::test]
+    async fn other_403_uses_the_rate_limit_backoff_not_a_30s_retry() {
+        let Some(db) = crate::test_util::TestDb::migrated("forbid").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/1/vehicles"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                r#"{"error":"invalid_scope","error_description":"missing vehicle_device_data"}"#,
+            ))
+            .mount(&server)
+            .await;
+        let client = FleetClient::builder(&server.uri(), BearerToken::new("token"))
+            .unwrap()
+            .build()
+            .unwrap();
+        let source = FleetPoll::new(client);
+        let archive = super::Archive::new(
+            db.pool.clone(),
+            crate::geocode::Geocoder::disabled(),
+            tokio::sync::broadcast::channel(4).0,
+            tokio::sync::broadcast::channel(4).0,
+            crate::position_mode::GpsBoard::default(),
+        );
+        let first = super::run_cycle(&source, &archive, &policy(), Some(1))
+            .await
+            .expect("cycle");
+        let wait = match first {
+            super::CycleControl::Pause(wait) => wait,
+            super::CycleControl::Wait(wait) => panic!("other 403 must back off, not wait {wait:?}"),
+        };
+        assert!(wait >= Duration::from_secs(60), "{wait:?}");
+        assert_ne!(wait, Duration::from_secs(30));
+        let _ = super::run_cycle(&source, &archive, &policy(), Some(1))
+            .await
+            .expect("backoff holds");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the backoff must not call again immediately"
+        );
+        assert_eq!(count_paths(&requests, "/vehicle_data"), 0);
+    }
+
+    #[tokio::test]
+    async fn paused_error_retry_does_not_call_vehicle_data() {
+        let Some(db) = crate::test_util::TestDb::migrated("pausedata").await else {
+            return;
+        };
+        let vin = "TEST00000000VIN01";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/1/vehicles"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"response":[{"id":1,"vin":"TEST00000000VIN01","state":"online","display_name":"Test"}],"pagination":{"next":null}}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/1/vehicles/{vin}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"response":{"id":1,"vin":"TEST00000000VIN01","state":"online"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/1/vehicles/{vin}/vehicle_data")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"response":{"id":1,"vin":"TEST00000000VIN01","drive_state":{"shift_state":"P"}}}"#,
+            ))
+            .mount(&server)
+            .await;
+        crate::budget::pause_billing(&db.pool, chrono::Utc::now())
+            .await
+            .unwrap();
+        let client = FleetClient::builder(&server.uri(), BearerToken::new("token"))
+            .unwrap()
+            .build()
+            .unwrap();
+        let source = FleetPoll::new(client);
+        let archive = super::Archive::new(
+            db.pool.clone(),
+            crate::geocode::Geocoder::disabled(),
+            tokio::sync::broadcast::channel(4).0,
+            tokio::sync::broadcast::channel(4).0,
+            crate::position_mode::GpsBoard::default(),
+        );
+        let _ = super::run_cycle(&source, &archive, &policy(), None)
+            .await
+            .expect("paused cycle");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(count_paths(&requests, "/vehicles"), 1);
+        assert_eq!(
+            count_paths(&requests, "/vehicle_data"),
+            0,
+            "a paused retry must not call vehicle_data"
+        );
     }
 }

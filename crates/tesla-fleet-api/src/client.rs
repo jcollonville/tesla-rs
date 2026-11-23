@@ -634,7 +634,19 @@ fn decode_success<T: DeserializeOwned>(bytes: &[u8]) -> Result<Decoded<T>, Fleet
 
 fn map_status(status: reqwest::StatusCode, bytes: &[u8]) -> FleetError {
     let value: serde_json::Value = serde_json::from_slice(bytes).unwrap_or(serde_json::Value::Null);
-    map_error_value(status, &value)
+    let parsed = map_error_value(status, &value);
+    if status.as_u16() == 403
+        && !parsed.is_exceeded_limit()
+        && bytes
+            .windows(b"EXCEEDED_LIMIT".len())
+            .any(|window| window == b"EXCEEDED_LIMIT")
+    {
+        return FleetError::Forbidden {
+            error: Some("EXCEEDED_LIMIT".to_owned()),
+            description: None,
+        };
+    }
+    parsed
 }
 
 fn map_error_value(status: reqwest::StatusCode, value: &serde_json::Value) -> FleetError {
