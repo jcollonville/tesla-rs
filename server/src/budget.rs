@@ -9,7 +9,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use sqlx::PgPool;
 
 use crate::error::AppError;
@@ -34,6 +34,10 @@ pub(crate) const DAILY_CAP_MAX: u64 = 100_000;
 pub(crate) const MONTHLY_CAP_DEFAULT: u64 = 4_500;
 pub(crate) const MONTHLY_CAP_MIN: u64 = 0;
 pub(crate) const MONTHLY_CAP_MAX: u64 = 1_000_000;
+
+pub(crate) const BLOCKED_PROBE_DEFAULT_SECS: u64 = 3_600;
+pub(crate) const BLOCKED_PROBE_MIN_SECS: u64 = 300;
+pub(crate) const BLOCKED_PROBE_MAX_SECS: u64 = 86_400;
 
 const BACKOFF_FLOOR_SECS: u64 = 60;
 const BACKOFF_CEILING_SECS: u64 = 3_600;
@@ -66,7 +70,7 @@ impl PauseKind {
                 "vehicle_data is paused: the monthly Fleet API cap is reached. The vehicle list and the Owner stream keep running."
             }
             Self::Billing => {
-                "vehicle_data is paused until the 1st of the month (UTC): Tesla billing limit. The vehicle list and the Owner stream keep running."
+                "vehicle_data is paused: Tesla billing limit. A periodic probe checks whether the block has lifted."
             }
             Self::Counters => "vehicle_data is paused: the usage counters could not be read.",
         }
@@ -81,7 +85,7 @@ impl PauseKind {
                 "vehicle_data est suspendu : plafond mensuel atteint. La liste des véhicules et le stream Owner continuent."
             }
             Self::Billing => {
-                "vehicle_data est suspendu jusqu'au 1er du mois (UTC) : limite de facturation Tesla. La liste et le stream continuent."
+                "vehicle_data est suspendu : limite de facturation Tesla. Un test périodique vérifie si le blocage est levé."
             }
             Self::Counters => "vehicle_data est suspendu : les compteurs d'usage sont illisibles.",
         }
@@ -95,10 +99,18 @@ pub(crate) struct Gate {
     pub month_calls: i64,
     pub daily_cap: i64,
     pub monthly_cap: i64,
-    pub billing_until: Option<DateTime<Utc>>,
-    /// Set when the vehicle list itself returned HTTP 403 `EXCEEDED_LIMIT`.
-    pub list_until: Option<DateTime<Utc>>,
+    /// Set while Tesla is rejecting calls for the billing limit.
+    pub block: Option<BillingBlock>,
     pub pause: Option<PauseKind>,
+}
+
+/// One billing block and the next single probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BillingBlock {
+    pub since: DateTime<Utc>,
+    pub next_probe: DateTime<Utc>,
+    /// The free vehicle list returned the block, so the probe uses that list.
+    pub probe_list: bool,
 }
 
 impl Gate {
@@ -118,9 +130,17 @@ impl Gate {
         self.pause.map(PauseKind::debug_banner)
     }
 
+    /// Daily or monthly cap, or unreadable counters. A billing block alone does not.
+    pub(crate) fn cap_reached(&self) -> bool {
+        matches!(self.pause, Some(PauseKind::Counters))
+            || self.today_calls >= self.daily_cap
+            || self.month_calls >= self.monthly_cap
+    }
+
+    /// Wait before the next list call when the list itself is the probe.
     pub(crate) fn list_wait(&self, now: DateTime<Utc>) -> Option<Duration> {
-        let until = self.list_until.filter(|at| *at > now)?;
-        (until - now).to_std().ok().filter(|wait| !wait.is_zero())
+        let block = self.block.filter(|block| block.probe_list)?;
+        block.remaining(now)
     }
 
     fn counters_down(daily_cap: i64, monthly_cap: i64) -> Self {
@@ -129,10 +149,25 @@ impl Gate {
             month_calls: 0,
             daily_cap,
             monthly_cap,
-            billing_until: None,
-            list_until: None,
+            block: None,
             pause: Some(PauseKind::Counters),
         }
+    }
+}
+
+impl BillingBlock {
+    pub(crate) fn due(self, now: DateTime<Utc>) -> bool {
+        now >= self.next_probe
+    }
+
+    pub(crate) fn remaining(self, now: DateTime<Utc>) -> Option<Duration> {
+        if self.due(now) {
+            return None;
+        }
+        (self.next_probe - now)
+            .to_std()
+            .ok()
+            .filter(|wait| !wait.is_zero())
     }
 }
 
@@ -169,22 +204,6 @@ pub(crate) fn as_display_f64(value: i64) -> f64 {
 
 pub(crate) fn estimated_cost_usd(calls: i64) -> f64 {
     as_display_f64(calls) / CALLS_PER_DOLLAR
-}
-
-/// First instant of the next UTC month. A 402 pause lasts until then.
-pub(crate) fn next_utc_month(now: DateTime<Utc>) -> DateTime<Utc> {
-    let (year, month) = if now.month() == 12 {
-        (now.year() + 1, 1)
-    } else {
-        (now.year(), now.month() + 1)
-    };
-    Utc.with_ymd_and_hms(year, month, 1, 0, 0, 0)
-        .single()
-        .unwrap_or(now)
-}
-
-pub(crate) fn billing_active(until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
-    until.is_some_and(|at| at > now)
 }
 
 pub(crate) fn backoff_base(consecutive: u32) -> u64 {
@@ -238,14 +257,13 @@ pub(crate) fn pause_kind(
     month: i64,
     daily_cap: i64,
     monthly_cap: i64,
-    billing_until: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
+    billing_blocked: bool,
     counters_ok: bool,
 ) -> Option<PauseKind> {
     if !counters_ok {
         return Some(PauseKind::Counters);
     }
-    if billing_active(billing_until, now) {
+    if billing_blocked {
         return Some(PauseKind::Billing);
     }
     if month >= monthly_cap {
@@ -309,13 +327,20 @@ pub(crate) async fn gate(
             return Gate::counters_down(daily_cap, monthly_cap);
         }
     };
+    let block = match (control.since, control.next_probe) {
+        (Some(since), Some(next_probe)) => Some(BillingBlock {
+            since,
+            next_probe,
+            probe_list: control.probe_list,
+        }),
+        _ => None,
+    };
     let pause = pause_kind(
         today_calls,
         month_calls,
         daily_cap,
         monthly_cap,
-        control.billing,
-        now,
+        block.is_some(),
         true,
     );
     Gate {
@@ -323,8 +348,7 @@ pub(crate) async fn gate(
         month_calls,
         daily_cap,
         monthly_cap,
-        billing_until: control.billing,
-        list_until: control.list,
+        block,
         pause,
     }
 }
@@ -358,38 +382,61 @@ fn utc_month(day: NaiveDate) -> (NaiveDate, NaiveDate) {
     (start, end)
 }
 
-pub(crate) async fn pause_billing(
-    pool: &PgPool,
-    now: DateTime<Utc>,
-) -> Result<DateTime<Utc>, AppError> {
-    let until = next_utc_month(now);
-    sqlx::query(
-        "INSERT INTO fleet_control (id, billing_paused_until)
-         VALUES (1, $1)
-         ON CONFLICT (id) DO UPDATE SET billing_paused_until = EXCLUDED.billing_paused_until",
-    )
-    .bind(until)
-    .execute(pool)
-    .await?;
-    Ok(until)
+pub(crate) fn probe_deadline(now: DateTime<Utc>, interval: Duration) -> DateTime<Utc> {
+    let secs = i64::try_from(interval.as_secs()).unwrap_or(3_600);
+    now + chrono::Duration::seconds(secs.max(1))
 }
 
-pub(crate) async fn pause_list(pool: &PgPool, until: DateTime<Utc>) -> Result<(), AppError> {
+/// Enter or refresh the billing block. The original `blocked_since` is kept.
+/// A list failure upgrades the probe to the free vehicle list.
+pub(crate) async fn enter_block(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    interval: Duration,
+    probe_list: bool,
+) -> Result<DateTime<Utc>, AppError> {
+    let next = probe_deadline(now, interval);
     sqlx::query(
-        "INSERT INTO fleet_control (id, list_paused_until)
-         VALUES (1, $1)
-         ON CONFLICT (id) DO UPDATE SET list_paused_until = EXCLUDED.list_paused_until",
+        "INSERT INTO fleet_control (id, blocked_since, next_probe_at, probe_list)
+         VALUES (1, $1, $2, $3)
+         ON CONFLICT (id) DO UPDATE SET
+            blocked_since = COALESCE(fleet_control.blocked_since, EXCLUDED.blocked_since),
+            next_probe_at = EXCLUDED.next_probe_at,
+            probe_list = fleet_control.probe_list OR EXCLUDED.probe_list",
     )
-    .bind(until)
+    .bind(now)
+    .bind(next)
+    .bind(probe_list)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(next)
+}
+
+pub(crate) async fn reschedule_probe(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    interval: Duration,
+) -> Result<DateTime<Utc>, AppError> {
+    let next = probe_deadline(now, interval);
+    sqlx::query(
+        "UPDATE fleet_control
+         SET next_probe_at = $1
+         WHERE id = 1 AND blocked_since IS NOT NULL",
+    )
+    .bind(next)
+    .execute(pool)
+    .await?;
+    Ok(next)
 }
 
 pub(crate) async fn resume_billing(pool: &PgPool) -> Result<(), AppError> {
     sqlx::query(
         "UPDATE fleet_control
-         SET billing_paused_until = NULL, list_paused_until = NULL
+         SET billing_paused_until = NULL,
+             list_paused_until = NULL,
+             blocked_since = NULL,
+             next_probe_at = NULL,
+             probe_list = FALSE
          WHERE id = 1",
     )
     .execute(pool)
@@ -398,33 +445,43 @@ pub(crate) async fn resume_billing(pool: &PgPool) -> Result<(), AppError> {
 }
 
 struct ControlDeadlines {
-    billing: Option<DateTime<Utc>>,
-    list: Option<DateTime<Utc>>,
+    since: Option<DateTime<Utc>>,
+    next_probe: Option<DateTime<Utc>>,
+    probe_list: bool,
 }
 
 #[derive(sqlx::FromRow)]
 struct ControlRow {
-    billing_paused_until: Option<DateTime<Utc>>,
-    list_paused_until: Option<DateTime<Utc>>,
+    blocked_since: Option<DateTime<Utc>>,
+    next_probe_at: Option<DateTime<Utc>>,
+    probe_list: bool,
 }
 
 async fn control_deadlines(pool: &PgPool) -> Result<ControlDeadlines, AppError> {
     let row = sqlx::query_as::<_, ControlRow>(
-        "SELECT billing_paused_until, list_paused_until FROM fleet_control WHERE id = 1",
+        "SELECT blocked_since, next_probe_at, probe_list FROM fleet_control WHERE id = 1",
     )
     .fetch_optional(pool)
     .await?;
-    Ok(ControlDeadlines {
-        billing: row.as_ref().and_then(|row| row.billing_paused_until),
-        list: row.as_ref().and_then(|row| row.list_paused_until),
+    Ok(match row {
+        Some(row) => ControlDeadlines {
+            since: row.blocked_since,
+            next_probe: row.next_probe_at,
+            probe_list: row.probe_list,
+        },
+        None => ControlDeadlines {
+            since: None,
+            next_probe: None,
+            probe_list: false,
+        },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Duration, PauseKind, StrikeBook, Utc, backoff_delay, billing_active, error_retry,
-        estimated_cost_usd, next_utc_month, pause_kind,
+        Duration, PauseKind, StrikeBook, Utc, backoff_delay, error_retry, estimated_cost_usd,
+        pause_kind, probe_deadline,
     };
     use chrono::TimeZone;
 
@@ -443,35 +500,31 @@ mod tests {
 
     #[test]
     fn cap_blocks_and_a_new_month_does_not_keep_the_old_count() {
-        let november = at(2026, 11, 23, 12);
         assert_eq!(
-            pause_kind(150, 150, 150, 4500, None, november, true),
+            pause_kind(150, 150, 150, 4500, false, true),
             Some(PauseKind::DailyCap)
         );
         assert_eq!(
-            pause_kind(10, 4500, 150, 4500, None, november, true),
+            pause_kind(10, 4500, 150, 4500, false, true),
             Some(PauseKind::MonthlyCap)
         );
-        assert_eq!(pause_kind(149, 149, 150, 4500, None, november, true), None);
+        assert_eq!(pause_kind(149, 149, 150, 4500, false, true), None);
         assert_eq!(
-            pause_kind(0, 0, 150, 4500, None, november, false),
+            pause_kind(0, 0, 150, 4500, false, false),
             Some(PauseKind::Counters)
         );
     }
 
     #[test]
-    fn billing_pause_lasts_until_the_first_of_the_next_utc_month() {
+    fn probe_deadline_uses_the_interval_and_a_block_stays_until_cleared() {
         let now = at(2026, 11, 23, 18);
-        let until = next_utc_month(now);
-        assert_eq!(until, at(2026, 12, 1, 0));
-        assert!(billing_active(Some(until), at(2026, 11, 30, 23)));
-        assert!(!billing_active(Some(until), until));
-        assert_eq!(next_utc_month(at(2026, 12, 31, 22)), at(2027, 1, 1, 0));
+        let next = probe_deadline(now, Duration::from_secs(3_600));
+        assert_eq!(next, at(2026, 11, 23, 19));
         assert_eq!(
-            pause_kind(0, 0, 150, 4500, Some(until), now, true),
+            pause_kind(0, 0, 150, 4500, true, true),
             Some(PauseKind::Billing)
         );
-        assert_eq!(pause_kind(0, 0, 150, 4500, Some(until), until, true), None);
+        assert_eq!(pause_kind(0, 0, 150, 4500, false, true), None);
     }
 
     #[test]
@@ -571,11 +624,17 @@ mod tests {
             return;
         };
         let now = at(2026, 11, 23, 8);
-        let until = super::pause_billing(&db.pool, now).await.unwrap();
-        assert_eq!(until, at(2026, 12, 1, 0));
+        let next = super::enter_block(&db.pool, now, Duration::from_secs(3_600), true)
+            .await
+            .unwrap();
+        assert_eq!(next, at(2026, 11, 23, 9));
         let paused = super::gate(&db.pool, 150, 4500, now).await;
         assert_eq!(paused.pause, Some(PauseKind::Billing));
         assert!(paused.blocks_vehicle_data());
+        let block = paused.block.expect("blocked");
+        assert!(block.probe_list);
+        assert_eq!(block.since, now);
+        assert!(paused.list_wait(now).is_some());
         super::resume_billing(&db.pool).await.unwrap();
         let resumed = super::gate(&db.pool, 150, 4500, now).await;
         assert_eq!(resumed.pause, None);

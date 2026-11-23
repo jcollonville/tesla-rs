@@ -704,6 +704,9 @@ components:
         - vehicle_data_paused
         - pause_reason
         - billing_paused_until
+        - blocked_since
+        - next_probe_at
+        - probe_with_list
       properties:
         day: { type: string, format: date, description: UTC day }
         today_calls: { type: integer, format: int64 }
@@ -725,4 +728,17 @@ components:
           type: string
           format: date-time
           nullable: true
-          description: UTC instant when a HTTP 402 pause ends. Null after a manual resume.
+          description: Next billing probe, same instant as next_probe_at. Null when Tesla is not blocking.
+        blocked_since:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the billing block started. Null when Tesla is not blocking.
+        next_probe_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the next single probe runs. Null after a successful probe or a manual resume.
+        probe_with_list:
+          type: boolean
+          description: True when the probe is the free vehicle list. False when it is one vehicle_data call.

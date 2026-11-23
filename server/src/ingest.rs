@@ -54,6 +54,8 @@ pub(crate) struct PollPolicy {
     pub gps_fallback: Duration,
     pub daily_cap: u64,
     pub monthly_cap: u64,
+    /// How long to wait between probes while Tesla billing is blocked.
+    pub blocked_probe: Duration,
 }
 
 /// Facts the next cycle needs. Grace and Hold keep [`Activity::Driving`] without
@@ -719,25 +721,17 @@ fn classify_fleet(err: FleetError) -> Result<ObserveResult, AppError> {
     }
 }
 
-async fn pause_for_billing_limit(archive: &Archive, stop_list: bool) -> CycleControl {
-    let until = match crate::budget::pause_billing(&archive.db, Utc::now()).await {
-        Ok(until) => until,
-        Err(err) => {
-            tracing::warn!(error = %err, "could not store the fleet billing pause");
-            return CycleControl::Wait(Duration::from_secs(3_600));
-        }
-    };
-    if stop_list && let Err(err) = crate::budget::pause_list(&archive.db, until).await {
-        tracing::warn!(error = %err, "could not stop the vehicle list");
+async fn pause_for_billing_limit(
+    archive: &Archive,
+    probe_list: bool,
+    interval: Duration,
+) -> CycleControl {
+    if let Err(err) =
+        crate::budget::enter_block(&archive.db, Utc::now(), interval, probe_list).await
+    {
+        tracing::warn!(error = %err, "could not store the fleet billing block");
     }
-    if stop_list {
-        let wait = (until - Utc::now())
-            .to_std()
-            .unwrap_or(Duration::from_secs(3_600));
-        CycleControl::Wait(wait.max(Duration::from_secs(60)))
-    } else {
-        CycleControl::Wait(Duration::from_secs(60))
-    }
+    CycleControl::Wait(interval)
 }
 
 fn summary_from_vehicle(vehicle: Vehicle) -> Summary {
@@ -942,6 +936,14 @@ pub(crate) async fn run_poll<T: AccessTokenProvider>(
         if policy.monthly_cap < policy.daily_cap {
             policy.monthly_cap = policy.daily_cap;
         }
+        policy.blocked_probe = crate::settings::bounded_secs(
+            &archive.db,
+            "FLEET_BLOCKED_PROBE_SECS",
+            policy.blocked_probe,
+            crate::budget::BLOCKED_PROBE_MIN_SECS,
+            crate::budget::BLOCKED_PROBE_MAX_SECS,
+        )
+        .await;
         let control = run_cycle(source, &archive, &policy, account_id).await;
         let gate = crate::budget::gate(
             &archive.db,
@@ -998,6 +1000,9 @@ async fn run_cycle(
     if let Some(wait) = gate.list_wait(now_utc) {
         return Ok(CycleControl::Wait(wait));
     }
+    let list_probe = gate
+        .block
+        .is_some_and(|block| block.probe_list && block.due(now_utc));
     let vehicles = match source.discover().await {
         Ok(vehicles) => vehicles,
         Err(AppError::RateLimited { retry_after }) => {
@@ -1005,12 +1010,8 @@ async fn run_cycle(
             note_rate_limit(archive, account_id, wait).await;
             return Ok(CycleControl::Pause(wait));
         }
-        Err(AppError::PaymentRequired) => {
-            let _ = crate::budget::pause_billing(&archive.db, Utc::now()).await;
-            return Ok(CycleControl::Wait(Duration::from_secs(60)));
-        }
-        Err(AppError::ExceededLimit) => {
-            return Ok(pause_for_billing_limit(archive, true).await);
+        Err(AppError::PaymentRequired | AppError::ExceededLimit) => {
+            return Ok(pause_for_billing_limit(archive, true, policy.blocked_probe).await);
         }
         Err(AppError::Forbidden) => {
             let wait = note_fleet_limit(archive, None).await;
@@ -1019,6 +1020,9 @@ async fn run_cycle(
         }
         Err(err) => return Err(err),
     };
+    if list_probe {
+        crate::budget::resume_billing(&archive.db).await?;
+    }
     if vehicles.is_empty() {
         if let Some(account_id) = account_id {
             let _ = crate::accounts::set_last_error(
@@ -1032,6 +1036,34 @@ async fn run_cycle(
     }
     if let Some(account_id) = account_id {
         let _ = crate::accounts::clear_last_error(&archive.db, account_id).await;
+    }
+    let data_probe = gate
+        .block
+        .is_some_and(|block| !block.probe_list && block.due(now_utc));
+    if data_probe {
+        let online = vehicles
+            .iter()
+            .find(|summary| summary.presence == Presence::Online)
+            .cloned();
+        if gate.cap_reached() || online.is_none() {
+            let _ = crate::budget::reschedule_probe(&archive.db, Utc::now(), policy.blocked_probe)
+                .await;
+        } else if let Some(summary) = online {
+            let control = handle_summary(source, archive, policy, &summary, true).await?;
+            let still = crate::budget::gate(
+                &archive.db,
+                policy.daily_cap,
+                policy.monthly_cap,
+                Utc::now(),
+            )
+            .await
+            .block
+            .is_some();
+            if still {
+                return Ok(control);
+            }
+            return Ok(CycleControl::Wait(Duration::from_secs(1)));
+        }
     }
     let mut soonest = policy.backoff;
     let now = Instant::now();
@@ -1050,7 +1082,7 @@ async fn run_cycle(
             }
             continue;
         }
-        match handle_summary(source, archive, policy, &summary).await {
+        match handle_summary(source, archive, policy, &summary, false).await {
             Ok(CycleControl::Pause(wait)) => {
                 note_rate_limit(archive, account_id, wait).await;
                 return Ok(CycleControl::Pause(wait));
@@ -1198,6 +1230,7 @@ async fn handle_summary(
     archive: &Archive,
     policy: &PollPolicy,
     summary: &Summary,
+    probe: bool,
 ) -> Result<CycleControl, AppError> {
     if summary.presence == Presence::Online {
         let _ = archive.stream_kick.send(summary.vin.clone());
@@ -1260,7 +1293,7 @@ async fn handle_summary(
     }
     let gate =
         crate::budget::gate(&archive.db, policy.daily_cap, policy.monthly_cap, now_utc).await;
-    let blocked = gate.blocks_vehicle_data();
+    let blocked = gate.cap_reached() || (gate.block.is_some() && !probe);
     let snap_choice = if blocked {
         SnapChoice::None
     } else {
@@ -1286,7 +1319,7 @@ async fn handle_summary(
                 note_vehicle_data(archive, status).await;
             }
             remember_snap(&slot, snap_choice).await;
-            Ok(pause_for_billing_limit(archive, false).await)
+            Ok(pause_for_billing_limit(archive, false, policy.blocked_probe).await)
         }
         ObserveResult::Backoff { counted } => {
             if counted {
@@ -1298,6 +1331,9 @@ async fn handle_summary(
         }
         ObserveResult::DataFault { status } => {
             note_vehicle_data(archive, status).await;
+            if probe {
+                crate::budget::resume_billing(&archive.db).await?;
+            }
             remember_snap(&slot, snap_choice).await;
             if status == 408 {
                 {
@@ -1314,6 +1350,11 @@ async fn handle_summary(
             }
         }
         ObserveResult::Resting(presence) => {
+            if probe {
+                let _ =
+                    crate::budget::reschedule_probe(&archive.db, Utc::now(), policy.blocked_probe)
+                        .await;
+            }
             {
                 let mut runtime = slot.lock().await;
                 runtime.parked_live_polls = 0;
@@ -1321,7 +1362,12 @@ async fn handle_summary(
             }
             let obs = resting_observation(Utc::now(), presence);
             apply_existing(archive, &summary.vin, obs, false, false).await?;
-            Ok(CycleControl::Wait(policy.asleep))
+            let wait = if probe {
+                policy.blocked_probe
+            } else {
+                policy.asleep
+            };
+            Ok(CycleControl::Wait(wait))
         }
         ObserveResult::Live(obs) => {
             note_vehicle_data(archive, 200).await;
@@ -1341,6 +1387,9 @@ async fn handle_summary(
                 archive.gps.mark_drive_position(vehicle_id, now).await;
             }
             remember_snap(&slot, snap_choice).await;
+            if probe {
+                crate::budget::resume_billing(&archive.db).await?;
+            }
             {
                 let mut runtime = slot.lock().await;
                 if matches!(
@@ -1426,6 +1475,7 @@ mod tests {
             gps_fallback: Duration::from_secs(300),
             daily_cap: 150,
             monthly_cap: 4_500,
+            blocked_probe: Duration::from_secs(3_600),
         }
     }
 
@@ -2026,7 +2076,7 @@ mod tests {
                 panic!("billing limit must not use the 30s retry: {wait:?}")
             }
         };
-        assert!(wait > Duration::from_secs(3_600), "{wait:?}");
+        assert_eq!(wait, Duration::from_secs(3_600), "{wait:?}");
         let second = super::run_cycle(&source, &archive, &policy(), None)
             .await
             .expect("paused cycle");
@@ -2045,6 +2095,190 @@ mod tests {
             "resume calls the list again"
         );
         assert_eq!(count_paths(&requests, "/vehicle_data"), 0);
+    }
+
+    fn fleet_archive(pool: sqlx::PgPool) -> super::Archive {
+        super::Archive::new(
+            pool,
+            crate::geocode::Geocoder::disabled(),
+            tokio::sync::broadcast::channel(4).0,
+            tokio::sync::broadcast::channel(4).0,
+            crate::position_mode::GpsBoard::default(),
+        )
+    }
+
+    fn online_list() -> &'static str {
+        r#"{"response":[{"id":1,"vin":"TEST00000000VIN01","state":"online","display_name":"Test"}],"pagination":{"next":null}}"#
+    }
+
+    #[tokio::test]
+    async fn billing_probe_waits_for_the_interval_and_a_403_reschedules_it() {
+        let Some(db) = crate::test_util::TestDb::migrated("probewait").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/1/vehicles"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(EXCEEDED_LIMIT_BODY))
+            .mount(&server)
+            .await;
+        let client = FleetClient::builder(&server.uri(), BearerToken::new("token"))
+            .unwrap()
+            .build()
+            .unwrap();
+        let source = FleetPoll::new(client);
+        let archive = fleet_archive(db.pool.clone());
+        let mut plan = policy();
+        plan.blocked_probe = Duration::from_secs(3_600);
+        let first = super::run_cycle(&source, &archive, &plan, None)
+            .await
+            .expect("block");
+        assert!(matches!(
+            first,
+            super::CycleControl::Wait(wait) if wait == Duration::from_secs(3_600)
+        ));
+        let _ = super::run_cycle(&source, &archive, &plan, None)
+            .await
+            .expect("not due");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        sqlx::query("UPDATE fleet_control SET next_probe_at = now() - interval '1 second'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let again = super::run_cycle(&source, &archive, &plan, None)
+            .await
+            .expect("probe");
+        assert!(matches!(
+            again,
+            super::CycleControl::Wait(wait) if wait == Duration::from_secs(3_600)
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        let _ = super::run_cycle(&source, &archive, &plan, None)
+            .await
+            .expect("rescheduled");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "a 403 probe waits another interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_list_probe_resumes_polling() {
+        let Some(db) = crate::test_util::TestDb::migrated("proberesume").await else {
+            return;
+        };
+        let vin = "TEST00000000VIN01";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/1/vehicles"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(EXCEEDED_LIMIT_BODY))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/1/vehicles"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(online_list()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/1/vehicles/{vin}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"response":{"id":1,"vin":"TEST00000000VIN01","state":"online"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/1/vehicles/{vin}/vehicle_data")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"response":{"id":1,"vin":"TEST00000000VIN01","drive_state":{"shift_state":"P"}}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let client = FleetClient::builder(&server.uri(), BearerToken::new("token"))
+            .unwrap()
+            .build()
+            .unwrap();
+        let source = FleetPoll::new(client);
+        let archive = fleet_archive(db.pool.clone());
+        let _ = super::run_cycle(&source, &archive, &policy(), None)
+            .await
+            .expect("block");
+        sqlx::query("UPDATE fleet_control SET next_probe_at = now() - interval '1 second'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let _ = super::run_cycle(&source, &archive, &policy(), None)
+            .await
+            .expect("probe succeeds");
+        let gate = crate::budget::gate(&db.pool, 150, 4_500, chrono::Utc::now()).await;
+        assert!(gate.block.is_none(), "a successful probe clears the block");
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            count_paths(&requests, "/vehicle_data") >= 1,
+            "normal polling resumes on the successful probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn vehicle_data_probe_respects_the_cap() {
+        let Some(db) = crate::test_util::TestDb::migrated("probecap").await else {
+            return;
+        };
+        let vin = "TEST00000000VIN01";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/1/vehicles"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(online_list()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/1/vehicles/{vin}/vehicle_data")))
+            .respond_with(ResponseTemplate::new(403).set_body_string(EXCEEDED_LIMIT_BODY))
+            .mount(&server)
+            .await;
+        sqlx::query(
+            "INSERT INTO fleet_usage (day, endpoint, status, count)
+             VALUES ($1, 'vehicle_data', 200, 150)",
+        )
+        .bind(chrono::Utc::now().date_naive())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        crate::budget::enter_block(
+            &db.pool,
+            chrono::Utc::now(),
+            Duration::from_secs(3_600),
+            false,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE fleet_control SET next_probe_at = now() - interval '1 second'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let client = FleetClient::builder(&server.uri(), BearerToken::new("token"))
+            .unwrap()
+            .build()
+            .unwrap();
+        let source = FleetPoll::new(client);
+        let archive = fleet_archive(db.pool.clone());
+        let _ = super::run_cycle(&source, &archive, &policy(), None)
+            .await
+            .expect("capped probe");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(count_paths(&requests, "/vehicles"), 1);
+        assert_eq!(count_paths(&requests, "/vehicle_data"), 0);
+        let gate = crate::budget::gate(&db.pool, 150, 4_500, chrono::Utc::now()).await;
+        let block = gate.block.expect("still blocked");
+        assert!(block.next_probe > chrono::Utc::now());
+        let _ = super::run_cycle(&source, &archive, &policy(), None)
+            .await
+            .expect("not due");
+        assert_eq!(
+            count_paths(&server.received_requests().await.unwrap(), "/vehicle_data"),
+            0
+        );
     }
 
     #[tokio::test]
@@ -2121,9 +2355,14 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        crate::budget::pause_billing(&db.pool, chrono::Utc::now())
-            .await
-            .unwrap();
+        crate::budget::enter_block(
+            &db.pool,
+            chrono::Utc::now(),
+            Duration::from_secs(3_600),
+            false,
+        )
+        .await
+        .unwrap();
         let client = FleetClient::builder(&server.uri(), BearerToken::new("token"))
             .unwrap()
             .build()

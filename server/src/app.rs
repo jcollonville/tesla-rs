@@ -251,6 +251,7 @@ fn policy_from(config: &Config) -> PollPolicy {
         gps_fallback: config.gps_fallback_poll,
         daily_cap: config.fleet_daily_cap,
         monthly_cap: config.fleet_monthly_cap,
+        blocked_probe: config.fleet_blocked_probe,
     }
 }
 

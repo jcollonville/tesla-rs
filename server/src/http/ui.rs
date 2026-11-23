@@ -1005,6 +1005,14 @@ async fn system_status(app: &AppState, csrf: &str, admin: bool) -> String {
     text.push_str(
         "<p class=\"muted\">Estimation : 1 USD pour 500 appels vehicle_data, avant le crédit mensuel de 10 USD. Les réponses 408 comptent.</p>",
     );
+    if let Some(block) = gate.block {
+        let tz = app.inner.config.timezone.parse().unwrap_or(chrono_tz::UTC);
+        let since = escape_html(&super::format::moment(block.since, tz));
+        let next = escape_html(&super::format::moment(block.next_probe, tz));
+        text.push_str(&format!(
+            "<p>Bloqué par Tesla depuis {since}, prochain test à {next}.</p>"
+        ));
+    }
     if admin && gate.pause == Some(crate::budget::PauseKind::Billing) {
         let csrf = escape_html(csrf);
         text.push_str(&format!(
