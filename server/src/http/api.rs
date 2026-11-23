@@ -134,6 +134,9 @@ pub(crate) struct FleetUsageJson {
     pub vehicle_data_paused: bool,
     pub pause_reason: Option<String>,
     pub billing_paused_until: Option<DateTime<Utc>>,
+    pub blocked_since: Option<DateTime<Utc>>,
+    pub next_probe_at: Option<DateTime<Utc>>,
+    pub probe_with_list: bool,
 }
 
 impl FleetUsageJson {
@@ -149,7 +152,10 @@ impl FleetUsageJson {
             monthly_cap: gate.monthly_cap,
             vehicle_data_paused: gate.blocks_vehicle_data(),
             pause_reason: gate.pause.map(|kind| kind.as_str().to_owned()),
-            billing_paused_until: gate.billing_until.filter(|until| *until > Utc::now()),
+            billing_paused_until: gate.block.map(|block| block.next_probe),
+            blocked_since: gate.block.map(|block| block.since),
+            next_probe_at: gate.block.map(|block| block.next_probe),
+            probe_with_list: gate.block.is_some_and(|block| block.probe_list),
         }
     }
 }

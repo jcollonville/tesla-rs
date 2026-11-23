@@ -19,6 +19,7 @@ pub(crate) const KEYS: &[&str] = &[
     "POLL_PARKED_LIVE_LIMIT",
     "FLEET_DATA_DAILY_CAP",
     "FLEET_DATA_MONTHLY_CAP",
+    "FLEET_BLOCKED_PROBE_SECS",
     "NOMINATIM_ENABLED",
     "NOMINATIM_URL",
     "NOMINATIM_MIN_INTERVAL_MS",
@@ -189,6 +190,10 @@ fn check_value(key: &str, value: &str) -> Result<(), AppError> {
         "FLEET_DATA_MONTHLY_CAP" => Some((
             crate::budget::MONTHLY_CAP_MIN,
             crate::budget::MONTHLY_CAP_MAX,
+        )),
+        "FLEET_BLOCKED_PROBE_SECS" => Some((
+            crate::budget::BLOCKED_PROBE_MIN_SECS,
+            crate::budget::BLOCKED_PROBE_MAX_SECS,
         )),
         _ => None,
     };

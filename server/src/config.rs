@@ -36,6 +36,7 @@ pub(crate) struct Config {
     pub gps_fallback_poll: Duration,
     pub fleet_daily_cap: u64,
     pub fleet_monthly_cap: u64,
+    pub fleet_blocked_probe: Duration,
     pub nominatim_enabled: bool,
     pub nominatim_url: String,
     pub nominatim_contact: Option<String>,
@@ -185,6 +186,13 @@ impl Config {
                 "FLEET_DATA_MONTHLY_CAP must be at least FLEET_DATA_DAILY_CAP",
             ));
         }
+        let fleet_blocked_probe = Duration::from_secs(bounded_secs(
+            map,
+            "FLEET_BLOCKED_PROBE_SECS",
+            crate::budget::BLOCKED_PROBE_DEFAULT_SECS,
+            crate::budget::BLOCKED_PROBE_MIN_SECS,
+            crate::budget::BLOCKED_PROBE_MAX_SECS,
+        )?);
         Ok(Self {
             database_url: required(map, "DATABASE_URL")?,
             listen_addr,
@@ -224,6 +232,7 @@ impl Config {
             )?),
             fleet_daily_cap,
             fleet_monthly_cap,
+            fleet_blocked_probe,
             nominatim_enabled,
             nominatim_url: optional(map, "NOMINATIM_URL")
                 .unwrap_or_else(|| "https://nominatim.openstreetmap.org".to_owned()),
@@ -334,6 +343,11 @@ impl Config {
             "Plafond vehicle_data / mois (0–1000000)",
             "FLEET_DATA_MONTHLY_CAP",
             self.fleet_monthly_cap.to_string(),
+        );
+        push(
+            "Sonde blocage Tesla (300–86400 s)",
+            "FLEET_BLOCKED_PROBE_SECS",
+            self.fleet_blocked_probe.as_secs().to_string(),
         );
         push("Fuseau", "TESLA_TIMEZONE", self.timezone.clone());
         push(
@@ -741,6 +755,10 @@ mod tests {
         assert_eq!(config.fleet_daily_cap, 150);
         assert_eq!(config.fleet_monthly_cap, 4500);
         assert_eq!(
+            config.fleet_blocked_probe,
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(
             config.owner_token_store_path,
             std::path::PathBuf::from("/data/owner-tokens.json")
         );
@@ -823,6 +841,9 @@ mod tests {
         assert!(Config::from_map(&map).is_err());
         map.insert("FLEET_DATA_DAILY_CAP".into(), "100".into());
         map.insert("FLEET_DATA_MONTHLY_CAP".into(), "400".into());
+        map.insert("FLEET_BLOCKED_PROBE_SECS".into(), "10".into());
+        assert!(Config::from_map(&map).is_err());
+        map.insert("FLEET_BLOCKED_PROBE_SECS".into(), "3600".into());
         map.insert("POLL_DRIVE_SECS".into(), "15".into());
         let config = Config::from_map(&map).unwrap();
         assert_eq!(
