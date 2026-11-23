@@ -30,6 +30,12 @@ pub(crate) enum AppError {
     /// The developer account has no payment method or has exceeded its billing limit.
     #[error("payment required")]
     PaymentRequired,
+    /// HTTP 403 whose body contains `EXCEEDED_LIMIT`. Same pause as [`Self::PaymentRequired`].
+    #[error("fleet billing limit exceeded")]
+    ExceededLimit,
+    /// HTTP 403 that is not a billing limit. Retry with the rate-limit backoff.
+    #[error("fleet api forbidden")]
+    Forbidden,
     /// Tesla asked the client to slow down.
     #[error("rate limited; retry after {}s", retry_after.as_secs())]
     RateLimited {
@@ -81,6 +87,8 @@ pub(crate) fn fleet_error(err: FleetError) -> AppError {
             AppError::RateLimited { retry_after }
         }
         FleetError::PaymentRequired => AppError::PaymentRequired,
+        err if err.is_exceeded_limit() => AppError::ExceededLimit,
+        err if err.is_forbidden() => AppError::Forbidden,
         other => AppError::Fleet(redact_secrets(&other.to_string())),
     }
 }

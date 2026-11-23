@@ -96,6 +96,8 @@ pub(crate) struct Gate {
     pub daily_cap: i64,
     pub monthly_cap: i64,
     pub billing_until: Option<DateTime<Utc>>,
+    /// Set when the vehicle list itself returned HTTP 403 `EXCEEDED_LIMIT`.
+    pub list_until: Option<DateTime<Utc>>,
     pub pause: Option<PauseKind>,
 }
 
@@ -116,6 +118,11 @@ impl Gate {
         self.pause.map(PauseKind::debug_banner)
     }
 
+    pub(crate) fn list_wait(&self, now: DateTime<Utc>) -> Option<Duration> {
+        let until = self.list_until.filter(|at| *at > now)?;
+        (until - now).to_std().ok().filter(|wait| !wait.is_zero())
+    }
+
     fn counters_down(daily_cap: i64, monthly_cap: i64) -> Self {
         Self {
             today_calls: 0,
@@ -123,6 +130,7 @@ impl Gate {
             daily_cap,
             monthly_cap,
             billing_until: None,
+            list_until: None,
             pause: Some(PauseKind::Counters),
         }
     }
@@ -294,8 +302,8 @@ pub(crate) async fn gate(
             return Gate::counters_down(daily_cap, monthly_cap);
         }
     };
-    let billing_until = match billing_until(pool).await {
-        Ok(until) => until,
+    let control = match control_deadlines(pool).await {
+        Ok(control) => control,
         Err(err) => {
             tracing::warn!(error = %err, "fleet billing pause could not be read");
             return Gate::counters_down(daily_cap, monthly_cap);
@@ -306,7 +314,7 @@ pub(crate) async fn gate(
         month_calls,
         daily_cap,
         monthly_cap,
-        billing_until,
+        control.billing,
         now,
         true,
     );
@@ -315,7 +323,8 @@ pub(crate) async fn gate(
         month_calls,
         daily_cap,
         monthly_cap,
-        billing_until,
+        billing_until: control.billing,
+        list_until: control.list,
         pause,
     }
 }
@@ -365,20 +374,50 @@ pub(crate) async fn pause_billing(
     Ok(until)
 }
 
-pub(crate) async fn resume_billing(pool: &PgPool) -> Result<(), AppError> {
-    sqlx::query("UPDATE fleet_control SET billing_paused_until = NULL WHERE id = 1")
-        .execute(pool)
-        .await?;
+pub(crate) async fn pause_list(pool: &PgPool, until: DateTime<Utc>) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO fleet_control (id, list_paused_until)
+         VALUES (1, $1)
+         ON CONFLICT (id) DO UPDATE SET list_paused_until = EXCLUDED.list_paused_until",
+    )
+    .bind(until)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-async fn billing_until(pool: &PgPool) -> Result<Option<DateTime<Utc>>, AppError> {
-    let until: Option<DateTime<Utc>> =
-        sqlx::query_scalar("SELECT billing_paused_until FROM fleet_control WHERE id = 1")
-            .fetch_optional(pool)
-            .await?
-            .flatten();
-    Ok(until)
+pub(crate) async fn resume_billing(pool: &PgPool) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE fleet_control
+         SET billing_paused_until = NULL, list_paused_until = NULL
+         WHERE id = 1",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+struct ControlDeadlines {
+    billing: Option<DateTime<Utc>>,
+    list: Option<DateTime<Utc>>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ControlRow {
+    billing_paused_until: Option<DateTime<Utc>>,
+    list_paused_until: Option<DateTime<Utc>>,
+}
+
+async fn control_deadlines(pool: &PgPool) -> Result<ControlDeadlines, AppError> {
+    let row = sqlx::query_as::<_, ControlRow>(
+        "SELECT billing_paused_until, list_paused_until FROM fleet_control WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(ControlDeadlines {
+        billing: row.as_ref().and_then(|row| row.billing_paused_until),
+        list: row.as_ref().and_then(|row| row.list_paused_until),
+    })
 }
 
 #[cfg(test)]
