@@ -13,6 +13,7 @@ pub mod cli;
 
 mod accounts;
 mod app;
+mod budget;
 mod config;
 mod crypto;
 mod debug;

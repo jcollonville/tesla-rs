@@ -229,13 +229,15 @@ Optional:
 | `TESLA_LOGGER_ENV_FILE` | `.env` | Dotenv path. Relative to the current directory |
 | `TESLA_OWNER_TOKEN_STORE_PATH` | `owner-tokens.json` next to `TESLA_TOKEN_STORE_PATH` | Owner API token file. Same encryption key |
 | `OWNER_STREAM_ENABLED` | `true` | `true`/`false`, `1`/`0`, `yes`/`no`, or `on`/`off`. `false` keeps a saved Owner token and does not connect |
-| `POLL_DRIVE_SECS` | `15` | Poll interval while driving |
-| `POLL_CHARGE_SECS` | `60` | Poll interval while charging |
-| `POLL_PARKED_SECS` | `180` | Poll interval while parked |
+| `POLL_DRIVE_FALLBACK_SECS` | `120` | `vehicle_data` interval while driving if the Owner stream is down or the last `data:update` is older than 90 seconds. 60–3600. The old 15 second drive cadence is not used |
+| `POLL_CHARGE_SECS` | `300` | Poll interval while charging. 60–86400 |
+| `POLL_PARKED_SECS` | `180` | Poll interval while parked, and during drive-end grace or Hold when movement evidence is 60 seconds old or older |
 | `POLL_ASLEEP_SECS` | `300` | Poll interval while asleep |
 | `POLL_BACKOFF_SECS` | `720` | Poll interval after a backoff |
 | `POLL_PARKED_LIVE_LIMIT` | `2` | Live `vehicle_data` reads while parked |
-| `POLL_GPS_FALLBACK_SECS` | `300` | Drive GPS poll interval when the Owner stream is down or silent |
+| `POLL_GPS_FALLBACK_SECS` | `300` | Minimum gap between `source=poll` drive positions while the Owner stream is down or stale. The `vehicle_data` call itself follows `POLL_DRIVE_FALLBACK_SECS` |
+| `FLEET_DATA_DAILY_CAP` | `150` | UTC-day cap on `vehicle_data` calls, including HTTP 408 and other 4xx. 0–100000. At the cap, `vehicle_data` stops; the vehicle list and the Owner stream continue |
+| `FLEET_DATA_MONTHLY_CAP` | `4500` | UTC-month cap. 0–1000000, and at least `FLEET_DATA_DAILY_CAP`. Estimated cost is calls / 500 USD, before the $10 monthly credit |
 | `DRIVE_END_GRACE_SECS` | `300` | Keep one drive open across a signal gap, asleep, offline, or incomplete poll until this long after the last driving evidence. 30–1800. Must be at least `DRIVE_PARK_GRACE_SECS` |
 | `DRIVE_PARK_GRACE_SECS` | `90` | Close a drive this long after a confirmed park (shift P and speed about 0). 15–900 |
 | `NOMINATIM_ENABLED` | `true` | Reverse geocoding. The URL must be `https` when enabled |

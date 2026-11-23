@@ -26,13 +26,16 @@ pub(crate) struct Config {
     pub token_store_path: PathBuf,
     pub token_encryption_key: Option<String>,
     pub ui_password: SecretString,
-    pub drive_poll: Duration,
+    /// `vehicle_data` interval while driving with the Owner stream down or stale.
+    pub drive_fallback_poll: Duration,
     pub charge_poll: Duration,
     pub parked_poll: Duration,
     pub asleep_poll: Duration,
     pub backoff_poll: Duration,
     pub parked_live_limit: u32,
     pub gps_fallback_poll: Duration,
+    pub fleet_daily_cap: u64,
+    pub fleet_monthly_cap: u64,
     pub nominatim_enabled: bool,
     pub nominatim_url: String,
     pub nominatim_contact: Option<String>,
@@ -163,6 +166,25 @@ impl Config {
                 "DRIVE_PARK_GRACE_SECS must not exceed DRIVE_END_GRACE_SECS",
             ));
         }
+        let fleet_daily_cap = bounded_count(
+            map,
+            "FLEET_DATA_DAILY_CAP",
+            crate::budget::DAILY_CAP_DEFAULT,
+            crate::budget::DAILY_CAP_MIN,
+            crate::budget::DAILY_CAP_MAX,
+        )?;
+        let fleet_monthly_cap = bounded_count(
+            map,
+            "FLEET_DATA_MONTHLY_CAP",
+            crate::budget::MONTHLY_CAP_DEFAULT,
+            crate::budget::MONTHLY_CAP_MIN,
+            crate::budget::MONTHLY_CAP_MAX,
+        )?;
+        if fleet_monthly_cap < fleet_daily_cap {
+            return Err(AppError::message(
+                "FLEET_DATA_MONTHLY_CAP must be at least FLEET_DATA_DAILY_CAP",
+            ));
+        }
         Ok(Self {
             database_url: required(map, "DATABASE_URL")?,
             listen_addr,
@@ -176,8 +198,20 @@ impl Config {
             token_store_path,
             token_encryption_key: optional(map, "TESLA_TOKEN_ENCRYPTION_KEY"),
             ui_password: SecretString::from(required(map, "TESLA_LOGGER_UI_PASSWORD")?),
-            drive_poll: Duration::from_secs(optional_u64(map, "POLL_DRIVE_SECS", 15)?),
-            charge_poll: Duration::from_secs(optional_u64(map, "POLL_CHARGE_SECS", 60)?),
+            drive_fallback_poll: Duration::from_secs(bounded_secs(
+                map,
+                "POLL_DRIVE_FALLBACK_SECS",
+                crate::budget::DRIVE_FALLBACK_DEFAULT_SECS,
+                crate::budget::DRIVE_FALLBACK_MIN_SECS,
+                crate::budget::DRIVE_FALLBACK_MAX_SECS,
+            )?),
+            charge_poll: Duration::from_secs(bounded_secs(
+                map,
+                "POLL_CHARGE_SECS",
+                crate::budget::CHARGE_POLL_DEFAULT_SECS,
+                crate::budget::CHARGE_POLL_MIN_SECS,
+                crate::budget::CHARGE_POLL_MAX_SECS,
+            )?),
             parked_poll: Duration::from_secs(optional_u64(map, "POLL_PARKED_SECS", 180)?),
             asleep_poll: Duration::from_secs(optional_u64(map, "POLL_ASLEEP_SECS", 300)?),
             backoff_poll: Duration::from_secs(optional_u64(map, "POLL_BACKOFF_SECS", 720)?),
@@ -188,6 +222,8 @@ impl Config {
                 "POLL_GPS_FALLBACK_SECS",
                 300,
             )?),
+            fleet_daily_cap,
+            fleet_monthly_cap,
             nominatim_enabled,
             nominatim_url: optional(map, "NOMINATIM_URL")
                 .unwrap_or_else(|| "https://nominatim.openstreetmap.org".to_owned()),
@@ -245,9 +281,9 @@ impl Config {
         }
         push("Écoute", "TESLA_LISTEN_ADDR", self.listen_addr.to_string());
         push(
-            "Poll conduite (s)",
-            "POLL_DRIVE_SECS",
-            self.drive_poll.as_secs().to_string(),
+            "Poll conduite repli (60–3600 s)",
+            "POLL_DRIVE_FALLBACK_SECS",
+            self.drive_fallback_poll.as_secs().to_string(),
         );
         push(
             "Délai fin de trajet (s)",
@@ -260,7 +296,7 @@ impl Config {
             self.drive_park_grace.as_secs().to_string(),
         );
         push(
-            "Poll charge (s)",
+            "Poll charge (60–86400 s)",
             "POLL_CHARGE_SECS",
             self.charge_poll.as_secs().to_string(),
         );
@@ -288,6 +324,16 @@ impl Config {
             "Repli GPS (s)",
             "POLL_GPS_FALLBACK_SECS",
             self.gps_fallback_poll.as_secs().to_string(),
+        );
+        push(
+            "Plafond vehicle_data / jour (0–100000)",
+            "FLEET_DATA_DAILY_CAP",
+            self.fleet_daily_cap.to_string(),
+        );
+        push(
+            "Plafond vehicle_data / mois (0–1000000)",
+            "FLEET_DATA_MONTHLY_CAP",
+            self.fleet_monthly_cap.to_string(),
         );
         push("Fuseau", "TESLA_TIMEZONE", self.timezone.clone());
         push(
@@ -454,6 +500,32 @@ fn optional(map: &BTreeMap<String, String>, key: &str) -> Option<String> {
     map.get(key)
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+fn bounded_secs(
+    map: &BTreeMap<String, String>,
+    key: &'static str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, AppError> {
+    drive_grace_secs(map, key, default, min, max)
+}
+
+fn bounded_count(
+    map: &BTreeMap<String, String>,
+    key: &'static str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, AppError> {
+    let value = optional_u64(map, key, default)?;
+    if value < min || value > max {
+        return Err(AppError::message(format!(
+            "{key} must be between {min} and {max}"
+        )));
+    }
+    Ok(value)
 }
 
 fn drive_grace_secs(
@@ -662,6 +734,13 @@ mod tests {
         assert_eq!(config.drive_end_grace, std::time::Duration::from_secs(300));
         assert_eq!(config.drive_park_grace, std::time::Duration::from_secs(90));
         assert_eq!(
+            config.drive_fallback_poll,
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(config.charge_poll, std::time::Duration::from_secs(300));
+        assert_eq!(config.fleet_daily_cap, 150);
+        assert_eq!(config.fleet_monthly_cap, 4500);
+        assert_eq!(
             config.owner_token_store_path,
             std::path::PathBuf::from("/data/owner-tokens.json")
         );
@@ -712,5 +791,46 @@ mod tests {
         let config = Config::from_map(&map).unwrap();
         assert_eq!(config.drive_end_grace, std::time::Duration::from_secs(120));
         assert_eq!(config.drive_park_grace, std::time::Duration::from_secs(60));
+    }
+
+    fn base_map() -> std::collections::BTreeMap<String, String> {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("TESLA_CLIENT_ID".into(), "id".into());
+        map.insert("TESLA_CLIENT_SECRET".into(), "secret".into());
+        map.insert(
+            "TESLA_FLEET_AUDIENCE".into(),
+            "https://fleet-api.prd.eu.vn.cloud.tesla.com".into(),
+        );
+        map.insert("TESLA_DOMAIN".into(), "tsl.b-612.fr".into());
+        map.insert("DATABASE_URL".into(), "postgres://localhost/tesla".into());
+        map.insert("TESLA_PRIVATE_KEY_PATH".into(), "/keys/key.pem".into());
+        map.insert("TESLA_TOKEN_STORE_PATH".into(), "/data/tokens.json".into());
+        map.insert("TESLA_LOGGER_UI_PASSWORD".into(), "password-value".into());
+        map
+    }
+
+    #[test]
+    fn fleet_budget_knobs_reject_out_of_range_values() {
+        let mut map = base_map();
+        map.insert("POLL_DRIVE_FALLBACK_SECS".into(), "15".into());
+        assert!(Config::from_map(&map).is_err());
+        map.insert("POLL_DRIVE_FALLBACK_SECS".into(), "60".into());
+        map.insert("POLL_CHARGE_SECS".into(), "30".into());
+        assert!(Config::from_map(&map).is_err());
+        map.insert("POLL_CHARGE_SECS".into(), "300".into());
+        map.insert("FLEET_DATA_DAILY_CAP".into(), "5000".into());
+        map.insert("FLEET_DATA_MONTHLY_CAP".into(), "100".into());
+        assert!(Config::from_map(&map).is_err());
+        map.insert("FLEET_DATA_DAILY_CAP".into(), "100".into());
+        map.insert("FLEET_DATA_MONTHLY_CAP".into(), "400".into());
+        map.insert("POLL_DRIVE_SECS".into(), "15".into());
+        let config = Config::from_map(&map).unwrap();
+        assert_eq!(
+            config.drive_fallback_poll,
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(config.charge_poll, std::time::Duration::from_secs(300));
+        assert_eq!(config.fleet_daily_cap, 100);
+        assert_eq!(config.fleet_monthly_cap, 400);
     }
 }

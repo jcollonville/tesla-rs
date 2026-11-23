@@ -10,7 +10,7 @@ Local setup — toolchain, Postgres, environment variables, `cargo run`, Docker 
 
 * Tesla OAuth (authorization code + PKCE) through `tesla-auth`, with the redirect `https://<TESLA_DOMAIN>/auth/callback`.
 * Public key at `/.well-known/appspecific/com.tesla.3p.public-key.pem`, derived from the mounted P-256 private key.
-* Sleep-aware Fleet API polling. The poller never calls `wake_up`. It uses the vehicle list to see `online` / `asleep` / `offline`, calls `vehicle_data` only while the car is already online, polls faster while driving or charging, and backs off when parked.
+* Sleep-aware Fleet API polling. The poller never calls `wake_up`. Presence comes from the vehicle list and `GET /api/1/vehicles/{id}`. `vehicle_data` runs only while the car is already online. A healthy Owner stream (connected, `data:update` younger than 90 seconds) does not poll `vehicle_data` during a drive, except one call at drive start and one at drive end. A down or stale stream uses `POLL_DRIVE_FALLBACK_SECS` (default 120, minimum 60). Drive-end grace and Hold use the parked cadence unless movement evidence is less than 60 seconds old. Charging defaults to every 300 seconds. Daily and monthly caps stop `vehicle_data` when reached; the list and the stream keep running. HTTP 429 backs off from 60 seconds to 3600 seconds. HTTP 402 pauses `vehicle_data` until the 1st of the next UTC month, or until a manual resume on Système.
 * Drive and charge detection, positions partitioned by month, Nominatim reverse geocoding (cached, rate limited, disable-able), and geofences.
 * Read API for Home Assistant: REST plus a WebSocket, described by `openapi.yaml`.
 * Optional MQTT Home Assistant discovery (`MQTT_ENABLED=false` by default). The client speaks plain MQTT to `MQTT_HOST` and `MQTT_PORT`.
@@ -28,7 +28,7 @@ The UI password protects the status page, the logs page, and the OAuth start but
 
 ## Owner API streaming
 
-Fleet API polling records climate, charge, and the other fields the Owner stream does not carry. While that stream is delivering `data:update` frames, drive GPS points come from the stream (`source=stream`) and a live status frame keeps the last polled temperatures and charge fields. The optional Owner API stream is the same legacy websocket TeslaMate uses (`wss://streaming.vn.teslamotors.com/streaming/`). It is not part of the Fleet API. Tesla can change or remove it without notice. When it is disconnected, rate-limited, rejected, or connected without a `data:update` for 90 seconds during a drive, GPS positions fall back to `vehicle_data` (`source=poll`) every `POLL_GPS_FALLBACK_SECS` (5 minutes). The poller still does not call `wake_up`. The debug console and `position_mode` on the state API report `hybrid` or `fallback`. Mode changes are logged as `position mode` with the database id and no VIN.
+Fleet API polling records climate, charge, and the other fields the Owner stream does not carry. While that stream is connected and a `data:update` is younger than 90 seconds, drive GPS comes from the stream (`source=stream`) and `vehicle_data` is not polled, except one call at drive start and one at drive end for temperatures, tyres, and odometer. The optional Owner API stream is the same legacy websocket TeslaMate uses (`wss://streaming.vn.teslamotors.com/streaming/`). It is not part of the Fleet API. Tesla can change or remove it without notice. When it is disconnected, rate-limited, rejected, or connected without a `data:update` for 90 seconds during a drive with movement evidence younger than 60 seconds, `vehicle_data` runs every `POLL_DRIVE_FALLBACK_SECS` (default 120 seconds, minimum 60). A `source=poll` position is stored at most every `POLL_GPS_FALLBACK_SECS`. Drive-end grace and Hold use the parked cadence. The poller still does not call `wake_up`. The debug console and `position_mode` on the state API report `hybrid` or `fallback`. Mode changes are logged as `position mode` with the database id and no VIN. A switch pulls the next poll forward at most once every 120 seconds.
 
 Enable it from the status page:
 
@@ -45,7 +45,7 @@ A refresh token generated for this logger can be pasted into **Owner API refresh
 
 `TESLA_TOKEN_ENCRYPTION_KEY` encrypts `owner-tokens.json` with the same AES-256-GCM format as the Fleet API token file. With Docker Compose the file is `/data/owner-tokens.json` on the `logger-data` volume. No restart is required after saving or disconnecting. Set `OWNER_STREAM_ENABLED=false` to stop connecting without deleting the token.
 
-Streamed rows are stored in `positions` with `source = 'stream'` and linked to the open drive. Those rows may leave temperature null. A poll within two seconds replaces the streamed point at that moment. Shift changes open and close the drive; an empty streaming gear does not close it. If the socket fails, `vehicle_data` keeps running and drive GPS uses the fallback poll.
+Streamed rows are stored in `positions` with `source = 'stream'` and linked to the open drive. Those rows may leave temperature null. A poll within two seconds replaces the streamed point at that moment. Shift changes open and close the drive; an empty streaming gear does not close it. If the socket fails during a drive, `vehicle_data` runs on `POLL_DRIVE_FALLBACK_SECS` and does not call `wake_up`. Usage, the estimated cost, and a billing-limit resume are on Système and at `GET /api/v1/fleet/usage`.
 
 Do not enable `sqlx=trace` in production. Query logs can include bound values. Tokens, the client secret, and the private key are not written to logs.
 
@@ -82,6 +82,7 @@ Images are published to `ghcr.io/jcollonville/tesla-logger` on `main` and on ver
 * `GET /api/v1/charges` and `GET /api/v1/charges/{id}`
 * `GET /api/v1/stats?vehicle_id&from&to`
 * `GET /api/v1/geofences`
+* `GET /api/v1/fleet/usage` returns today and month-to-date `vehicle_data` calls, the estimated cost, the caps, and whether `vehicle_data` is paused
 * `GET /api/v1/ws` pushes `{"type":"state",...}` frames
 
 Distances are kilometres. Fleet API miles are converted on ingest. Temperatures are Celsius, power is kilowatts, tire pressures are bar, charger voltage is volts, and charger current is amperes. `GET /api/v1/vehicles/{id}/state` and each WebSocket `state` frame return every `vehicle_state` column. Door, window, and trunk keys use the Fleet API names (`df`, `dr`, `pf`, `pr`, `fd_window`, `fp_window`, `rd_window`, `rp_window`, `ft`, `rt`). `0` is closed. `plugged_in` is derived from the charge-port latch, the charging state, and the charge cable. `scheduled_charging_start_time` is minutes after midnight.

@@ -242,13 +242,15 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
 
 fn policy_from(config: &Config) -> PollPolicy {
     PollPolicy {
-        drive: config.drive_poll,
+        drive_fallback: config.drive_fallback_poll,
         charge: config.charge_poll,
         parked: config.parked_poll,
         asleep: config.asleep_poll,
         backoff: config.backoff_poll,
         parked_live_limit: config.parked_live_limit,
         gps_fallback: config.gps_fallback_poll,
+        daily_cap: config.fleet_daily_cap,
+        monthly_cap: config.fleet_monthly_cap,
     }
 }
 

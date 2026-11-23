@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tesla_auth::{Session, TokenStore};
 use tesla_fleet_api::{
@@ -43,14 +43,29 @@ const LIVE_ENDPOINTS: &[VehicleDataEndpoint] = &[
 /// How often to call the Fleet API. Live reads happen only while the car is already online.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PollPolicy {
-    pub drive: Duration,
+    /// `vehicle_data` while driving with the Owner stream down or stale.
+    pub drive_fallback: Duration,
     pub charge: Duration,
     pub parked: Duration,
     pub asleep: Duration,
     pub backoff: Duration,
     pub parked_live_limit: u32,
-    /// Backup drive-position interval used when the Owner stream is not healthy.
+    /// How often a fallback drive stores a `source=poll` position.
     pub gps_fallback: Duration,
+    pub daily_cap: u64,
+    pub monthly_cap: u64,
+}
+
+/// Facts the next cycle needs. Grace and Hold keep [`Activity::Driving`] without
+/// [`PollFacts::movement_recent`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PollFacts {
+    pub presence: Presence,
+    pub activity: Activity,
+    pub parked_live_polls: u32,
+    pub telemetry_fresh: bool,
+    pub stream_fresh: bool,
+    pub movement_recent: bool,
 }
 
 /// Whether the next cycle should pay for `vehicle_data`.
@@ -60,51 +75,123 @@ pub(crate) struct PollPlan {
     pub wait: Duration,
 }
 
-pub(crate) fn poll_plan(
-    presence: Presence,
-    activity: Activity,
-    parked_live_polls: u32,
-    telemetry_fresh: bool,
-    policy: &PollPolicy,
-) -> PollPlan {
-    if presence != Presence::Online {
+/// Free vehicle-list cadence while a healthy stream covers a drive.
+const LIST_WAIT: Duration = Duration::from_secs(60);
+
+/// Movement evidence older than this is grace or Hold, not a live drive poll.
+const MOVEMENT_FRESH: chrono::Duration = chrono::Duration::seconds(60);
+
+pub(crate) fn movement_is_recent(
+    last_driving_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    last_driving_at.is_some_and(|at| now.signed_duration_since(at) < MOVEMENT_FRESH)
+}
+
+pub(crate) fn poll_plan(facts: &PollFacts, policy: &PollPolicy) -> PollPlan {
+    if facts.presence != Presence::Online {
         return PollPlan {
             observe: false,
             wait: policy.asleep,
         };
     }
-    if telemetry_fresh {
+    if facts.telemetry_fresh {
         return PollPlan {
             observe: false,
-            wait: Duration::from_secs(60),
+            wait: LIST_WAIT,
         };
     }
-    match activity {
-        Activity::Driving => PollPlan {
+    if facts.activity == Activity::Driving {
+        if !facts.movement_recent {
+            return parked_plan(facts.parked_live_polls, policy);
+        }
+        if facts.stream_fresh {
+            return PollPlan {
+                observe: false,
+                wait: LIST_WAIT,
+            };
+        }
+        return PollPlan {
             observe: true,
-            wait: policy.drive,
-        },
-        Activity::Charging => PollPlan {
+            wait: policy.drive_fallback,
+        };
+    }
+    if facts.activity == Activity::Charging {
+        return PollPlan {
             observe: true,
             wait: policy.charge,
-        },
-        Activity::Updating => PollPlan {
+        };
+    }
+    if facts.activity == Activity::Updating {
+        return PollPlan {
             observe: true,
             wait: policy.parked,
-        },
-        Activity::Online | Activity::Asleep | Activity::Offline => {
-            if parked_live_polls < policy.parked_live_limit {
-                PollPlan {
-                    observe: true,
-                    wait: policy.parked,
-                }
-            } else {
-                PollPlan {
-                    observe: false,
-                    wait: policy.backoff,
-                }
-            }
+        };
+    }
+    parked_plan(facts.parked_live_polls, policy)
+}
+
+fn parked_plan(parked_live_polls: u32, policy: &PollPolicy) -> PollPlan {
+    if parked_live_polls < policy.parked_live_limit {
+        PollPlan {
+            observe: true,
+            wait: policy.parked,
         }
+    } else {
+        PollPlan {
+            observe: false,
+            wait: policy.backoff,
+        }
+    }
+}
+
+/// Optional `vehicle_data` at the edges of a streamed drive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapChoice {
+    None,
+    Start,
+    End,
+}
+
+pub(crate) fn drive_snapshot(
+    stream_fresh: bool,
+    activity: Activity,
+    movement_recent: bool,
+    open_drive_id: Option<i64>,
+    snap: crate::persist::StreamSnap,
+) -> SnapChoice {
+    if !stream_fresh {
+        return SnapChoice::None;
+    }
+    let driving = activity == Activity::Driving && movement_recent;
+    if driving && needs_start(snap, open_drive_id) {
+        return SnapChoice::Start;
+    }
+    if !driving && needs_end(snap, open_drive_id) {
+        return SnapChoice::End;
+    }
+    SnapChoice::None
+}
+
+fn needs_start(snap: crate::persist::StreamSnap, open_drive_id: Option<i64>) -> bool {
+    if !snap.start_done {
+        return true;
+    }
+    match (snap.drive_id, open_drive_id) {
+        (Some(previous), Some(current)) => previous != current,
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+fn needs_end(snap: crate::persist::StreamSnap, open_drive_id: Option<i64>) -> bool {
+    if !snap.start_done || snap.end_done {
+        return false;
+    }
+    match (snap.drive_id, open_drive_id) {
+        (Some(previous), Some(current)) => previous == current,
+        (None, Some(_)) => false,
+        _ => true,
     }
 }
 
@@ -134,6 +221,12 @@ pub(crate) enum ObserveResult {
     Live(Observation),
     Resting(Presence),
     RateLimited(Duration),
+    /// HTTP 402. `vehicle_data` stays paused until the next UTC month.
+    PaymentRequired,
+    /// `vehicle_data` returned this status and no live body. The call is billed.
+    DataFault {
+        status: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -161,6 +254,8 @@ pub(crate) struct Archive {
     pub owner_account_id: Option<i64>,
     /// 429 pause deadlines keyed by Tesla account id.
     pub account_backoff: Arc<Mutex<HashMap<i64, Instant>>>,
+    /// Consecutive Fleet API 429s. A successful `vehicle_data` resets this.
+    pub fleet_strikes: Arc<Mutex<crate::budget::StrikeBook>>,
     pub fences: crate::persist::FenceCache,
     /// How long an open drive survives a gap or a confirmed park.
     pub drive_grace: crate::state::DriveGrace,
@@ -184,6 +279,7 @@ impl Archive {
             fleet_account_id: None,
             owner_account_id: None,
             account_backoff: Arc::new(Mutex::new(HashMap::new())),
+            fleet_strikes: Arc::new(Mutex::new(crate::budget::StrikeBook::default())),
             fences: crate::persist::FenceCache::default(),
             drive_grace: crate::state::DriveGrace::standard(),
         }
@@ -509,21 +605,36 @@ impl<T: AccessTokenProvider> IngestSource for FleetPoll<T> {
                 self.note_http(
                     "GET",
                     "/api/1/vehicles/{id}/vehicle_data",
-                    fleet_http_status(&err),
+                    Some(408),
                     started,
                     "vehicle unavailable",
                 );
-                return Ok(ObserveResult::Resting(Presence::Asleep));
+                return Ok(ObserveResult::DataFault { status: 408 });
             }
             Err(err) => {
+                let status = fleet_http_status(&err);
                 self.note_http(
                     "GET",
                     "/api/1/vehicles/{id}/vehicle_data",
-                    fleet_http_status(&err),
+                    status,
                     started,
                     &err.to_string(),
                 );
-                return map_rate(err);
+                if matches!(err, FleetError::PaymentRequired) {
+                    return Ok(ObserveResult::PaymentRequired);
+                }
+                if err.is_device_unavailable() {
+                    return Ok(ObserveResult::DataFault {
+                        status: status.unwrap_or(408),
+                    });
+                }
+                if matches!(err, FleetError::RateLimited(_)) {
+                    return map_rate(err);
+                }
+                if let Some(status) = status {
+                    return Ok(ObserveResult::DataFault { status });
+                }
+                return Err(fleet_error(err));
             }
         };
         Ok(ObserveResult::Live(observation_from_vehicle_data(data)))
@@ -713,9 +824,22 @@ pub(crate) async fn run_poll<T: AccessTokenProvider>(
             break;
         }
         let mut policy = policy;
-        policy.drive = crate::settings::secs_or(&archive.db, "POLL_DRIVE_SECS", policy.drive).await;
-        policy.charge =
-            crate::settings::secs_or(&archive.db, "POLL_CHARGE_SECS", policy.charge).await;
+        policy.drive_fallback = crate::settings::bounded_secs(
+            &archive.db,
+            "POLL_DRIVE_FALLBACK_SECS",
+            policy.drive_fallback,
+            crate::budget::DRIVE_FALLBACK_MIN_SECS,
+            crate::budget::DRIVE_FALLBACK_MAX_SECS,
+        )
+        .await;
+        policy.charge = crate::settings::bounded_secs(
+            &archive.db,
+            "POLL_CHARGE_SECS",
+            policy.charge,
+            crate::budget::CHARGE_POLL_MIN_SECS,
+            crate::budget::CHARGE_POLL_MAX_SECS,
+        )
+        .await;
         policy.parked =
             crate::settings::secs_or(&archive.db, "POLL_PARKED_SECS", policy.parked).await;
         policy.asleep =
@@ -725,7 +849,34 @@ pub(crate) async fn run_poll<T: AccessTokenProvider>(
         policy.gps_fallback =
             crate::settings::secs_or(&archive.db, "POLL_GPS_FALLBACK_SECS", policy.gps_fallback)
                 .await;
+        policy.daily_cap = crate::settings::bounded_u64(
+            &archive.db,
+            "FLEET_DATA_DAILY_CAP",
+            policy.daily_cap,
+            crate::budget::DAILY_CAP_MIN,
+            crate::budget::DAILY_CAP_MAX,
+        )
+        .await;
+        policy.monthly_cap = crate::settings::bounded_u64(
+            &archive.db,
+            "FLEET_DATA_MONTHLY_CAP",
+            policy.monthly_cap,
+            crate::budget::MONTHLY_CAP_MIN,
+            crate::budget::MONTHLY_CAP_MAX,
+        )
+        .await;
+        if policy.monthly_cap < policy.daily_cap {
+            policy.monthly_cap = policy.daily_cap;
+        }
         let control = run_cycle(source, &archive, &policy, account_id).await;
+        let gate = crate::budget::gate(
+            &archive.db,
+            policy.daily_cap,
+            policy.monthly_cap,
+            Utc::now(),
+        )
+        .await;
+        source.debug.set_budget_banner(gate.debug_line());
         let wait = match control {
             Ok(CycleControl::Wait(wait) | CycleControl::Pause(wait)) => wait,
             Err(err) => {
@@ -735,7 +886,11 @@ pub(crate) async fn run_poll<T: AccessTokenProvider>(
                     let _ =
                         crate::accounts::set_last_error(&archive.db, account_id, &message).await;
                 }
-                Duration::from_secs(30)
+                let backoff = match account_id {
+                    Some(id) => account_pause(&archive, id).await,
+                    None => None,
+                };
+                crate::budget::error_retry(backoff, gate.blocks_vehicle_data())
             }
         };
         let wake = archive.gps.notified();
@@ -766,8 +921,13 @@ async fn run_cycle(
     let vehicles = match source.discover().await {
         Ok(vehicles) => vehicles,
         Err(AppError::RateLimited { retry_after }) => {
-            note_rate_limit(archive, account_id, retry_after).await;
-            return Ok(CycleControl::Pause(retry_after));
+            let wait = note_fleet_limit(archive, Some(retry_after)).await;
+            note_rate_limit(archive, account_id, wait).await;
+            return Ok(CycleControl::Pause(wait));
+        }
+        Err(AppError::PaymentRequired) => {
+            let _ = crate::budget::pause_billing(&archive.db, Utc::now()).await;
+            return Ok(CycleControl::Wait(Duration::from_secs(60)));
         }
         Err(err) => return Err(err),
     };
@@ -908,6 +1068,43 @@ async fn vehicle_id_by_vin(pool: &PgPool, vin: &str) -> Option<i64> {
         .map(|row| row.0)
 }
 
+async fn note_fleet_limit(archive: &Archive, retry_after: Option<Duration>) -> Duration {
+    archive
+        .fleet_strikes
+        .lock()
+        .await
+        .on_limited_now(retry_after)
+}
+
+async fn note_vehicle_data(archive: &Archive, status: u16) {
+    if let Err(err) = crate::budget::record(
+        &archive.db,
+        crate::budget::VEHICLE_DATA,
+        i32::from(status),
+        Utc::now(),
+    )
+    .await
+    {
+        tracing::warn!(error = %err, "could not record fleet usage");
+    }
+}
+
+async fn remember_snap(slot: &SharedRuntime, choice: SnapChoice) {
+    if choice == SnapChoice::None {
+        return;
+    }
+    let mut runtime = slot.lock().await;
+    match choice {
+        SnapChoice::Start => {
+            runtime.stream_snap.start_done = true;
+            runtime.stream_snap.end_done = false;
+            runtime.stream_snap.drive_id = runtime.open_drive_id;
+        }
+        SnapChoice::End => runtime.stream_snap.end_done = true,
+        SnapChoice::None => {}
+    }
+}
+
 async fn handle_summary(
     source: &impl IngestSource,
     archive: &Archive,
@@ -929,7 +1126,8 @@ async fn handle_summary(
     )
     .await?;
     let slot = ensure_runtime(archive, &summary.vin, vehicle_id).await?;
-    let (activity, telemetry_fresh, parked_live_polls) = {
+    let now_utc = Utc::now();
+    let (activity, telemetry_fresh, parked_live_polls, movement_recent, snap, open_drive_id) = {
         let runtime = slot.lock().await;
         (
             runtime.tracker.activity,
@@ -937,48 +1135,88 @@ async fn handle_summary(
                 .last_telemetry
                 .is_some_and(|at| at.elapsed() < Duration::from_secs(120)),
             runtime.parked_live_polls,
+            movement_is_recent(
+                runtime.drive_clock.map(|clock| clock.last_driving_at),
+                now_utc,
+            ),
+            runtime.stream_snap,
+            runtime.open_drive_id,
         )
     };
-    // Owner stream health is not `telemetry_fresh`. A live socket must not
-    // suspend `vehicle_data`; that flag is only Fleet Telemetry.
+    let stream_fresh = archive.gps.stream_fresh(vehicle_id).await;
     let mode = archive
         .gps
         .reconcile(vehicle_id, summary.presence, activity)
         .await
         .mode;
-    let mut plan = poll_plan(
-        summary.presence,
+    let facts = PollFacts {
+        presence: summary.presence,
         activity,
         parked_live_polls,
         telemetry_fresh,
-        policy,
-    );
-    if crate::position_mode::fallback_observe(mode, summary.presence, telemetry_fresh, plan.observe)
+        stream_fresh,
+        movement_recent,
+    };
+    let mut plan = poll_plan(&facts, policy);
+    if !plan.observe
+        && crate::position_mode::fallback_observe(
+            mode,
+            summary.presence,
+            telemetry_fresh,
+            plan.observe,
+            movement_recent,
+        )
     {
         plan.observe = true;
-        plan.wait = policy.gps_fallback;
+        plan.wait = policy.drive_fallback;
+    }
+    let gate =
+        crate::budget::gate(&archive.db, policy.daily_cap, policy.monthly_cap, now_utc).await;
+    let blocked = gate.blocks_vehicle_data();
+    let snap_choice = if blocked {
+        SnapChoice::None
+    } else {
+        drive_snapshot(stream_fresh, activity, movement_recent, open_drive_id, snap)
+    };
+    if snap_choice != SnapChoice::None {
+        plan.observe = true;
+    }
+    if blocked {
+        plan.observe = false;
     }
     if summary.presence != Presence::Online || !plan.observe {
-        {
-            let mut runtime = slot.lock().await;
-            runtime.parked_live_polls = 0;
-            runtime.next_due = Instant::now() + plan.wait;
-        }
-        let vin = summary.vin.clone();
-        let presence = summary.presence;
-        let obs = resting_observation(Utc::now(), presence);
-        if let Err(err) = apply_existing(archive, &vin, obs, false, false).await {
-            tracing::warn!(
-                vehicle_id = summary.tesla_id,
-                error = %crate::logs::redact_line(&err.to_string(), &[]),
-                "could not record resting state"
-            );
-            let _ = record_error(&archive.db, vehicle_id, &err.to_string()).await;
-        }
-        return Ok(CycleControl::Wait(plan.wait));
+        return skip_live(archive, &slot, summary, vehicle_id, plan).await;
     }
     match source.observe(&summary.vin).await? {
-        ObserveResult::RateLimited(wait) => Ok(CycleControl::Pause(wait)),
+        ObserveResult::RateLimited(retry_after) => {
+            note_vehicle_data(archive, 429).await;
+            let wait = note_fleet_limit(archive, Some(retry_after)).await;
+            Ok(CycleControl::Pause(wait))
+        }
+        ObserveResult::PaymentRequired => {
+            note_vehicle_data(archive, 402).await;
+            let _ = crate::budget::pause_billing(&archive.db, Utc::now()).await;
+            remember_snap(&slot, snap_choice).await;
+            slot.lock().await.next_due = Instant::now() + plan.wait.max(Duration::from_secs(60));
+            Ok(CycleControl::Wait(plan.wait.max(Duration::from_secs(60))))
+        }
+        ObserveResult::DataFault { status } => {
+            note_vehicle_data(archive, status).await;
+            remember_snap(&slot, snap_choice).await;
+            if status == 408 {
+                {
+                    let mut runtime = slot.lock().await;
+                    runtime.parked_live_polls = 0;
+                    runtime.next_due = Instant::now() + policy.asleep;
+                }
+                let obs = resting_observation(Utc::now(), Presence::Asleep);
+                apply_existing(archive, &summary.vin, obs, false, false).await?;
+                Ok(CycleControl::Wait(policy.asleep))
+            } else {
+                slot.lock().await.next_due = Instant::now() + policy.backoff;
+                Ok(CycleControl::Wait(policy.backoff))
+            }
+        }
         ObserveResult::Resting(presence) => {
             {
                 let mut runtime = slot.lock().await;
@@ -990,6 +1228,8 @@ async fn handle_summary(
             Ok(CycleControl::Wait(policy.asleep))
         }
         ObserveResult::Live(obs) => {
+            note_vehicle_data(archive, 200).await;
+            archive.fleet_strikes.lock().await.on_success();
             let driving = crate::position_mode::sample_is_driving(
                 activity,
                 obs.shift_state.as_deref(),
@@ -1004,6 +1244,7 @@ async fn handle_summary(
             if store_position && driving {
                 archive.gps.mark_drive_position(vehicle_id, now).await;
             }
+            remember_snap(&slot, snap_choice).await;
             {
                 let mut runtime = slot.lock().await;
                 if matches!(
@@ -1021,6 +1262,39 @@ async fn handle_summary(
     }
 }
 
+async fn skip_live(
+    archive: &Archive,
+    slot: &SharedRuntime,
+    summary: &Summary,
+    vehicle_id: i64,
+    plan: PollPlan,
+) -> Result<CycleControl, AppError> {
+    let preserve = summary.presence == Presence::Online && {
+        let runtime = slot.lock().await;
+        runtime.tracker.drive_open || runtime.tracker.activity == Activity::Driving
+    };
+    {
+        let mut runtime = slot.lock().await;
+        if !preserve {
+            runtime.parked_live_polls = 0;
+        }
+        runtime.next_due = Instant::now() + plan.wait;
+    }
+    if preserve {
+        return Ok(CycleControl::Wait(plan.wait));
+    }
+    let obs = resting_observation(Utc::now(), summary.presence);
+    if let Err(err) = apply_existing(archive, &summary.vin, obs, false, false).await {
+        tracing::warn!(
+            vehicle_id = summary.tesla_id,
+            error = %crate::logs::redact_line(&err.to_string(), &[]),
+            "could not record resting state"
+        );
+        let _ = record_error(&archive.db, vehicle_id, &err.to_string()).await;
+    }
+    Ok(CycleControl::Wait(plan.wait))
+}
+
 async fn apply_existing(
     archive: &Archive,
     vin: &str,
@@ -1036,7 +1310,10 @@ async fn apply_existing(
 
 #[cfg(test)]
 mod tests {
-    use super::{Activity, FleetPoll, IngestSource, PollPolicy, Presence, poll_plan};
+    use super::{
+        Activity, FleetPoll, IngestSource, PollFacts, PollPolicy, Presence, SnapChoice,
+        drive_snapshot, poll_plan,
+    };
     use std::time::Duration;
     use tesla_fleet_api::{BearerToken, FleetClient};
     use wiremock::matchers::{method, path};
@@ -1044,42 +1321,148 @@ mod tests {
 
     fn policy() -> PollPolicy {
         PollPolicy {
-            drive: Duration::from_secs(15),
-            charge: Duration::from_secs(60),
+            drive_fallback: Duration::from_secs(120),
+            charge: Duration::from_secs(300),
             parked: Duration::from_secs(180),
             asleep: Duration::from_secs(300),
             backoff: Duration::from_secs(720),
             parked_live_limit: 2,
             gps_fallback: Duration::from_secs(300),
+            daily_cap: 150,
+            monthly_cap: 4_500,
+        }
+    }
+
+    fn facts(
+        presence: Presence,
+        activity: Activity,
+        parked_live_polls: u32,
+        telemetry_fresh: bool,
+        stream_fresh: bool,
+        movement_recent: bool,
+    ) -> PollFacts {
+        PollFacts {
+            presence,
+            activity,
+            parked_live_polls,
+            telemetry_fresh,
+            stream_fresh,
+            movement_recent,
         }
     }
 
     #[test]
     fn asleep_and_backoff_do_not_request_live_data() {
         let policy = policy();
-        let asleep = poll_plan(Presence::Asleep, Activity::Asleep, 0, false, &policy);
+        let asleep = poll_plan(
+            &facts(Presence::Asleep, Activity::Asleep, 0, false, false, false),
+            &policy,
+        );
         assert!(!asleep.observe);
         assert_eq!(asleep.wait, Duration::from_secs(300));
-        let early = poll_plan(Presence::Online, Activity::Online, 0, false, &policy);
+        let early = poll_plan(
+            &facts(Presence::Online, Activity::Online, 0, false, false, false),
+            &policy,
+        );
         assert!(early.observe);
-        let later = poll_plan(Presence::Online, Activity::Online, 2, false, &policy);
+        let later = poll_plan(
+            &facts(Presence::Online, Activity::Online, 2, false, false, false),
+            &policy,
+        );
         assert!(!later.observe);
         assert_eq!(later.wait, Duration::from_secs(720));
-        let driving = poll_plan(Presence::Online, Activity::Driving, 9, false, &policy);
-        assert!(driving.observe);
-        assert_eq!(driving.wait, Duration::from_secs(15));
-        let streamed = poll_plan(Presence::Online, Activity::Driving, 0, true, &policy);
+        let streamed = poll_plan(
+            &facts(Presence::Online, Activity::Driving, 0, true, false, true),
+            &policy,
+        );
         assert!(!streamed.observe);
     }
 
     #[test]
-    fn owner_stream_does_not_suspend_vehicle_data() {
+    fn healthy_stream_while_driving_does_not_call_vehicle_data() {
         let policy = policy();
-        let driving = poll_plan(Presence::Online, Activity::Driving, 0, false, &policy);
-        assert!(driving.observe);
-        assert_eq!(driving.wait, policy.drive);
-        let charging = poll_plan(Presence::Online, Activity::Charging, 0, false, &policy);
+        let plan = poll_plan(
+            &facts(Presence::Online, Activity::Driving, 0, false, true, true),
+            &policy,
+        );
+        assert!(!plan.observe);
+        assert_eq!(plan.wait, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn stale_stream_while_driving_uses_the_fallback_interval() {
+        let policy = policy();
+        let plan = poll_plan(
+            &facts(Presence::Online, Activity::Driving, 0, false, false, true),
+            &policy,
+        );
+        assert!(plan.observe);
+        assert_eq!(plan.wait, Duration::from_secs(120));
+        assert_ne!(plan.wait, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn grace_and_hold_do_not_use_a_fast_drive_poll() {
+        let policy = policy();
+        let grace = poll_plan(
+            &facts(Presence::Online, Activity::Driving, 0, false, false, false),
+            &policy,
+        );
+        assert_eq!(grace.wait, Duration::from_secs(180));
+        assert_ne!(grace.wait, Duration::from_secs(15));
+        let held = poll_plan(
+            &facts(Presence::Online, Activity::Driving, 2, false, true, false),
+            &policy,
+        );
+        assert!(!held.observe);
+        assert_eq!(held.wait, Duration::from_secs(720));
+        assert_ne!(held.wait, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn charging_uses_the_slower_default() {
+        let policy = policy();
+        let charging = poll_plan(
+            &facts(Presence::Online, Activity::Charging, 0, false, true, false),
+            &policy,
+        );
         assert!(charging.observe);
+        assert_eq!(charging.wait, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn streamed_drive_snapshots_are_one_at_each_edge() {
+        let fresh = crate::persist::StreamSnap::default();
+        assert_eq!(
+            drive_snapshot(true, Activity::Driving, true, Some(4), fresh),
+            SnapChoice::Start
+        );
+        let started = crate::persist::StreamSnap {
+            start_done: true,
+            end_done: false,
+            drive_id: Some(4),
+        };
+        assert_eq!(
+            drive_snapshot(true, Activity::Driving, true, Some(4), started),
+            SnapChoice::None
+        );
+        assert_eq!(
+            drive_snapshot(true, Activity::Driving, false, Some(4), started),
+            SnapChoice::End
+        );
+        let ended = crate::persist::StreamSnap {
+            start_done: true,
+            end_done: true,
+            drive_id: Some(4),
+        };
+        assert_eq!(
+            drive_snapshot(true, Activity::Online, false, Some(4), ended),
+            SnapChoice::None
+        );
+        assert_eq!(
+            drive_snapshot(false, Activity::Driving, true, Some(4), fresh),
+            SnapChoice::None
+        );
     }
 
     #[tokio::test]
@@ -1383,5 +1766,125 @@ mod tests {
         super::note_account_pause(&archive, 7, Duration::from_secs(40)).await;
         assert!(super::account_pause(&archive, 7).await.is_some());
         assert!(super::account_pause(&archive, 8).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn healthy_stream_drive_calls_vehicle_data_at_most_twice_in_an_hour() {
+        let Some(db) = crate::test_util::TestDb::migrated("streamdrive").await else {
+            return;
+        };
+        let vin = "TEST00000000VIN01";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/1/vehicles"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"response":[{"id":1,"vin":"TEST00000000VIN01","state":"online","display_name":"Test"}],"pagination":{"next":null}}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/1/vehicles/{vin}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"response":{"id":1,"vin":"TEST00000000VIN01","state":"online"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/1/vehicles/{vin}/vehicle_data")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"response":{"id":1,"vin":"TEST00000000VIN01","drive_state":{"shift_state":"D","speed":30},"climate_state":{"inside_temp":21,"outside_temp":9},"vehicle_state":{"odometer":1000,"tpms_pressure_fl":2.9}}}"#,
+            ))
+            .mount(&server)
+            .await;
+        sqlx::query("INSERT INTO vehicles (vin, name) VALUES ($1, 'Test')")
+            .bind(vin)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let vehicle_id: i64 = sqlx::query_scalar("SELECT id FROM vehicles WHERE vin = $1")
+            .bind(vin)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO drives (vehicle_id, start_at, source) VALUES ($1, now(), 'stream')",
+        )
+        .bind(vehicle_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let drive_id: i64 =
+            sqlx::query_scalar("SELECT id FROM drives WHERE vehicle_id = $1 AND end_at IS NULL")
+                .bind(vehicle_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO positions (vehicle_id, recorded_at, speed_kmh, shift_state, drive_id, source)
+             VALUES ($1, now(), 40, 'D', $2, 'stream')",
+        )
+        .bind(vehicle_id)
+        .bind(drive_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let client = FleetClient::builder(&server.uri(), BearerToken::new("token"))
+            .unwrap()
+            .build()
+            .unwrap();
+        let source = FleetPoll::new(client);
+        let archive = super::Archive::new(
+            db.pool.clone(),
+            crate::geocode::Geocoder::disabled(),
+            tokio::sync::broadcast::channel(8).0,
+            tokio::sync::broadcast::channel(8).0,
+            crate::position_mode::GpsBoard::default(),
+        );
+        let mut elapsed = Duration::ZERO;
+        let mut cycles = 0_u32;
+        while elapsed < Duration::from_secs(3_600) && cycles < 500 {
+            if let Some(slot) = archive.runtimes.lock().await.get(vin).cloned() {
+                let mut runtime = slot.lock().await;
+                runtime.next_due = tokio::time::Instant::now();
+                runtime.tracker.activity = Activity::Driving;
+                runtime.tracker.drive_open = true;
+                runtime.drive_clock = Some(crate::state::DriveClock {
+                    last_driving_at: chrono::Utc::now(),
+                    park_since: None,
+                });
+            }
+            archive.gps.mark_update(vehicle_id).await;
+            let control = super::run_cycle(&source, &archive, &policy(), None)
+                .await
+                .expect("cycle");
+            let wait = match control {
+                super::CycleControl::Wait(wait) | super::CycleControl::Pause(wait) => wait,
+            };
+            elapsed += wait;
+            cycles += 1;
+        }
+        let requests = server.received_requests().await.unwrap();
+        let data_calls = requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/vehicle_data"))
+            .count();
+        let list_calls = requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/1/vehicles")
+            .count();
+        let wakes = requests
+            .iter()
+            .filter(|request| request.url.path().contains("wake_up"))
+            .count();
+        assert_eq!(wakes, 0);
+        assert!(
+            data_calls <= 2,
+            "vehicle_data calls {data_calls} over {cycles} cycles ({elapsed:?})"
+        );
+        assert!(
+            list_calls >= 30,
+            "list calls {list_calls}; the free list should keep running"
+        );
+        assert!(elapsed >= Duration::from_secs(3_600), "{elapsed:?}");
     }
 }

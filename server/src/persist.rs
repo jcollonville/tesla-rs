@@ -52,6 +52,16 @@ pub(crate) struct Runtime {
     pub drive_clock: Option<DriveClock>,
     /// Signal-loss and park windows for this process.
     pub drive_grace: DriveGrace,
+    /// One `vehicle_data` snapshot at the start and end of a streamed drive.
+    pub stream_snap: StreamSnap,
+}
+
+/// One streamed drive may pay for a single start snapshot and a single end snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StreamSnap {
+    pub start_done: bool,
+    pub end_done: bool,
+    pub drive_id: Option<i64>,
 }
 
 /// Push payload for the read API websocket and the MQTT publisher.
@@ -361,6 +371,7 @@ pub(crate) async fn load_runtime(
             None => None,
         },
         drive_grace: DriveGrace::standard(),
+        stream_snap: StreamSnap::default(),
     })
 }
 

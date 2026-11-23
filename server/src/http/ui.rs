@@ -50,6 +50,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/settings/override", post(save_setting))
         .route("/debug", get(debug_page_handler))
         .route("/system", get(system))
+        .route("/system/fleet/resume", post(resume_fleet))
         .route("/system/backup", get(backup))
         .route("/security/passkey/start", post(passkey_start))
         .route("/security/passkey/finish", post(passkey_finish))
@@ -900,17 +901,16 @@ async fn save_setting(
     }
     let vehicle = form.vehicle_id.trim().parse::<i64>().ok();
     if let Err(err) = crate::settings::set(&app.inner.db, vehicle, &form.key, &form.value).await {
-        tracing::warn!(error = %err, "setting was not stored");
-    } else {
-        crate::identity::audit(
-            &app.inner.db,
-            Some(principal.user_id),
-            "settings.change",
-            "ok",
-            &serde_json::json!({ "key": form.key }).to_string(),
-        )
-        .await;
+        return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
     }
+    crate::identity::audit(
+        &app.inner.db,
+        Some(principal.user_id),
+        "settings.change",
+        "ok",
+        &serde_json::json!({ "key": form.key }).to_string(),
+    )
+    .await;
     Redirect::to("/settings").into_response()
 }
 
@@ -919,13 +919,13 @@ async fn system(State(app): State<AppState>, headers: HeaderMap) -> Response {
         return Redirect::to("/").into_response();
     };
     let mut body = system_page(&chrome(&page, None, None, GlobalTab::System, false));
-    let extra = system_status(&app).await;
+    let extra = system_status(&app, &page.csrf, page.admin).await;
     body = body.replacen("</main>", &(extra + "</main>"), 1);
     html_page(body, page.cookie)
 }
 
 #[allow(clippy::format_push_string)]
-async fn system_status(app: &AppState) -> String {
+async fn system_status(app: &AppState, csrf: &str, admin: bool) -> String {
     let size: String =
         sqlx::query_scalar("SELECT pg_size_pretty(pg_database_size(current_database()))")
             .fetch_one(&app.inner.db)
@@ -950,6 +950,27 @@ async fn system_status(app: &AppState) -> String {
             .await
             .unwrap_or_default();
     let alert = crate::system::storage_alert(default_rows, chrono::Utc::now().year());
+    let daily = crate::settings::bounded_u64(
+        &app.inner.db,
+        "FLEET_DATA_DAILY_CAP",
+        app.inner.config.fleet_daily_cap,
+        crate::budget::DAILY_CAP_MIN,
+        crate::budget::DAILY_CAP_MAX,
+    )
+    .await;
+    let mut monthly = crate::settings::bounded_u64(
+        &app.inner.db,
+        "FLEET_DATA_MONTHLY_CAP",
+        app.inner.config.fleet_monthly_cap,
+        crate::budget::MONTHLY_CAP_MIN,
+        crate::budget::MONTHLY_CAP_MAX,
+    )
+    .await;
+    if monthly < daily {
+        monthly = daily;
+    }
+    let gate = crate::budget::gate(&app.inner.db, daily, monthly, chrono::Utc::now()).await;
+    app.inner.debug.set_budget_banner(gate.debug_line());
     let mode = escape_html(&app.inner.config.auth_mode);
     let oidc = if app.inner.config.oidc_issuer.is_some() {
         "configuré"
@@ -963,6 +984,31 @@ async fn system_status(app: &AppState) -> String {
     if let Some(alert) = alert {
         text.push_str(&format!(
             "<p class=\"banner bad\" role=\"alert\">{alert}</p>"
+        ));
+    }
+    text.push_str("<h2>Fleet API</h2>");
+    if let Some(kind) = gate.pause {
+        text.push_str(&format!(
+            "<p class=\"banner bad\" role=\"alert\">{}</p>",
+            escape_html(kind.system_banner())
+        ));
+    }
+    let today = super::format::number(crate::budget::as_display_f64(gate.today_calls), 0);
+    let month = super::format::number(crate::budget::as_display_f64(gate.month_calls), 0);
+    let today_cost = super::format::number(gate.today_cost_usd(), 3);
+    let month_cost = super::format::number(gate.month_cost_usd(), 3);
+    let daily_label = super::format::number(crate::budget::as_display_f64(gate.daily_cap), 0);
+    let monthly_label = super::format::number(crate::budget::as_display_f64(gate.monthly_cap), 0);
+    text.push_str(&format!(
+        "<p>Aujourd'hui {today} appels ({today_cost} USD). Mois {month} appels ({month_cost} USD). Plafonds {daily_label} / jour et {monthly_label} / mois.</p>"
+    ));
+    text.push_str(
+        "<p class=\"muted\">Estimation : 1 USD pour 500 appels vehicle_data, avant le crédit mensuel de 10 USD. Les réponses 408 comptent.</p>",
+    );
+    if admin && gate.pause == Some(crate::budget::PauseKind::Billing) {
+        let csrf = escape_html(csrf);
+        text.push_str(&format!(
+            "<form method=\"post\" action=\"/system/fleet/resume\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button type=\"submit\">Reprendre vehicle_data</button></form>"
         ));
     }
     text.push_str("<h2>Comptes Tesla</h2><ul class=\"list\">");
@@ -987,6 +1033,28 @@ fn escape_html(value: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+async fn resume_fleet(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) || !principal.is_admin() {
+        return (StatusCode::FORBIDDEN, "admin required").into_response();
+    }
+    if let Err(err) = crate::budget::resume_billing(&app.inner.db).await {
+        tracing::warn!(error = %err, "fleet billing pause was not cleared");
+        return (StatusCode::BAD_GATEWAY, "resume failed").into_response();
+    }
+    let daily = app.inner.config.fleet_daily_cap;
+    let monthly = app.inner.config.fleet_monthly_cap.max(daily);
+    let gate = crate::budget::gate(&app.inner.db, daily, monthly, chrono::Utc::now()).await;
+    app.inner.debug.set_budget_banner(gate.debug_line());
+    Redirect::to("/system").into_response()
 }
 
 async fn backup(State(app): State<AppState>, headers: HeaderMap) -> Response {

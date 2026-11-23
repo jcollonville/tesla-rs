@@ -50,6 +50,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/v1/charges/{id}", get(api::charge_detail))
         .route("/api/v1/stats", get(api::stats))
         .route("/api/v1/geofences", get(api::geofences))
+        .route("/api/v1/fleet/usage", get(api::fleet_usage))
         .route("/api/v1/ws", get(api::ws))
         .route_layer(from_fn_with_state(state.clone(), require_bearer));
     Router::new()

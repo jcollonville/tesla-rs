@@ -27,6 +27,9 @@ pub(crate) enum AppError {
     /// The Fleet API failed. The text does not include the access token.
     #[error("fleet api error: {0}")]
     Fleet(String),
+    /// The developer account has no payment method or has exceeded its billing limit.
+    #[error("payment required")]
+    PaymentRequired,
     /// Tesla asked the client to slow down.
     #[error("rate limited; retry after {}s", retry_after.as_secs())]
     RateLimited {
@@ -77,6 +80,7 @@ pub(crate) fn fleet_error(err: FleetError) -> AppError {
             };
             AppError::RateLimited { retry_after }
         }
+        FleetError::PaymentRequired => AppError::PaymentRequired,
         other => AppError::Fleet(redact_secrets(&other.to_string())),
     }
 }

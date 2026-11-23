@@ -10,13 +10,15 @@ use crate::error::AppError;
 pub(crate) const KEYS: &[&str] = &[
     "ENERGY_PRICE_PER_KWH",
     "TESLA_TIMEZONE",
-    "POLL_DRIVE_SECS",
+    "POLL_DRIVE_FALLBACK_SECS",
     "POLL_CHARGE_SECS",
     "POLL_PARKED_SECS",
     "POLL_ASLEEP_SECS",
     "POLL_BACKOFF_SECS",
     "POLL_GPS_FALLBACK_SECS",
     "POLL_PARKED_LIVE_LIMIT",
+    "FLEET_DATA_DAILY_CAP",
+    "FLEET_DATA_MONTHLY_CAP",
     "NOMINATIM_ENABLED",
     "NOMINATIM_URL",
     "NOMINATIM_MIN_INTERVAL_MS",
@@ -69,6 +71,7 @@ pub(crate) async fn set(
         clear(pool, vehicle_id, key).await?;
         return Ok(());
     }
+    check_value(key, value)?;
     if let Some(vehicle_id) = vehicle_id {
         sqlx::query(
             "INSERT INTO vehicle_settings (vehicle_id, key, value) VALUES ($1, $2, $3)
@@ -137,10 +140,68 @@ pub(crate) async fn secs_or(
     key: &str,
     fallback: std::time::Duration,
 ) -> std::time::Duration {
+    bounded_secs(pool, key, fallback, 0, u64::MAX).await
+}
+
+pub(crate) async fn bounded_secs(
+    pool: &PgPool,
+    key: &str,
+    fallback: std::time::Duration,
+    min: u64,
+    max: u64,
+) -> std::time::Duration {
+    match bounded_u64(pool, key, fallback.as_secs(), min, max).await {
+        secs if secs == fallback.as_secs() => fallback,
+        secs => std::time::Duration::from_secs(secs),
+    }
+}
+
+pub(crate) async fn bounded_u64(
+    pool: &PgPool,
+    key: &str,
+    fallback: u64,
+    min: u64,
+    max: u64,
+) -> u64 {
     match get(pool, None, key).await {
         Ok(Some((value, _))) => value
             .parse::<u64>()
-            .map_or(fallback, std::time::Duration::from_secs),
+            .ok()
+            .filter(|value| (min..=max).contains(value))
+            .unwrap_or(fallback),
         _ => fallback,
     }
+}
+
+fn check_value(key: &str, value: &str) -> Result<(), AppError> {
+    let bounds = match key {
+        "POLL_DRIVE_FALLBACK_SECS" => Some((
+            crate::budget::DRIVE_FALLBACK_MIN_SECS,
+            crate::budget::DRIVE_FALLBACK_MAX_SECS,
+        )),
+        "POLL_CHARGE_SECS" => Some((
+            crate::budget::CHARGE_POLL_MIN_SECS,
+            crate::budget::CHARGE_POLL_MAX_SECS,
+        )),
+        "FLEET_DATA_DAILY_CAP" => {
+            Some((crate::budget::DAILY_CAP_MIN, crate::budget::DAILY_CAP_MAX))
+        }
+        "FLEET_DATA_MONTHLY_CAP" => Some((
+            crate::budget::MONTHLY_CAP_MIN,
+            crate::budget::MONTHLY_CAP_MAX,
+        )),
+        _ => None,
+    };
+    let Some((min, max)) = bounds else {
+        return Ok(());
+    };
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| AppError::message(format!("{key} must be an integer")))?;
+    if parsed < min || parsed > max {
+        return Err(AppError::message(format!(
+            "{key} must be between {min} and {max}"
+        )));
+    }
+    Ok(())
 }

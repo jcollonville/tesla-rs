@@ -242,6 +242,26 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/Geofence" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v1/fleet/usage:
+    get:
+      operationId: getFleetUsage
+      summary: Fleet API vehicle_data usage and estimated cost
+      description: |
+        Today and month-to-date `vehicle_data` calls, in UTC. Every response is
+        counted, including HTTP 408 and other 4xx. `estimated_cost_usd` is the
+        month-to-date bill at $1 per 500 calls, before Tesla's monthly credit.
+        `vehicle_data_paused` is true when a cap is reached, the account is in a
+        billing pause (HTTP 402, until the 1st of the next UTC month), or the
+        counters could not be read. The vehicle list and the Owner stream are
+        not paused by these caps.
+      security: [{ bearer: [] }]
+      responses:
+        "200":
+          description: Usage counters
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FleetUsage" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
   /api/v1/ws:
     get:
       operationId: streamState
@@ -398,11 +418,13 @@ components:
           type: string
           enum: [hybrid, fallback]
           description: >
-            hybrid while Owner stream data:update frames supply drive GPS and
-            vehicle_data supplies the other status fields. fallback when the
-            socket is down or silent during a drive; GPS positions then come
-            from vehicle_data every POLL_GPS_FALLBACK_SECS. Asleep cars are not
-            woken for either mode.
+            hybrid while the Owner stream is connected and a data:update is at
+            most 90 seconds old during a drive. vehicle_data is not polled then,
+            except one call when the drive starts and one when it ends. fallback
+            when the socket is down or that update is stale; vehicle_data then
+            runs every POLL_DRIVE_FALLBACK_SECS (default 120, minimum 60).
+            Drive-end grace and Hold use the parked cadence unless movement
+            evidence is less than 60 seconds old. Asleep cars are not woken.
         charger_voltage: { type: number, nullable: true, description: Volts }
         charger_current:
           type: number
@@ -669,3 +691,38 @@ components:
         billing_type: { type: string, nullable: true }
         cost_per_unit: { type: number, nullable: true }
         session_fee: { type: number, nullable: true }
+    FleetUsage:
+      type: object
+      required:
+        - day
+        - today_calls
+        - month_calls
+        - today_estimated_cost_usd
+        - estimated_cost_usd
+        - daily_cap
+        - monthly_cap
+        - vehicle_data_paused
+        - pause_reason
+        - billing_paused_until
+      properties:
+        day: { type: string, format: date, description: UTC day }
+        today_calls: { type: integer, format: int64 }
+        month_calls: { type: integer, format: int64, description: UTC month to date }
+        today_estimated_cost_usd:
+          type: number
+          description: today_calls / 500. HTTP 408 counts.
+        estimated_cost_usd:
+          type: number
+          description: Month-to-date cost at $1 per 500 vehicle_data calls, before the monthly credit
+        daily_cap: { type: integer, format: int64 }
+        monthly_cap: { type: integer, format: int64 }
+        vehicle_data_paused: { type: boolean }
+        pause_reason:
+          type: string
+          nullable: true
+          enum: [daily_cap, monthly_cap, billing, counters]
+        billing_paused_until:
+          type: string
+          format: date-time
+          nullable: true
+          description: UTC instant when a HTTP 402 pause ends. Null after a manual resume.

@@ -600,6 +600,7 @@ ol.logs .info { font-weight: 600; }
 }
 
 .status-grid { display: grid; gap: calc(var(--space) * 2); }
+.status-grid > .banner { grid-column: 1 / -1; }
 .status-grid > .card { margin: 0; }
 .vehicles { display: grid; gap: calc(var(--space) * 2); }
 
