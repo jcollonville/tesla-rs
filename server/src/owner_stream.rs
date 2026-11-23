@@ -8,7 +8,8 @@
 //! is driving, and it opens a drive as soon as the stream reports a gear.
 //! Published status merges those drive fields onto the last polled values.
 //! The legacy streaming socket is unofficial. Failures back off, switch GPS to
-//! fallback polling, and leave the normal `vehicle_data` cadence running.
+//! fallback polling at `POLL_DRIVE_FALLBACK_SECS`. A healthy socket suspends
+//! `vehicle_data` for the drive.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -912,6 +913,13 @@ async fn enqueue_sample(
 /// id only. This function does not record the VIN.
 async fn follow_mode(archive: &Archive, vin: &str, change: crate::position_mode::ModeChange) {
     if !change.changed {
+        return;
+    }
+    if !archive
+        .gps
+        .claim_mode_pull(crate::position_mode::MODE_PULL_GAP)
+        .await
+    {
         return;
     }
     let slot = archive.runtimes.lock().await.get(vin).cloned();

@@ -29,6 +29,7 @@ fn openapi_lists_the_read_api() {
         "/api/v1/vehicles/{id}/stats/series",
         "/api/v1/vehicles/{id}/stats/consumption_by_temp",
         "/api/v1/geofences",
+        "/api/v1/fleet/usage",
         "/api/v1/ws",
     ] {
         assert!(OPENAPI.contains(path), "{path}");
@@ -52,6 +53,10 @@ fn openapi_lists_the_read_api() {
         "stream_status",
         "car_render",
         "position_mode",
+        "today_calls",
+        "month_calls",
+        "estimated_cost_usd",
+        "vehicle_data_paused",
         "range_at_100_km",
         "idle_range_loss_km_per_day",
         "temp_c_bucket",

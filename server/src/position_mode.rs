@@ -3,10 +3,10 @@
 
 //! Who writes drive GPS points.
 //!
-//! `hybrid` uses the Owner stream for drive positions and `vehicle_data` for
-//! everything the stream does not carry. `fallback` writes `source=poll`
-//! positions again because the socket is down, in error, or connected without
-//! a `data:update` while the car is driving. Neither mode calls `wake_up`.
+//! `hybrid` uses the Owner stream for drive positions. A healthy stream does
+//! not poll `vehicle_data` while the car is moving. `fallback` writes
+//! `source=poll` positions because the socket is down, in error, or connected
+//! without a fresh `data:update` during a drive. Neither mode calls `wake_up`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -105,17 +105,20 @@ pub(crate) fn store_poll_position(
 /// A backup `vehicle_data` read when the normal plan would not poll.
 ///
 /// Asleep and offline cars stay on the normal plan, which does not call
-/// `vehicle_data`. Fleet telemetry freshness is unchanged.
+/// `vehicle_data`. Grace and Hold (`movement_recent` false) stay there too.
+/// Fleet telemetry freshness is unchanged.
 pub(crate) fn fallback_observe(
     mode: PositionMode,
     presence: Presence,
     telemetry_fresh: bool,
     normal_observe: bool,
+    movement_recent: bool,
 ) -> bool {
     mode == PositionMode::Fallback
         && presence == Presence::Online
         && !telemetry_fresh
         && !normal_observe
+        && movement_recent
 }
 
 /// This poll sample is a drive point. Gear wins; a moving car with no gear counts too.
@@ -132,6 +135,9 @@ pub(crate) fn sample_is_driving(
         _ => speed_kmh.is_some_and(|speed| speed.is_finite() && speed > 1.0),
     }
 }
+
+/// How often a hybrid/fallback switch may pull the Fleet poll forward.
+pub(crate) const MODE_PULL_GAP: Duration = Duration::from_secs(120);
 
 struct Slot {
     up: bool,
@@ -171,6 +177,7 @@ pub(crate) struct GpsBoard {
     inner: Arc<Mutex<HashMap<i64, Slot>>>,
     debug: DebugBoard,
     wake: Arc<Notify>,
+    last_mode_pull: Arc<Mutex<Option<tokio::time::Instant>>>,
 }
 
 impl Default for GpsBoard {
@@ -188,6 +195,7 @@ impl GpsBoard {
             inner: Arc::new(Mutex::new(HashMap::new())),
             debug,
             wake,
+            last_mode_pull: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -197,6 +205,29 @@ impl GpsBoard {
 
     pub(crate) fn notify(&self) {
         self.wake.notify_one();
+    }
+
+    /// Connected, with a `data:update` no older than [`STREAM_UPDATE_STALE`].
+    pub(crate) async fn stream_fresh(&self, vehicle_id: i64) -> bool {
+        let guard = self.inner.lock().await;
+        let Some(slot) = guard.get(&vehicle_id) else {
+            return false;
+        };
+        slot.up
+            && slot
+                .last_update
+                .is_some_and(|at| at.elapsed() <= STREAM_UPDATE_STALE)
+    }
+
+    /// `true` at most once per `gap`. Mode changes outside that window still log.
+    pub(crate) async fn claim_mode_pull(&self, gap: Duration) -> bool {
+        let mut guard = self.last_mode_pull.lock().await;
+        let now = tokio::time::Instant::now();
+        if guard.is_some_and(|at| now.saturating_duration_since(at) < gap) {
+            return false;
+        }
+        *guard = Some(now);
+        true
     }
 
     pub(crate) async fn mode_name(&self, vehicle_id: i64) -> String {
@@ -301,8 +332,8 @@ impl GpsBoard {
 #[cfg(test)]
 mod tests {
     use super::{
-        Activity, Duration, Instant, PositionMode, Presence, STREAM_UPDATE_STALE, StreamLink,
-        fallback_observe, position_mode, sample_is_driving, store_poll_position,
+        Activity, Duration, Instant, MODE_PULL_GAP, PositionMode, Presence, STREAM_UPDATE_STALE,
+        StreamLink, fallback_observe, position_mode, sample_is_driving, store_poll_position,
     };
     use crate::debug::DebugBoard;
     use crate::logs::LogBuffer;
@@ -432,17 +463,27 @@ mod tests {
             PositionMode::Fallback,
             Presence::Asleep,
             false,
-            false
+            false,
+            true
         ));
         assert!(!fallback_observe(
             PositionMode::Fallback,
             Presence::Offline,
             false,
-            false
+            false,
+            true
         ));
         assert!(fallback_observe(
             PositionMode::Fallback,
             Presence::Online,
+            false,
+            false,
+            true
+        ));
+        assert!(!fallback_observe(
+            PositionMode::Fallback,
+            Presence::Online,
+            false,
             false,
             false
         ));
@@ -450,18 +491,21 @@ mod tests {
             PositionMode::Hybrid,
             Presence::Online,
             false,
-            false
+            false,
+            true
         ));
         assert!(!fallback_observe(
             PositionMode::Fallback,
             Presence::Online,
             true,
-            false
+            false,
+            true
         ));
         assert!(!fallback_observe(
             PositionMode::Fallback,
             Presence::Online,
             false,
+            true,
             true
         ));
     }
@@ -501,5 +545,15 @@ mod tests {
         assert!(!view.body.contains(vin), "{vin} leaked into {}", view.body);
         assert_eq!(board.mode_name(7).await, "fallback");
         assert_eq!(board.mode_name(99).await, "fallback");
+    }
+
+    #[tokio::test]
+    async fn mode_pull_is_at_most_once_per_two_minutes() {
+        tokio::time::pause();
+        let board = GpsBoard::default();
+        assert!(board.claim_mode_pull(MODE_PULL_GAP).await);
+        assert!(!board.claim_mode_pull(MODE_PULL_GAP).await);
+        tokio::time::advance(MODE_PULL_GAP).await;
+        assert!(board.claim_mode_pull(MODE_PULL_GAP).await);
     }
 }

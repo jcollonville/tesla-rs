@@ -96,6 +96,64 @@ pub(crate) async fn vehicle_state(
     Ok(Json(row))
 }
 
+pub(crate) async fn fleet_usage(
+    State(app): State<AppState>,
+) -> Result<Json<FleetUsageJson>, ApiError> {
+    let daily = crate::settings::bounded_u64(
+        &app.inner.db,
+        "FLEET_DATA_DAILY_CAP",
+        app.inner.config.fleet_daily_cap,
+        crate::budget::DAILY_CAP_MIN,
+        crate::budget::DAILY_CAP_MAX,
+    )
+    .await;
+    let mut monthly = crate::settings::bounded_u64(
+        &app.inner.db,
+        "FLEET_DATA_MONTHLY_CAP",
+        app.inner.config.fleet_monthly_cap,
+        crate::budget::MONTHLY_CAP_MIN,
+        crate::budget::MONTHLY_CAP_MAX,
+    )
+    .await;
+    if monthly < daily {
+        monthly = daily;
+    }
+    let gate = crate::budget::gate(&app.inner.db, daily, monthly, Utc::now()).await;
+    Ok(Json(FleetUsageJson::from_gate(&gate)))
+}
+
+#[derive(Serialize)]
+pub(crate) struct FleetUsageJson {
+    pub day: String,
+    pub today_calls: i64,
+    pub month_calls: i64,
+    pub today_estimated_cost_usd: f64,
+    pub estimated_cost_usd: f64,
+    pub daily_cap: i64,
+    pub monthly_cap: i64,
+    pub vehicle_data_paused: bool,
+    pub pause_reason: Option<String>,
+    pub billing_paused_until: Option<DateTime<Utc>>,
+}
+
+impl FleetUsageJson {
+    fn from_gate(gate: &crate::budget::Gate) -> Self {
+        let day = Utc::now().date_naive().to_string();
+        Self {
+            day,
+            today_calls: gate.today_calls,
+            month_calls: gate.month_calls,
+            today_estimated_cost_usd: gate.today_cost_usd(),
+            estimated_cost_usd: gate.month_cost_usd(),
+            daily_cap: gate.daily_cap,
+            monthly_cap: gate.monthly_cap,
+            vehicle_data_paused: gate.blocks_vehicle_data(),
+            pause_reason: gate.pause.map(|kind| kind.as_str().to_owned()),
+            billing_paused_until: gate.billing_until.filter(|until| *until > Utc::now()),
+        }
+    }
+}
+
 pub(crate) async fn list_drives(
     State(app): State<AppState>,
     Query(query): Query<ListQuery>,

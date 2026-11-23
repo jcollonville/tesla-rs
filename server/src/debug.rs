@@ -127,6 +127,7 @@ struct FleetSlot {
     charge: Duration,
     parked: Duration,
     asleep: Duration,
+    budget_banner: Option<String>,
 }
 
 struct ProbeSlot {
@@ -200,6 +201,7 @@ impl Default for DebugState {
                 charge: Duration::ZERO,
                 parked: Duration::ZERO,
                 asleep: Duration::ZERO,
+                budget_banner: None,
             },
             postgres: ProbeSlot {
                 reachable: None,
@@ -253,7 +255,7 @@ impl DebugBoard {
     pub(crate) fn apply_config(&self, config: &Config) {
         {
             let mut guard = self.lock();
-            guard.fleet.drive = config.drive_poll;
+            guard.fleet.drive = config.drive_fallback_poll;
             guard.fleet.charge = config.charge_poll;
             guard.fleet.parked = config.parked_poll;
             guard.fleet.asleep = config.asleep_poll;
@@ -537,6 +539,19 @@ impl DebugBoard {
         self.set_service(false, state, detail);
     }
 
+    /// Operator banner when `vehicle_data` is stopped. `None` clears it.
+    pub(crate) fn set_budget_banner(&self, text: Option<&str>) {
+        let text = text.map(str::to_owned);
+        {
+            let mut guard = self.lock();
+            if guard.fleet.budget_banner == text {
+                return;
+            }
+            guard.fleet.budget_banner = text;
+        }
+        self.notify();
+    }
+
     fn frames_after(&self, seq: u64) -> Vec<DebugEvent> {
         self.lock()
             .events
@@ -563,6 +578,9 @@ impl DebugBoard {
         let logs_cursor = lines.last().map_or(0, |line| line.seq);
         let mut body = String::new();
         body.push_str("<div id=\"status\" class=\"status-grid\">");
+        if let Some(banner) = guard.fleet.budget_banner.clone() {
+            body.push_str(&budget_banner_html(&banner));
+        }
         body.push_str(&render_owner(&guard, now));
         body.push_str(&render_fleet(&guard.fleet, now));
         body.push_str(&render_postgres(&guard.postgres, now));
@@ -722,6 +740,9 @@ fn status_html(app: &AppState) -> String {
     let guard = app.inner.debug.lock();
     let now = Utc::now();
     let mut html = String::new();
+    if let Some(banner) = guard.fleet.budget_banner.clone() {
+        html.push_str(&budget_banner_html(&banner));
+    }
     html.push_str(&render_owner(&guard, now));
     html.push_str(&render_fleet(&guard.fleet, now));
     html.push_str(&render_postgres(&guard.postgres, now));
@@ -778,6 +799,14 @@ fn token_mut<'a>(guard: &'a mut DebugState, kind: &str) -> &'a mut TokenSlot {
     } else {
         &mut guard.fleet_token
     }
+}
+
+fn budget_banner_html(text: &str) -> String {
+    let text = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!("<div class=\"banner bad\" role=\"alert\"><p>{text}</p></div>")
 }
 
 fn connection_text(stream_id: i64, stop: &StreamStop) -> String {
@@ -863,7 +892,7 @@ fn render_owner(guard: &DebugState, now: DateTime<Utc>) -> String {
 
 fn render_fleet(slot: &FleetSlot, now: DateTime<Utc>) -> String {
     let intervals = format!(
-        "drive {} · charge {} · parked {} · asleep {}",
+        "drive fallback {} · charge {} · parked {} · asleep {}",
         fmt_duration(slot.drive),
         fmt_duration(slot.charge),
         fmt_duration(slot.parked),
@@ -1283,5 +1312,18 @@ mod tests {
         assert!(html.contains("<dt>Ingestion lag</dt>"), "{html}");
         assert!(html.contains("<dt>Queue depth</dt><dd>4</dd>"), "{html}");
         assert!(!html.contains("5YJ"), "{html}");
+    }
+
+    #[test]
+    fn console_shows_the_budget_banner() {
+        let board = DebugBoard::new(LogBuffer::new(4));
+        board.set_budget_banner(Some(
+            "vehicle_data is paused: the daily Fleet API cap is reached. The vehicle list and the Owner stream keep running.",
+        ));
+        let html = board.console(&[]).body;
+        assert!(html.contains("class=\"banner bad\""), "{html}");
+        assert!(html.contains("daily Fleet API cap"), "{html}");
+        board.set_budget_banner(None);
+        assert!(!board.console(&[]).body.contains("banner bad"));
     }
 }
