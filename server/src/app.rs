@@ -176,6 +176,11 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
         .connect(&config.database_url)
         .await?;
     sqlx::migrate!("./migrations").run(&db).await?;
+    match crate::persist::repair_drive_park_tails(&db).await {
+        Ok(0) => {}
+        Ok(fixed) => tracing::info!(fixed, "repaired drive park-grace tails"),
+        Err(err) => tracing::warn!(error = %err, "drive park-grace repair failed"),
+    }
     crate::identity::bootstrap(&db, &config).await?;
     let imported = accounts::import_token_files(&db, &config).await?;
     let fleet_store = Arc::new(DbTokenStore::open(
