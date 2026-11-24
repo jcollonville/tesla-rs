@@ -59,8 +59,10 @@ pub(crate) struct Config {
     /// Optional currency per kWh used when a charge has no stored cost.
     pub energy_price_per_kwh: Option<f64>,
     /// How long a drive stays open after the last driving evidence when the link drops.
+    /// Closure detection only. It does not move `end_at`.
     pub drive_end_grace: Duration,
     /// How long a confirmed park (shift P, speed about 0) stays open before close.
+    /// Closure detection only. It does not move `end_at`.
     pub drive_park_grace: Duration,
     /// `local` (default), `oidc`, or `proxy`. Proxy requires an IP allowlist.
     pub auth_mode: String,

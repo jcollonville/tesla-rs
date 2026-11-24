@@ -239,8 +239,8 @@ Optional:
 | `FLEET_DATA_DAILY_CAP` | `150` | UTC-day cap on `vehicle_data` calls, including HTTP 408 and other 4xx. 0–100000. At the cap, `vehicle_data` stops; the vehicle list and the Owner stream continue |
 | `FLEET_DATA_MONTHLY_CAP` | `4500` | UTC-month cap. 0–1000000, and at least `FLEET_DATA_DAILY_CAP`. Estimated cost is calls / 500 USD, before the $10 monthly credit |
 | `FLEET_BLOCKED_PROBE_SECS` | `3600` | While Tesla returns 402 or 403 `EXCEEDED_LIMIT`, one probe this often. 300–86400. Success resumes polling |
-| `DRIVE_END_GRACE_SECS` | `300` | Keep one drive open across a signal gap, asleep, offline, or incomplete poll until this long after the last driving evidence. 30–1800. Must be at least `DRIVE_PARK_GRACE_SECS` |
-| `DRIVE_PARK_GRACE_SECS` | `90` | Close a drive this long after a confirmed park (shift P and speed about 0). 15–900 |
+| `DRIVE_END_GRACE_SECS` | `300` | Keep one drive open across a signal gap, asleep, offline, or incomplete poll until this long after the last driving evidence. 30–1800. Must be at least `DRIVE_PARK_GRACE_SECS`. Decides when the drive closes. Does not trim `end_at` |
+| `DRIVE_PARK_GRACE_SECS` | `90` | Close a drive this long after a confirmed park (shift P and speed about 0). 15–900. Decides when the drive closes. `end_at` is the last exact 0 km/h sample in the tail, or the last sample when that tail has no 0 km/h reading |
 | `NOMINATIM_ENABLED` | `true` | Reverse geocoding. The URL must be `https` when enabled |
 | `NOMINATIM_URL` | `https://nominatim.openstreetmap.org` | Nominatim base URL |
 | `NOMINATIM_CONTACT` | unset | Included in the User-Agent: `tesla-logger/0.1 (self-hosted; …)` |
