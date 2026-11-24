@@ -767,22 +767,25 @@ fn position_is_trailing_stop(cue: &PositionCue) -> bool {
 /// split the trip. Samples collected during that wait still have `drive_id` set;
 /// this cutoff is the first sample of the trailing standstill or park run so
 /// those wait minutes are detached and left out of `end_at` / charts.
+///
+/// When the newest sample is not a stop (still moving, or speed unknown), the
+/// cutoff is that newest time so incomplete rows are not trimmed away.
 pub(crate) fn drive_end_cutoff(cues: &[PositionCue], drive_start: DateTime<Utc>) -> DateTime<Utc> {
     let Some(newest) = cues.first() else {
         return drive_start;
     };
-    if position_is_trailing_stop(newest) {
-        let mut since = newest.at;
-        for cue in cues {
-            if position_is_trailing_stop(cue) {
-                since = cue.at;
-                continue;
-            }
-            break;
-        }
-        return since;
+    if !position_is_trailing_stop(newest) {
+        return newest.at;
     }
-    clock_from_tail(cues, drive_start).0.last_driving_at
+    let mut since = newest.at;
+    for cue in cues {
+        if position_is_trailing_stop(cue) {
+            since = cue.at;
+            continue;
+        }
+        break;
+    }
+    since
 }
 
 /// Prefers in-memory evidence when it is newer than the rows already stored.
@@ -1687,6 +1690,24 @@ mod tests {
         assert_eq!(
             super::drive_end_cutoff(&moving_only, drive_start),
             moving_only[0].at
+        );
+
+        let unknown_speed = vec![
+            super::PositionCue {
+                at: at(5),
+                speed_kmh: None,
+                shift_state: None,
+            },
+            super::PositionCue {
+                at: at(4),
+                speed_kmh: None,
+                shift_state: None,
+            },
+        ];
+        assert_eq!(
+            super::drive_end_cutoff(&unknown_speed, drive_start),
+            unknown_speed[0].at,
+            "missing speed must not invent a park tail"
         );
     }
 
