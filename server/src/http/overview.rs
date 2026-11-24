@@ -40,6 +40,11 @@ struct Live {
     charge_limit_soc: Option<f64>,
     time_to_full_charge_h: Option<f64>,
     plugged_in: Option<bool>,
+    scheduled_charging_mode: Option<String>,
+    scheduled_charging_start_time: Option<i32>,
+    scheduled_departure_time: Option<i32>,
+    off_peak_charging_enabled: Option<bool>,
+    off_peak_hours_end_time: Option<i32>,
     is_dc: Option<bool>,
     software_version: Option<String>,
     last_poll_at: Option<DateTime<Utc>>,
@@ -54,6 +59,9 @@ async fn live(app: &AppState, id: i64) -> Live {
                 s.inside_temp_c, s.outside_temp_c, s.locked, s.sentry_mode,
                 s.charging_state, s.charger_power_kw, s.charge_energy_added_kwh,
                 s.charge_limit_soc, s.time_to_full_charge_h, s.plugged_in, s.is_dc,
+                s.scheduled_charging_mode, s.scheduled_charging_start_time,
+                s.scheduled_departure_time, s.off_peak_charging_enabled,
+                s.off_peak_hours_end_time,
                 s.software_version, s.last_poll_at, s.last_data_at
          FROM vehicles v
          LEFT JOIN vehicle_state s ON s.vehicle_id = v.id
@@ -87,6 +95,16 @@ impl Live {
 
     fn range(&self) -> String {
         format::unit(self.rated_range_km.or(self.est_range_km), 0, "km")
+    }
+
+    fn schedule(&self) -> Option<String> {
+        format::schedule_label(
+            self.scheduled_charging_mode.as_deref(),
+            self.scheduled_charging_start_time,
+            self.scheduled_departure_time,
+            self.off_peak_charging_enabled,
+            self.off_peak_hours_end_time,
+        )
     }
 }
 
@@ -342,6 +360,7 @@ pub(super) async fn car_card(app: &AppState, id: i64) -> CarCard {
         limit_pct: state.charge_limit_soc,
         range: state.range(),
         note: charge_note(&state, status),
+        schedule: state.schedule(),
         facts,
         map,
         place,
@@ -355,6 +374,7 @@ pub(super) async fn decorate_fleet_card(app: &AppState, card: &mut FleetCard) {
     let state = live(app, card.id).await;
     card.look = state.look(app.inner.car_renders.enabled());
     card.status = state.status();
+    card.schedule = state.schedule();
     card.battery_pct = state.battery_level;
     card.limit_pct = state.charge_limit_soc;
     card.range = state.range();

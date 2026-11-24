@@ -14,12 +14,12 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use tesla_fleet_telemetry::proto::vehicle_connectivity::ConnectivityEvent;
 use tesla_fleet_telemetry::proto::vehicle_data::{
-    CableType, ChargePortLatchValue, ChargingState, DistanceUnit, Field, HvacPowerState,
-    ShiftState, WindowState,
+    CableType, ChargePortLatchValue, ChargingState, DetailedChargeStateValue, DistanceUnit, Field,
+    HvacPowerState, ScheduledChargingModeValue, ShiftState, WindowState,
 };
 use tesla_fleet_telemetry::{
-    ClientCa, DatumValue, Decoded, FieldKey, IncomingRecord, ServerConfig, TelemetryServer,
-    TypedEnum, VehicleData,
+    ClientCa, DatumValue, Decoded, DecodedDatum, FieldKey, IncomingRecord, ServerConfig,
+    TelemetryServer, TypedEnum, VehicleData,
 };
 use tokio::sync::watch;
 
@@ -180,14 +180,28 @@ pub(crate) fn fold_vehicle_data(obs: &mut Observation, data: &VehicleData) {
         obs.at = DateTime::<Utc>::from(time);
     }
     let mut metric = crate::units::units_are_metric(obs.distance_unit.as_deref());
-    for datum in data.iter() {
+    let datums: Vec<DecodedDatum> = data.iter().collect();
+    for datum in &datums {
         if let DatumValue::DistanceUnit(TypedEnum::Known(unit)) = &datum.value {
             metric = matches!(unit, DistanceUnit::Kilometers);
             obs.distance_unit = Some(if metric { "km/hr" } else { "mi/hr" }.to_owned());
         }
     }
-    for datum in data.iter() {
+    fold_datums(obs, &datums, metric);
+}
+
+/// Applies one telemetry payload. `DetailedChargeState` replaces the deprecated
+/// `ChargeState` when both are present, whichever order the car sent them.
+fn fold_datums(obs: &mut Observation, data: &[DecodedDatum], metric: bool) {
+    for datum in data {
         apply_field(obs, datum.field, &datum.value, metric);
+    }
+    if let Some(state) = data.iter().find_map(|datum| {
+        (datum.field == FieldKey::Known(Field::DetailedChargeState))
+            .then(|| charge_label(&datum.value))
+            .flatten()
+    }) {
+        obs.charging_state = Some(state.to_owned());
     }
     refresh_plugged_in(obs);
 }
@@ -218,7 +232,11 @@ fn apply_field(obs: &mut Observation, field: FieldKey, value: &DatumValue, metri
             }
         }
         Field::Gear => obs.shift_state = shift_label(value).map(str::to_owned),
-        Field::ChargeState => obs.charging_state = charge_label(value).map(str::to_owned),
+        Field::ChargeState | Field::DetailedChargeState => {
+            if let Some(label) = charge_label(value) {
+                obs.charging_state = Some(label.to_owned());
+            }
+        }
         Field::AcChargingPower | Field::DcChargingPower => {
             if let Some(power) = number(value) {
                 obs.charger_power_kw = Some(
@@ -266,6 +284,16 @@ fn apply_field(obs: &mut Observation, field: FieldKey, value: &DatumValue, metri
         Field::ScheduledChargingStartTime => {
             if let Some(minutes) = scheduled_minutes(value) {
                 obs.scheduled_charging_start_time = Some(minutes);
+            }
+        }
+        Field::ScheduledDepartureTime => {
+            if let Some(minutes) = scheduled_minutes(value) {
+                obs.scheduled_departure_time = Some(minutes);
+            }
+        }
+        Field::ScheduledChargingMode => {
+            if let Some(mode) = charging_mode_label(value) {
+                obs.scheduled_charging_mode = Some(mode);
             }
         }
         Field::TpmsPressureFl => obs.tpms_pressure_fl = nonneg(number(value)),
@@ -417,18 +445,43 @@ fn shift_label(value: &DatumValue) -> Option<&'static str> {
 }
 
 fn charge_label(value: &DatumValue) -> Option<&'static str> {
-    let DatumValue::ChargingState(TypedEnum::Known(state)) = value else {
-        return None;
+    match value {
+        DatumValue::ChargingState(TypedEnum::Known(state)) => match state {
+            ChargingState::ChargeStateCharging => Some("Charging"),
+            ChargingState::ChargeStateStarting => Some("Starting"),
+            ChargingState::ChargeStateDisconnected => Some("Disconnected"),
+            ChargingState::ChargeStateComplete => Some("Complete"),
+            ChargingState::ChargeStateStopped => Some("Stopped"),
+            ChargingState::ChargeStateNoPower => Some("NoPower"),
+            ChargingState::ChargeStateUnknown => None,
+        },
+        DatumValue::DetailedChargeState(TypedEnum::Known(state)) => match state {
+            DetailedChargeStateValue::DetailedChargeStateCharging => Some("Charging"),
+            DetailedChargeStateValue::DetailedChargeStateStarting => Some("Starting"),
+            DetailedChargeStateValue::DetailedChargeStateDisconnected => Some("Disconnected"),
+            DetailedChargeStateValue::DetailedChargeStateComplete => Some("Complete"),
+            DetailedChargeStateValue::DetailedChargeStateStopped => Some("Stopped"),
+            DetailedChargeStateValue::DetailedChargeStateNoPower => Some("NoPower"),
+            DetailedChargeStateValue::DetailedChargeStateUnknown => None,
+        },
+        _ => None,
+    }
+}
+
+fn charging_mode_label(value: &DatumValue) -> Option<String> {
+    let mode = match value {
+        DatumValue::ScheduledChargingMode(TypedEnum::Known(mode)) => match mode {
+            ScheduledChargingModeValue::ScheduledChargingModeOff => "Off",
+            ScheduledChargingModeValue::ScheduledChargingModeStartAt => "StartAt",
+            ScheduledChargingModeValue::ScheduledChargingModeDepartBy => "DepartBy",
+            ScheduledChargingModeValue::ScheduledChargingModeUnknown => return None,
+        },
+        DatumValue::String(text) => {
+            return crate::state::normalize_charging_mode(text).map(str::to_owned);
+        }
+        _ => return None,
     };
-    Some(match state {
-        ChargingState::ChargeStateCharging => "Charging",
-        ChargingState::ChargeStateStarting => "Starting",
-        ChargingState::ChargeStateDisconnected => "Disconnected",
-        ChargingState::ChargeStateComplete => "Complete",
-        ChargingState::ChargeStateStopped => "Stopped",
-        ChargingState::ChargeStateNoPower => "NoPower",
-        ChargingState::ChargeStateUnknown => return None,
-    })
+    Some(mode.to_owned())
 }
 
 #[cfg(test)]
@@ -558,5 +611,87 @@ mod tests {
         assert_eq!(obs.climate_on, Some(true));
         assert_eq!(obs.is_preconditioning, Some(true));
         assert_eq!(obs.scheduled_charging_start_time, Some(1320));
+    }
+
+    #[test]
+    fn detailed_charge_state_marks_a_stopped_cable_as_plugged() {
+        use super::{apply_field, refresh_plugged_in};
+        use tesla_fleet_telemetry::proto::vehicle_data::{DetailedChargeStateValue, Field};
+        use tesla_fleet_telemetry::{DatumValue, FieldKey, TypedEnum};
+
+        let mut obs = Observation::at(Utc::now(), Presence::Online);
+        apply_field(
+            &mut obs,
+            FieldKey::Known(Field::DetailedChargeState),
+            &DatumValue::DetailedChargeState(TypedEnum::Known(
+                DetailedChargeStateValue::DetailedChargeStateStopped,
+            )),
+            true,
+        );
+        obs.charge_port_latch = Some("Engaged".to_owned());
+        obs.charge_port_door_open = Some(false);
+        obs.charger_power_kw = Some(0.0);
+        refresh_plugged_in(&mut obs);
+        assert_eq!(obs.charging_state.as_deref(), Some("Stopped"));
+        assert_eq!(obs.plugged_in, Some(true));
+    }
+
+    #[test]
+    fn detailed_charge_state_wins_when_the_deprecated_field_says_disconnected() {
+        use super::{DecodedDatum, fold_datums};
+        use tesla_fleet_telemetry::proto::vehicle_data::{
+            ChargingState, DetailedChargeStateValue, Field,
+        };
+        use tesla_fleet_telemetry::{DatumValue, FieldKey, TypedEnum};
+
+        let known = FieldKey::Known;
+        let datums = [
+            DecodedDatum {
+                field: known(Field::DetailedChargeState),
+                value: DatumValue::DetailedChargeState(TypedEnum::Known(
+                    DetailedChargeStateValue::DetailedChargeStateStopped,
+                )),
+            },
+            DecodedDatum {
+                field: known(Field::ChargeState),
+                value: DatumValue::ChargingState(TypedEnum::Known(
+                    ChargingState::ChargeStateDisconnected,
+                )),
+            },
+        ];
+        let mut obs = Observation::at(Utc::now(), Presence::Online);
+        fold_datums(&mut obs, &datums, true);
+        assert_eq!(obs.charging_state.as_deref(), Some("Stopped"));
+        assert_eq!(obs.plugged_in, Some(true));
+    }
+
+    #[test]
+    fn folds_a_departure_schedule_in_local_minutes() {
+        use super::apply_field;
+        use tesla_fleet_telemetry::proto::vehicle_data::{Field, ScheduledChargingModeValue, Time};
+        use tesla_fleet_telemetry::{DatumValue, FieldKey, TypedEnum};
+
+        let mut obs = Observation::at(Utc::now(), Presence::Online);
+        let known = FieldKey::Known;
+        apply_field(
+            &mut obs,
+            known(Field::ScheduledChargingMode),
+            &DatumValue::ScheduledChargingMode(TypedEnum::Known(
+                ScheduledChargingModeValue::ScheduledChargingModeDepartBy,
+            )),
+            true,
+        );
+        apply_field(
+            &mut obs,
+            known(Field::ScheduledDepartureTime),
+            &DatumValue::Time(Time {
+                hour: 7,
+                minute: 30,
+                second: 0,
+            }),
+            true,
+        );
+        assert_eq!(obs.scheduled_charging_mode.as_deref(), Some("DepartBy"));
+        assert_eq!(obs.scheduled_departure_time, Some(7 * 60 + 30));
     }
 }

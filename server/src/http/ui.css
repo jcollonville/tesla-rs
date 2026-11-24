@@ -673,6 +673,8 @@ details.card[open] { padding-bottom: calc(var(--space) * 3); }
 }
 .fleet-card:hover { border-color: var(--line-strong); transform: translateY(-2px); }
 .fleet-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space); }
+.status-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; max-width: 16rem; }
+.fleet-schedule { margin: 0; text-align: right; font-size: 0.75rem; line-height: 1.3; }
 .fleet-name { margin: 0 0 4px; font-size: 1.375rem; }
 .fleet-car { margin: 0 -8px; }
 .fleet-battery { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space); }

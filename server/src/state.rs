@@ -97,8 +97,15 @@ pub(crate) struct Observation {
     pub conn_charge_cable: Option<String>,
     pub plugged_in: Option<bool>,
     pub time_to_full_charge_h: Option<f64>,
-    /// Minutes after midnight. This is the Fleet API unit.
+    /// Minutes after midnight on the car's local clock. This is the Fleet API unit.
     pub scheduled_charging_start_time: Option<i32>,
+    /// `Off`, `StartAt`, or `DepartBy`.
+    pub scheduled_charging_mode: Option<String>,
+    /// Minutes after midnight on the car's local clock.
+    pub scheduled_departure_time: Option<i32>,
+    pub off_peak_charging_enabled: Option<bool>,
+    /// Minutes after midnight on the car's local clock.
+    pub off_peak_hours_end_time: Option<i32>,
     pub tpms_pressure_fl: Option<f64>,
     pub tpms_pressure_fr: Option<f64>,
     pub tpms_pressure_rl: Option<f64>,
@@ -165,6 +172,10 @@ impl Observation {
             plugged_in: None,
             time_to_full_charge_h: None,
             scheduled_charging_start_time: None,
+            scheduled_charging_mode: None,
+            scheduled_departure_time: None,
+            off_peak_charging_enabled: None,
+            off_peak_hours_end_time: None,
             tpms_pressure_fl: None,
             tpms_pressure_fr: None,
             tpms_pressure_rl: None,
@@ -329,6 +340,59 @@ fn door_is_latched_shut(door_open: Option<bool>, power_kw: Option<f64>) -> bool 
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|text| !text.is_empty())
+}
+
+/// Cable state for the read API. Independent of sleep and driving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CableStatus {
+    Charging,
+    Plugged,
+    Unplugged,
+}
+
+impl CableStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Charging => "charging",
+            Self::Plugged => "plugged",
+            Self::Unplugged => "unplugged",
+        }
+    }
+}
+
+/// `Charging` is charging. `Starting`, `Stopped`, `Complete`, and `NoPower` are
+/// plugged in. `Disconnected` is unplugged even when a stale `plugged_in` is set.
+pub(crate) fn cable_status(
+    charging_state: Option<&str>,
+    plugged_in: Option<bool>,
+) -> Option<CableStatus> {
+    let charging = nonempty(charging_state).unwrap_or("").to_ascii_lowercase();
+    if charging == "charging" {
+        return Some(CableStatus::Charging);
+    }
+    if matches!(
+        charging.as_str(),
+        "starting" | "complete" | "stopped" | "nopower"
+    ) {
+        return Some(CableStatus::Plugged);
+    }
+    if charging != "disconnected" && plugged_in == Some(true) {
+        return Some(CableStatus::Plugged);
+    }
+    if charging == "disconnected" || plugged_in == Some(false) {
+        return Some(CableStatus::Unplugged);
+    }
+    None
+}
+
+/// Canonical schedule mode. Unknown text is dropped.
+pub(crate) fn normalize_charging_mode(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "scheduledchargingmodeoff" => Some("Off"),
+        "startat" | "start_at" | "scheduledchargingmodestartat" => Some("StartAt"),
+        "departby" | "depart_by" | "scheduledchargingmodedepartby" => Some("DepartBy"),
+        _ => None,
+    }
 }
 
 /// Open-session memory. Aggregates are recomputed from stored samples when a session closes.
@@ -2096,6 +2160,30 @@ mod tests {
         let merged = super::merge_clock(silent, Some(newer));
         assert_eq!(merged.last_driving_at, newer.last_driving_at);
         assert_eq!(merged.park_since, None);
+    }
+
+    #[test]
+    fn starting_opens_a_charge_and_stopped_does_not_keep_it_charging() {
+        let mut starting = online(0);
+        starting.charging_state = Some("Starting".to_owned());
+        let (tracker, events) = reduce(&Tracker::default(), &starting);
+        assert_eq!(events, vec![Transition::ChargeStarted]);
+        assert_eq!(tracker.activity, Activity::Charging);
+        assert!(tracker.charge_open);
+
+        let mut charging = online(1);
+        charging.charging_state = Some("Charging".to_owned());
+        let (tracker, events) = reduce(&tracker, &charging);
+        assert_eq!(events, []);
+        assert!(tracker.charge_open);
+        assert_eq!(tracker.activity, Activity::Charging);
+
+        let mut stopped = online(2);
+        stopped.charging_state = Some("Stopped".to_owned());
+        let (tracker, events) = reduce(&tracker, &stopped);
+        assert_eq!(events, vec![Transition::ChargeEnded]);
+        assert!(!tracker.charge_open);
+        assert_eq!(tracker.activity, Activity::Online);
     }
 
     #[test]

@@ -4,7 +4,7 @@
 import { TlCarImage } from "./car-image.js";
 import { TlElement, contextOf, h, readData } from "./dom.js";
 import { card, sheet } from "./styles.js";
-import { statusFrom } from "./status.js";
+import { scheduleFrom, statusFrom } from "./status.js";
 
 function temperature(fmt, value) {
   if (value == null || !Number.isFinite(Number(value))) return null;
@@ -61,9 +61,12 @@ export class TlVehicleCard extends TlElement {
     const model = data.model || fmt.strings.vehicle;
     eyebrow.textContent = data.trim ? `${model} · ${data.trim}` : model;
     h("h2", { class: "hero-name", id: "hero-name", text: data.name || fmt.strings.vehicle }, titles);
-    const chip = h("span", { class: `chip status ${status.tone}` }, head);
+    const statusCol = h("div", { class: "hero-status" }, head);
+    const chip = h("span", { class: `chip status ${status.tone}` }, statusCol);
     h("span", { class: "status-dot", "aria-hidden": "true" }, chip);
     chip.append(document.createTextNode(status.label));
+    const schedule = scheduleFrom(data, fmt.strings);
+    if (schedule) h("p", { class: "hero-schedule", text: schedule }, statusCol);
 
     const stage = h("div", { class: "hero-car" }, root);
     const photo = new TlCarImage();

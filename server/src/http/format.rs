@@ -236,6 +236,56 @@ pub(crate) fn ago(at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     format!("il y a {}{NNBSP}j", hours / 24)
 }
 
+/// French schedule line for the vehicle status. Times are already the car's
+/// local clock (minutes after midnight), so they are not shifted again.
+///
+/// Hidden when charging is `Off` and off-peak is not enabled. A start time
+/// with no mode is shown: that is the field older payloads send on its own.
+pub(crate) fn schedule_label(
+    mode: Option<&str>,
+    start_minute: Option<i32>,
+    departure_minute: Option<i32>,
+    off_peak: Option<bool>,
+    off_peak_end_minute: Option<i32>,
+) -> Option<String> {
+    let mode = mode.and_then(crate::state::normalize_charging_mode);
+    let mut parts = Vec::new();
+    if mode != Some("Off") {
+        if mode == Some("DepartBy") {
+            parts.push(match clock_minute(departure_minute) {
+                Some(time) => format!("Départ programmé à {time}"),
+                None => "Départ programmé".to_owned(),
+            });
+        } else if mode == Some("StartAt") || (mode.is_none() && start_minute.is_some()) {
+            if let Some(time) = clock_minute(start_minute) {
+                parts.push(format!("Charge programmée à {time}"));
+            } else if mode == Some("StartAt") {
+                parts.push("Charge programmée".to_owned());
+            }
+        }
+    }
+    if off_peak == Some(true) {
+        parts.push(match clock_minute(off_peak_end_minute) {
+            Some(time) => format!("Heures creuses jusqu'à {time}"),
+            None => "Heures creuses".to_owned(),
+        });
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+fn clock_minute(minutes: Option<i32>) -> Option<String> {
+    let minutes = minutes?;
+    if !(0..=1_440).contains(&minutes) {
+        return None;
+    }
+    let minutes = if minutes == 1_440 { 0 } else { minutes };
+    Some(format!("{:02}:{:02}", minutes / 60, minutes % 60))
+}
+
 pub(crate) fn capitalize(text: &str) -> String {
     let mut chars = text.chars();
     chars.next().map_or_else(String::new, |first| {
@@ -401,8 +451,44 @@ impl Place {
 
 #[cfg(test)]
 mod tests {
-    use super::{NNBSP, Place, ago, day_label, duration, km, number};
+    use super::{NNBSP, Place, ago, day_label, duration, km, number, schedule_label};
     use chrono::{NaiveDate, TimeZone, Utc};
+
+    #[test]
+    fn schedule_uses_the_car_clock_and_hides_when_off() {
+        assert_eq!(
+            schedule_label(Some("StartAt"), Some(1320), None, None, None).as_deref(),
+            Some("Charge programmée à 22:00")
+        );
+        assert_eq!(
+            schedule_label(None, Some(1320), None, Some(false), None).as_deref(),
+            Some("Charge programmée à 22:00")
+        );
+        assert_eq!(
+            schedule_label(Some("Off"), Some(1320), Some(420), Some(false), Some(360)),
+            None
+        );
+        assert_eq!(
+            schedule_label(
+                Some("DepartBy"),
+                Some(1320),
+                Some(450),
+                Some(true),
+                Some(360)
+            )
+            .as_deref(),
+            Some("Départ programmé à 07:30 · Heures creuses jusqu'à 06:00")
+        );
+        assert_eq!(
+            schedule_label(Some("Off"), None, None, Some(true), None).as_deref(),
+            Some("Heures creuses")
+        );
+        assert_eq!(schedule_label(None, None, None, None, None), None);
+        assert_eq!(
+            schedule_label(Some("StartAt"), Some(1440), None, None, None).as_deref(),
+            Some("Charge programmée à 00:00")
+        );
+    }
 
     #[test]
     fn numbers_use_french_separators() {

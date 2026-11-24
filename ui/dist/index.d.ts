@@ -29,6 +29,12 @@ export interface Strings {
   charging: string;
   plugged: string;
   parked: string;
+  chargeAt: string;
+  chargeScheduled: string;
+  departAt: string;
+  departScheduled: string;
+  offPeakUntil: string;
+  offPeak: string;
   asleep: string;
   offline: string;
   updating: string;
@@ -89,6 +95,12 @@ export interface VehicleCardData {
   activity?: string | null;
   charging_state?: string | null;
   plugged_in?: boolean | null;
+  schedule?: string | null;
+  scheduled_charging_mode?: string | null;
+  scheduled_charging_start_time?: number | null;
+  scheduled_departure_time?: number | null;
+  off_peak_charging_enabled?: boolean | null;
+  off_peak_hours_end_time?: number | null;
   battery_level?: number | null;
   charge_limit_soc?: number | null;
   rated_range_km?: number | null;

@@ -150,6 +150,17 @@ pub(crate) struct LiveEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheduled_charging_start_time: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduled_charging_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduled_departure_time: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub off_peak_charging_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub off_peak_hours_end_time: Option<i32>,
+    /// `charging`, `plugged`, or `unplugged`. Omitted when the cable state is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charge_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tpms_pressure_fl: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tpms_pressure_fr: Option<f64>,
@@ -255,6 +266,15 @@ impl LiveEvent {
             plugged_in: obs.plugged_in,
             time_to_full_charge_h: obs.time_to_full_charge_h,
             scheduled_charging_start_time: obs.scheduled_charging_start_time,
+            scheduled_charging_mode: obs.scheduled_charging_mode.clone(),
+            scheduled_departure_time: obs.scheduled_departure_time,
+            off_peak_charging_enabled: obs.off_peak_charging_enabled,
+            off_peak_hours_end_time: obs.off_peak_hours_end_time,
+            charge_status: crate::state::cable_status(
+                obs.charging_state.as_deref(),
+                obs.plugged_in,
+            )
+            .map(crate::state::CableStatus::as_str),
             tpms_pressure_fl: obs.tpms_pressure_fl,
             tpms_pressure_fr: obs.tpms_pressure_fr,
             tpms_pressure_rl: obs.tpms_pressure_rl,
@@ -2105,12 +2125,15 @@ async fn save_state(
                 charge_port_latch, plugged_in, time_to_full_charge_h, scheduled_charging_start_time,
                 tpms_pressure_fl, tpms_pressure_fr, tpms_pressure_rl, tpms_pressure_rr,
                 df, dr, pf, pr, fd_window, fp_window, rd_window, rp_window, ft, rt,
-                is_user_present, elevation_m, battery_heater_on, is_preconditioning
+                is_user_present, elevation_m, battery_heater_on, is_preconditioning,
+                scheduled_charging_mode, scheduled_departure_time,
+                off_peak_charging_enabled, off_peak_hours_end_time
              ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                 $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $27, NULL, now(),
                 $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39,
-                $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53
+                $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53,
+                $54, $55, $56, $57
              )
              ON CONFLICT (vehicle_id) DO UPDATE SET
                 activity = EXCLUDED.activity,
@@ -2167,7 +2190,11 @@ async fn save_state(
                 is_user_present = COALESCE(EXCLUDED.is_user_present, vehicle_state.is_user_present),
                 elevation_m = COALESCE(EXCLUDED.elevation_m, vehicle_state.elevation_m),
                 battery_heater_on = COALESCE(EXCLUDED.battery_heater_on, vehicle_state.battery_heater_on),
-                is_preconditioning = COALESCE(EXCLUDED.is_preconditioning, vehicle_state.is_preconditioning)",
+                is_preconditioning = COALESCE(EXCLUDED.is_preconditioning, vehicle_state.is_preconditioning),
+                scheduled_charging_mode = COALESCE(EXCLUDED.scheduled_charging_mode, vehicle_state.scheduled_charging_mode),
+                scheduled_departure_time = COALESCE(EXCLUDED.scheduled_departure_time, vehicle_state.scheduled_departure_time),
+                off_peak_charging_enabled = COALESCE(EXCLUDED.off_peak_charging_enabled, vehicle_state.off_peak_charging_enabled),
+                off_peak_hours_end_time = COALESCE(EXCLUDED.off_peak_hours_end_time, vehicle_state.off_peak_hours_end_time)",
         )
         .bind(vehicle_id)
         .bind(tracker.activity.as_str())
@@ -2222,6 +2249,10 @@ async fn save_state(
         .bind(obs.elevation_m)
         .bind(obs.battery_heater_on)
         .bind(obs.is_preconditioning)
+        .bind(&obs.scheduled_charging_mode)
+        .bind(obs.scheduled_departure_time)
+        .bind(obs.off_peak_charging_enabled)
+        .bind(obs.off_peak_hours_end_time)
         .execute(&mut **tx)
         .await?;
     } else {

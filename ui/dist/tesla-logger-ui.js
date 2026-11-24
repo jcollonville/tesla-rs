@@ -1,10 +1,10 @@
-var ut = (t) => {
+var ht = (t) => {
   throw TypeError(t);
 };
-var Pt = (t, e, r) => e.has(t) || ut("Cannot " + r);
-var dt = (t, e, r) => e.has(t) ? ut("Cannot add the same private member more than once") : e instanceof WeakSet ? e.add(t) : e.set(t, r);
-var R = (t, e, r) => (Pt(t, e, "access private method"), r);
-const jt = {
+var Ut = (t, e, r) => e.has(t) || ht("Cannot " + r);
+var ft = (t, e, r) => e.has(t) ? ht("Cannot add the same private member more than once") : e instanceof WeakSet ? e.add(t) : e.set(t, r);
+var R = (t, e, r) => (Ut(t, e, "access private method"), r);
+const Bt = {
   today: "Aujourd'hui",
   yesterday: "Hier",
   days: ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"],
@@ -41,6 +41,12 @@ const jt = {
   charging: "En charge",
   plugged: "Branchée",
   parked: "Garée",
+  chargeAt: "Charge programmée à {time}",
+  chargeScheduled: "Charge programmée",
+  departAt: "Départ programmé à {time}",
+  departScheduled: "Départ programmé",
+  offPeakUntil: "Heures creuses jusqu'à {time}",
+  offPeak: "Heures creuses",
   asleep: "Endormie",
   offline: "Hors ligne",
   updating: "Mise à jour",
@@ -56,7 +62,7 @@ const jt = {
   kwh: "kWh",
   currency: "€",
   vehicle: "Voiture"
-}, Ut = {
+}, It = {
   today: "Today",
   yesterday: "Yesterday",
   days: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
@@ -93,6 +99,12 @@ const jt = {
   charging: "Charging",
   plugged: "Plugged in",
   parked: "Parked",
+  chargeAt: "Scheduled charge at {time}",
+  chargeScheduled: "Scheduled charge",
+  departAt: "Scheduled departure at {time}",
+  departScheduled: "Scheduled departure",
+  offPeakUntil: "Off-peak until {time}",
+  offPeak: "Off-peak",
   asleep: "Asleep",
   offline: "Offline",
   updating: "Updating",
@@ -109,39 +121,39 @@ const jt = {
   currency: "€",
   vehicle: "Car"
 };
-function Bt(t) {
-  return String(t || "fr").toLowerCase().startsWith("fr") ? jt : Ut;
+function Ot(t) {
+  return String(t || "fr").toLowerCase().startsWith("fr") ? Bt : It;
 }
 const at = " ";
-function It(t, e) {
+function Wt(t, e) {
   if (!Number.isFinite(t)) return "—";
   const r = Math.abs(t).toFixed(e), [i, a] = r.split(".");
   let n = "";
-  for (let s = 0; s < i.length; s += 1)
-    s > 0 && (i.length - s) % 3 === 0 && (n += at), n += i[s];
-  const o = t < 0 && [...r].some((s) => s >= "1" && s <= "9") ? "−" : "";
-  return a ? `${o}${n},${a}` : o + n;
+  for (let l = 0; l < i.length; l += 1)
+    l > 0 && (i.length - l) % 3 === 0 && (n += at), n += i[l];
+  const s = t < 0 && [...r].some((l) => l >= "1" && l <= "9") ? "−" : "";
+  return a ? `${s}${n},${a}` : s + n;
 }
-function Ot(t, e, r) {
+function Rt(t, e, r) {
   return Number.isFinite(e) ? new Intl.NumberFormat(t, {
     minimumFractionDigits: r,
     maximumFractionDigits: r
   }).format(e) : "—";
 }
-function Wt(t, e, r = at) {
+function Ht(t, e, r = at) {
   if (t == null || !Number.isFinite(Number(t))) return "—";
   const i = Math.max(0, Math.trunc(Number(t)));
   if (i < 60) return `${i}${r}${e.second}`;
   const a = Math.trunc((i + 30) / 60);
   if (a < 60) return `${a}${r}${e.minute}`;
-  const n = Math.trunc(a / 60), l = a % 60;
-  return n >= 24 ? `${Math.trunc(n / 24)}${r}${e.day} ${n % 24}${r}${e.hour}` : `${n}${r}${e.hour}${r}${String(l).padStart(2, "0")}`;
+  const n = Math.trunc(a / 60), o = a % 60;
+  return n >= 24 ? `${Math.trunc(n / 24)}${r}${e.day} ${n % 24}${r}${e.hour}` : `${n}${r}${e.hour}${r}${String(o).padStart(2, "0")}`;
 }
-function st(t, e) {
+function lt(t, e) {
   return t > 0 && e > 0.05 ? t * 1e3 / e : null;
 }
-function Rt(t, e) {
-  var l, o;
+function Gt(t, e) {
+  var o, s;
   const r = new Date(t);
   if (Number.isNaN(r.getTime())) return "—";
   const i = new Intl.DateTimeFormat("en-GB", {
@@ -150,11 +162,11 @@ function Rt(t, e) {
     minute: "2-digit",
     hourCycle: "h23"
   }).formatToParts(r);
-  let a = ((l = i.find((s) => s.type === "hour")) == null ? void 0 : l.value) || "00";
-  const n = ((o = i.find((s) => s.type === "minute")) == null ? void 0 : o.value) || "00";
+  let a = ((o = i.find((l) => l.type === "hour")) == null ? void 0 : o.value) || "00";
+  const n = ((s = i.find((l) => l.type === "minute")) == null ? void 0 : s.value) || "00";
   return a === "24" && (a = "00"), `${a.padStart(2, "0")}:${n.padStart(2, "0")}`;
 }
-function ht(t, e) {
+function pt(t, e) {
   const r = new Date(t);
   if (Number.isNaN(r.getTime())) return null;
   const i = new Intl.DateTimeFormat("en-US", {
@@ -169,73 +181,73 @@ function ht(t, e) {
     d: Number(i.find((a) => a.type === "day").value)
   };
 }
-function ft(t, e) {
+function gt(t, e) {
   return t && e && t.y === e.y && t.m === e.m && t.d === e.d;
 }
-function Gt(t, e) {
+function qt(t, e) {
   const r = new Date(Date.UTC(t.y, t.m - 1, t.d));
   return r.setUTCDate(r.getUTCDate() + e), { y: r.getUTCFullYear(), m: r.getUTCMonth() + 1, d: r.getUTCDate() };
 }
-function Ht(t) {
+function Xt(t) {
   return (new Date(Date.UTC(t.y, t.m - 1, t.d)).getUTCDay() + 6) % 7;
 }
-function qt(t, e) {
+function Yt(t, e) {
   if (!t) return "";
   const [r, ...i] = [...t];
   return r.toLocaleUpperCase(e) + i.join("");
 }
-function Xt(t, e, r) {
-  const i = r.days[Ht(t)], a = r.months[t.m - 1];
+function Jt(t, e, r) {
+  const i = r.days[Xt(t)], a = r.months[t.m - 1];
   return e ? `${i} ${t.d} ${a} ${t.y}` : `${i} ${t.d} ${a}`;
 }
-function Yt(t, e, r, i, a) {
-  const n = ht(t, e), l = ht(r || (/* @__PURE__ */ new Date()).toISOString(), e);
-  return !n || !l ? "—" : ft(n, l) ? i.today : ft(n, Gt(l, -1)) ? i.yesterday : qt(Xt(n, n.y !== l.y, i), a);
+function Vt(t, e, r, i, a) {
+  const n = pt(t, e), o = pt(r || (/* @__PURE__ */ new Date()).toISOString(), e);
+  return !n || !o ? "—" : gt(n, o) ? i.today : gt(n, qt(o, -1)) ? i.yesterday : Yt(Jt(n, n.y !== o.y, i), a);
 }
-function Jt(t, e, r, i = at) {
+function Zt(t, e, r, i = at) {
   if (!t) return r.never;
   const a = new Date(t).getTime(), n = new Date(e || Date.now()).getTime();
   if (!Number.isFinite(a) || !Number.isFinite(n)) return r.never;
-  const l = Math.trunc((n - a) / 1e3);
-  if (l < 45) return r.justNow;
-  const o = Math.trunc((l + 30) / 60);
-  if (o < 60) return `${r.agoPrefix} ${o}${i}${r.minute}`;
-  const s = Math.trunc(o / 60);
-  return s < 48 ? `${r.agoPrefix} ${s}${i}${r.hour}` : `${r.agoPrefix} ${Math.trunc(s / 24)}${i}${r.day}`;
+  const o = Math.trunc((n - a) / 1e3);
+  if (o < 45) return r.justNow;
+  const s = Math.trunc((o + 30) / 60);
+  if (s < 60) return `${r.agoPrefix} ${s}${i}${r.minute}`;
+  const l = Math.trunc(s / 60);
+  return l < 48 ? `${r.agoPrefix} ${l}${i}${r.hour}` : `${r.agoPrefix} ${Math.trunc(l / 24)}${i}${r.day}`;
 }
-const Vt = ["quater", "bis", "ter"];
-function pt(t) {
+const Qt = ["quater", "bis", "ter"];
+function mt(t) {
   return t >= "0" && t <= "9";
 }
-function Zt(t) {
+function Kt(t) {
   return t >= "a" && t <= "z" || t >= "A" && t <= "Z";
 }
-function gt(t, e) {
+function bt(t, e) {
   const r = t[e];
   return r == null || r === " " || r === "-" || r === "/";
 }
-function mt(t, e) {
+function vt(t, e) {
   let r = e;
-  if (r >= t.length || !pt(t[r])) return -1;
-  for (; r < t.length && pt(t[r]); ) r += 1;
+  if (r >= t.length || !mt(t[r])) return -1;
+  for (; r < t.length && mt(t[r]); ) r += 1;
   const i = t[r] === " " ? r + 1 : r, a = t.slice(i).toLowerCase();
-  for (const n of Vt) {
+  for (const n of Qt) {
     if (!a.startsWith(n)) continue;
-    const l = i + n.length;
-    if (gt(t, l)) return l;
+    const o = i + n.length;
+    if (bt(t, o)) return o;
   }
-  return i < t.length && Zt(t[i]) && gt(t, i + 1) ? i + 1 : r;
+  return i < t.length && Kt(t[i]) && bt(t, i + 1) ? i + 1 : r;
 }
 function et(t) {
   const e = t.trim();
   if (!e) return !1;
-  let r = mt(e, 0);
-  return r < 0 ? !1 : r === e.length ? !0 : e[r] !== "-" && e[r] !== "/" ? !1 : (r += 1, e[r] === " " && (r += 1), mt(e, r) === e.length);
+  let r = vt(e, 0);
+  return r < 0 ? !1 : r === e.length ? !0 : e[r] !== "-" && e[r] !== "/" ? !1 : (r += 1, e[r] === " " && (r += 1), vt(e, r) === e.length);
 }
-function xt(t) {
+function wt(t) {
   return String(t || "").split(",").map((e) => e.trim()).filter(Boolean);
 }
-function yt(t) {
+function kt(t) {
   const e = [];
   for (let r = 0; r < t.length; r += 1) {
     const i = t[r + 1];
@@ -243,48 +255,48 @@ function yt(t) {
   }
   return e;
 }
-function Qt(t) {
-  return yt(xt(t)).join(", ");
+function te(t) {
+  return kt(wt(t)).join(", ");
 }
-function Kt(t) {
-  const e = xt(t);
+function ee(t) {
+  const e = wt(t);
   if (!e.length) return null;
-  const r = yt(e), a = et(e[0]) && e[1] && !et(e[1]) ? e[1] : r[0], l = (r[0] === a ? r.slice(1) : r).join(", ");
-  return { name: a, detail: l || null };
+  const r = kt(e), a = et(e[0]) && e[1] && !et(e[1]) ? e[1] : r[0], o = (r[0] === a ? r.slice(1) : r).join(", ");
+  return { name: a, detail: o || null };
 }
-function G(t, e) {
+function H(t, e) {
   const r = String(t || "").trim(), i = String(e || "").trim();
-  return i && r && i !== r ? { name: i, detail: Qt(r) } : i ? { name: i, detail: null } : r ? Kt(r) : null;
+  return i && r && i !== r ? { name: i, detail: te(r) } : i ? { name: i, detail: null } : r ? ee(r) : null;
 }
-function te(t = {}) {
-  const e = t.locale || "fr", r = t.timeZone || "UTC", i = t.format || {}, a = e.toLowerCase().startsWith("fr"), n = a ? at : " ", l = { ...Bt(e), ...t.strings || {}, ...i.strings || {} }, o = i.number || ((c, d) => a ? It(c, d) : Ot(e, c, d)), s = i.unit || ((c, d, h) => c == null || !Number.isFinite(Number(c)) ? "—" : `${o(Number(c), d)}${n}${h}`);
+function re(t = {}) {
+  const e = t.locale || "fr", r = t.timeZone || "UTC", i = t.format || {}, a = e.toLowerCase().startsWith("fr"), n = a ? at : " ", o = { ...Ot(e), ...t.strings || {}, ...i.strings || {} }, s = i.number || ((c, d) => a ? Wt(c, d) : Rt(e, c, d)), l = i.unit || ((c, d, h) => c == null || !Number.isFinite(Number(c)) ? "—" : `${s(Number(c), d)}${n}${h}`);
   return {
     locale: e,
     timeZone: r,
-    strings: l,
+    strings: o,
     sep: n,
-    number: o,
-    unit: s,
-    distance: i.distance || ((c) => c == null || !Number.isFinite(Number(c)) ? "—" : s(Number(c), Math.abs(c) < 100 ? 1 : 0, l.km)),
-    energy: i.energy || ((c) => s(c, 1, l.kwh)),
-    percent: i.percent || ((c) => s(c, 0, "%")),
-    money: i.money || ((c) => s(c, 2, l.currency)),
-    duration: i.duration || ((c) => Wt(c, l, n)),
-    clock: i.clock || ((c) => Rt(c, r)),
-    dayLabel: i.dayLabel || ((c, d) => Yt(c, r, d, l, e)),
-    ago: i.ago || ((c, d) => Jt(c, d, l, n))
+    number: s,
+    unit: l,
+    distance: i.distance || ((c) => c == null || !Number.isFinite(Number(c)) ? "—" : l(Number(c), Math.abs(c) < 100 ? 1 : 0, o.km)),
+    energy: i.energy || ((c) => l(c, 1, o.kwh)),
+    percent: i.percent || ((c) => l(c, 0, "%")),
+    money: i.money || ((c) => l(c, 2, o.currency)),
+    duration: i.duration || ((c) => Ht(c, o, n)),
+    clock: i.clock || ((c) => Gt(c, r)),
+    dayLabel: i.dayLabel || ((c, d) => Vt(c, r, d, o, e)),
+    ago: i.ago || ((c, d) => Zt(c, d, o, n))
   };
 }
-const ee = "http://www.w3.org/2000/svg";
+const ie = "http://www.w3.org/2000/svg";
 function u(t, e, r) {
   const i = document.createElement(t);
-  return wt(i, e), r && r.appendChild(i), i;
+  return _t(i, e), r && r.appendChild(i), i;
 }
-function x(t, e, r) {
-  const i = document.createElementNS(ee, t);
-  return wt(i, e), r && r.appendChild(i), i;
+function v(t, e, r) {
+  const i = document.createElementNS(ie, t);
+  return _t(i, e), r && r.appendChild(i), i;
 }
-function wt(t, e) {
+function _t(t, e) {
   if (e)
     for (const [r, i] of Object.entries(e))
       i == null || i === !1 || (r === "class" ? t.setAttribute("class", i) : r === "text" ? t.textContent = String(i) : t.setAttribute(r, String(i)));
@@ -299,7 +311,7 @@ function j(t) {
     return null;
   }
 }
-function re(t, e) {
+function ae(t, e) {
   try {
     if ("adoptedStyleSheets" in t && typeof CSSStyleSheet == "function") {
       const i = new CSSStyleSheet();
@@ -314,21 +326,21 @@ function re(t, e) {
 function I(t) {
   var i, a, n;
   const e = t.getAttribute("locale") || ((i = t.closest("[locale]")) == null ? void 0 : i.getAttribute("locale")) || ((a = document.documentElement) == null ? void 0 : a.lang) || "fr", r = t.getAttribute("time-zone") || ((n = t.closest("[time-zone]")) == null ? void 0 : n.getAttribute("time-zone")) || "UTC";
-  return te({
+  return re({
     locale: e,
     timeZone: r,
     format: t._format || null,
     strings: t._strings || null
   });
 }
-function ot(t) {
+function ct(t) {
   return t.getAttribute("now") || (/* @__PURE__ */ new Date()).toISOString();
 }
-class _ extends HTMLElement {
+class A extends HTMLElement {
   constructor(e) {
     super();
     const r = this.attachShadow({ mode: "open" });
-    re(r, e);
+    ae(r, e);
   }
   static get observedAttributes() {
     return ["locale", "time-zone", "theme", "now"];
@@ -399,7 +411,7 @@ class _ extends HTMLElement {
 function Y(t, e, r) {
   t.dispatchEvent(new CustomEvent(e, { detail: r, bubbles: !0, composed: !0 }));
 }
-const ie = `
+const ne = `
 :host {
   color: var(--tl-text, #171a20);
   font-family: var(--tl-font, -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif);
@@ -454,7 +466,7 @@ a { color: var(--tl-accent, #3e6ae1); }
     transition-duration: 0.01ms !important;
   }
 }
-`, ae = `
+`, se = `
 :host {
   display: block;
   position: relative;
@@ -469,6 +481,8 @@ a { color: var(--tl-accent, #3e6ae1); }
 }
 .eyebrow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; color: var(--tl-muted, #5c5e62); font-size: 0.75rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
 .hero-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.hero-status { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; max-width: 16rem; }
+.hero-schedule { margin: 0; color: var(--tl-muted, #5c5e62); font-size: 0.75rem; line-height: 1.3; text-align: right; }
 .hero-name { margin: 6px 0 0; font-size: clamp(1.5rem, 5vw, 2rem); font-weight: 500; letter-spacing: -0.02em; }
 .hero-car { margin: 16px -12px 8px; }
 .hero-energy { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; margin: 0 0 12px; }
@@ -488,7 +502,7 @@ dd { margin: 2px 0 0; overflow-wrap: anywhere; }
 .status.note { background: var(--tl-surface-2, #f4f4f4); color: var(--tl-amber, #c27c0e); }
 .status.idle { background: var(--tl-surface-2, #f4f4f4); color: var(--tl-muted, #5c5e62); }
 .status.drive .status-dot, .status.charge .status-dot { animation: tl-pulse 2s cubic-bezier(0.2, 0.7, 0.2, 1) infinite; }
-`, ne = `
+`, oe = `
 :host { display: block; width: 100%; }
 .stage { display: grid; aspect-ratio: 2 / 1; overflow: hidden; border-radius: var(--tl-radius-sm, 10px); background: var(--tl-surface-2, #f4f4f4); }
 .stage > * { grid-area: 1 / 1; }
@@ -498,7 +512,7 @@ img { display: none; width: 100%; height: 100%; object-fit: cover; scale: 1.14;
 :host(.ready) img { display: block; }
 :host(.ready) .placeholder { display: none; }
 .placeholder { display: flex; align-items: center; justify-content: center; margin: 0; padding: 16px; color: var(--tl-faint, #8e9095); font-size: 0.875rem; line-height: 1.4; text-align: center; }
-`, se = `
+`, le = `
 :host { display: block; width: 100%; }
 svg.battery-meter { display: block; width: 100%; height: 8px; overflow: visible; }
 .battery-track { fill: var(--tl-surface-3, #e9e9eb); }
@@ -506,7 +520,7 @@ svg.battery-meter { display: block; width: 100%; height: 8px; overflow: visible;
 .battery-meter.charging .battery-fill { fill: var(--tl-green, #1d9b52); }
 .battery-meter.low .battery-fill { fill: var(--tl-danger, #c8332f); }
 .battery-limit { fill: var(--tl-muted, #5c5e62); }
-`, oe = `
+`, ce = `
 :host { display: block; width: 100%; }
 .map-stack { position: relative; overflow: hidden; background: var(--tl-map-bg, #eef0f3); }
 .tiles { position: absolute; inset: 0; }
@@ -528,7 +542,7 @@ svg.mini-map { position: relative; display: block; width: 100%; height: auto; as
 .map-scale path { fill: none; stroke: var(--tl-muted, #5c5e62); stroke-width: 1.5; }
 .map-scale text { fill: var(--tl-muted, #5c5e62); font-family: var(--tl-font, sans-serif); font-size: 11px; dominant-baseline: middle; }
 :host(.has-tiles) .map-bg, :host(.has-tiles) .map-dots { display: none; }
-`, kt = `
+`, At = `
 :host { display: block; background: transparent; }
 :host(:not(:first-child)) { border-top: 1px solid var(--tl-line, rgba(23, 26, 32, 0.08)); }
 a.trip, .trip {
@@ -580,13 +594,13 @@ svg.soc-bar { display: block; width: 100%; max-width: 9rem; height: 6px; margin-
   .stat-label { display: block; color: var(--tl-faint, #8e9095); font-size: 0.6875rem; letter-spacing: 0.02em; }
   .chip.source { grid-column: 2; grid-row: 2; }
 }
-`, le = `
+`, ue = `
 :host { display: block; margin: 0 0 24px; }
 .day-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; padding: 0 4px 8px; }
 .day-head h2 { margin: 0; font-size: 1rem; font-weight: 600; }
 .day-head p { margin: 0; font-size: 0.8125rem; }
 .trips { overflow: hidden; border: 1px solid var(--tl-line, rgba(23, 26, 32, 0.08)); border-radius: var(--tl-radius, 14px); background: var(--tl-surface, #fff); box-shadow: var(--tl-shadow, 0 1px 2px rgba(23, 26, 32, 0.04), 0 8px 24px rgba(23, 26, 32, 0.04)); }
-`, ce = `
+`, de = `
 :host { display: block; padding: 24px; border: 1px solid var(--tl-line, rgba(23, 26, 32, 0.08)); border-radius: var(--tl-radius, 14px); background: var(--tl-surface, #fff); box-shadow: var(--tl-shadow, 0 1px 2px rgba(23, 26, 32, 0.04), 0 8px 24px rgba(23, 26, 32, 0.04)); }
 .recent-link { display: block; margin: 0 -12px -12px; padding: 12px; border-radius: 10px; color: inherit; text-decoration: none; }
 .recent-link:hover { background: var(--tl-surface-2, #f4f4f4); }
@@ -602,7 +616,7 @@ svg.soc-bar { display: block; width: 100%; max-width: 9rem; height: 6px; margin-
 .route-stop.start::before { border: 2px solid var(--tl-muted, #5c5e62); background: var(--tl-surface, #fff); }
 .route-stop.end::before { background: var(--tl-accent, #3e6ae1); }
 .live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--tl-green, #1d9b52); }
-`, ue = `
+`, he = `
 :host { display: block; }
 :host([variant="strip"]) { margin: 0 0 24px; }
 :host([variant="card"]) { padding: 24px; border: 1px solid var(--tl-line, rgba(23, 26, 32, 0.08)); border-radius: var(--tl-radius, 14px); background: var(--tl-surface, #fff); box-shadow: var(--tl-shadow, 0 1px 2px rgba(23, 26, 32, 0.04), 0 8px 24px rgba(23, 26, 32, 0.04)); }
@@ -617,19 +631,19 @@ dd { margin-top: 4px; font-size: 1.125rem; font-weight: 500; letter-spacing: -0.
 @media (min-width: 900px) {
   :host([variant="card"]) dl { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
-`, de = `
+`, fe = `
 :host { display: flex; flex-wrap: nowrap; gap: 2px; overflow-x: auto; scrollbar-width: none; padding: 3px; border-radius: 999px; background: var(--tl-surface-3, #e9e9eb); width: max-content; max-width: 100%; }
 :host::-webkit-scrollbar { display: none; }
 a { display: inline-flex; align-items: center; min-height: 32px; padding: 0 14px; border-radius: 999px; color: var(--tl-muted, #5c5e62); font-size: 0.8125rem; font-weight: 500; text-decoration: none; white-space: nowrap; }
 a:hover { color: var(--tl-text, #171a20); }
 a[aria-current="page"] { background: var(--tl-surface, #fff); color: var(--tl-text, #171a20); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12); }
-`, he = `
+`, pe = `
 :host { display: flex; flex-wrap: nowrap; gap: 4px; overflow-x: auto; scrollbar-width: none; margin: 0 0 24px; padding: 4px; border-radius: 999px; background: var(--tl-surface-3, #e9e9eb); width: max-content; max-width: 100%; }
 :host::-webkit-scrollbar { display: none; }
 a { display: inline-flex; align-items: center; justify-content: center; min-height: 36px; padding: 0 16px; border-radius: 999px; color: var(--tl-muted, #5c5e62); font-size: 0.875rem; font-weight: 500; text-decoration: none; white-space: nowrap; }
 a:hover { color: var(--tl-text, #171a20); }
 a[aria-selected="true"] { background: var(--tl-surface, #fff); color: var(--tl-text, #171a20); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12); }
-`, fe = `
+`, ge = `
 :host { display: block; position: relative; color: var(--tl-text, #171a20); }
 :host([variant="card"]) {
   padding: 20px;
@@ -677,27 +691,27 @@ figure.chart:not(.chart-lead) .chart-tools { display: none; }
 .chart-ready .chart-fallback { display: none; }
 svg.chart-fallback { display: block; width: 100%; height: 180px; color: var(--tl-accent, #3e6ae1); }
 `;
-function P(...t) {
-  return ie + t.join(`
+function D(...t) {
+  return ne + t.join(`
 `);
 }
-var U, nt, Q;
-class pe extends _ {
+var U, ot, Q;
+class me extends A {
   constructor() {
-    super(P(se));
-    dt(this, U);
+    super(D(le));
+    ft(this, U);
   }
   static get observedAttributes() {
-    return [..._.observedAttributes, "level", "limit", "charging", "low-at"];
+    return [...A.observedAttributes, "level", "limit", "charging", "low-at"];
   }
   set level(r) {
-    R(this, U, nt).call(this, "level", r);
+    R(this, U, ot).call(this, "level", r);
   }
   get level() {
     return R(this, U, Q).call(this, "level");
   }
   set limit(r) {
-    R(this, U, nt).call(this, "limit", r);
+    R(this, U, ot).call(this, "limit", r);
   }
   get limit() {
     return R(this, U, Q).call(this, "limit");
@@ -711,25 +725,25 @@ class pe extends _ {
   paint(r) {
     const i = I(this), a = this.level;
     if (a == null) return;
-    const n = Math.min(100, Math.max(0, a)), l = this.charging, o = R(this, U, Q).call(this, "low-at") ?? 20;
-    let s = "battery-meter";
-    l ? s += " charging" : n <= o && (s += " low");
-    const c = x("svg", {
-      class: s,
+    const n = Math.min(100, Math.max(0, a)), o = this.charging, s = R(this, U, Q).call(this, "low-at") ?? 20;
+    let l = "battery-meter";
+    o ? l += " charging" : n <= s && (l += " low");
+    const c = v("svg", {
+      class: l,
       viewBox: "0 0 100 8",
       preserveAspectRatio: "none",
       role: "img",
       "aria-label": `${i.strings.battery} ${Math.round(n)} %`,
       focusable: "false"
     }, r);
-    x("rect", { class: "battery-track", width: "100", height: "8", rx: "4" }, c), x("rect", {
+    v("rect", { class: "battery-track", width: "100", height: "8", rx: "4" }, c), v("rect", {
       class: "battery-fill",
       width: Math.max(2, n).toFixed(1),
       height: "8",
       rx: "4"
     }, c);
     const d = this.limit;
-    d != null && d > 0 && d < 100 && x("rect", {
+    d != null && d > 0 && d < 100 && v("rect", {
       class: "battery-limit",
       x: (d - 0.4).toFixed(1),
       y: "0",
@@ -738,7 +752,7 @@ class pe extends _ {
     }, c);
   }
 }
-U = new WeakSet(), nt = function(r, i) {
+U = new WeakSet(), ot = function(r, i) {
   i == null || i === "" || Number.isNaN(Number(i)) ? this.removeAttribute(r) : this.setAttribute(r, String(i));
 }, Q = function(r) {
   const i = this.getAttribute(r);
@@ -746,12 +760,12 @@ U = new WeakSet(), nt = function(r, i) {
   const a = Number(i);
   return Number.isFinite(a) ? a : null;
 };
-class At extends _ {
+class Mt extends A {
   constructor() {
-    super(P(ne));
+    super(D(oe));
   }
   static get observedAttributes() {
-    return [..._.observedAttributes, "image-url", "alt", "unavailable"];
+    return [...A.observedAttributes, "image-url", "alt", "unavailable"];
   }
   set imageUrl(e) {
     e ? this.setAttribute("image-url", e) : this.removeAttribute("image-url");
@@ -762,25 +776,25 @@ class At extends _ {
   paint(e) {
     const r = I(this), i = this.getAttribute("image-url") || "", a = this.getAttribute("unavailable") || r.strings.unavailableImage, n = this.getAttribute("alt") || a;
     this.classList.remove("ready");
-    const l = u("div", { class: "stage" }, e), o = u("p", { class: "placeholder", text: a }, l);
-    if (o.setAttribute("role", "img"), o.setAttribute("aria-label", a), !i) return;
-    const s = u("img", { alt: n, decoding: "async" }, l), c = () => {
-      s.naturalWidth > 0 && this.classList.add("ready");
+    const o = u("div", { class: "stage" }, e), s = u("p", { class: "placeholder", text: a }, o);
+    if (s.setAttribute("role", "img"), s.setAttribute("aria-label", a), !i) return;
+    const l = u("img", { alt: n, decoding: "async" }, o), c = () => {
+      l.naturalWidth > 0 && this.classList.add("ready");
     }, d = () => this.classList.remove("ready");
-    s.addEventListener("load", c), s.addEventListener("error", d), s.src = i, s.complete && (s.naturalWidth > 0 ? c() : d());
+    l.addEventListener("load", c), l.addEventListener("error", d), l.src = i, l.complete && (l.naturalWidth > 0 ? c() : d());
   }
 }
-var ge = "http://www.w3.org/2000/svg", K = " ", bt = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null, H = {}, me = 0;
-function be() {
-  return bt && bt.matches;
+var be = "http://www.w3.org/2000/svg", K = " ", xt = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null, G = {}, ve = 0;
+function xe() {
+  return xt && xt.matches;
 }
-function y(t, e, r) {
-  var i = document.createElementNS(ge, t);
+function x(t, e, r) {
+  var i = document.createElementNS(be, t);
   return e && Object.keys(e).forEach(function(a) {
     i.setAttribute(a, e[a]);
   }), r && r.appendChild(i), i;
 }
-function D(t, e, r) {
+function P(t, e, r) {
   var i = document.createElement(t);
   return e && (i.className = e), r && r.appendChild(i), i;
 }
@@ -799,40 +813,40 @@ function it(t, e, r) {
 function tt(t) {
   return t < 10 ? "0" + t : String(t);
 }
-function _t(t, e) {
+function Ct(t, e) {
   var r = t / Math.max(1, e), i = Math.pow(10, Math.floor(Math.log(r) / Math.LN10)), a = r / i, n = a < 1.5 ? 1 : a < 3 ? 2 : a < 7 ? 5 : 10;
   return n * i;
 }
-function Mt(t, e, r, i) {
+function Nt(t, e, r, i) {
   i && (t = Math.min(t, 0), e = Math.max(e, 0)), e > t || (e = t + 1, i || (t = t - 1));
-  for (var a = _t(e - t, r), n = Math.floor(t / a) * a, l = Math.ceil(e / a) * a, o = [], s = n; s <= l + a / 2; s += a) o.push(Math.abs(s) < a / 1e6 ? 0 : s);
-  return { lo: n, hi: l, ticks: o, step: a };
+  for (var a = Ct(e - t, r), n = Math.floor(t / a) * a, o = Math.ceil(e / a) * a, s = [], l = n; l <= o + a / 2; l += a) s.push(Math.abs(l) < a / 1e6 ? 0 : l);
+  return { lo: n, hi: o, ticks: s, step: a };
 }
-function Ct(t) {
+function St(t) {
   return t >= 1 ? 0 : Math.min(3, Math.ceil(-Math.log(t) / Math.LN10));
 }
-function Nt(t, e, r) {
+function $t(t, e, r) {
   var i = new Date(t.origin_ms + e * 1e3 + t.offset_min * 6e4), a = tt(i.getUTCHours()) + ":" + tt(i.getUTCMinutes());
   return r ? a + ":" + tt(i.getUTCSeconds()) : a;
 }
-function ve(t) {
+function ye(t) {
   var e = Math.round(t / 60);
   return e < 60 ? e + K + "min" : Math.floor(e / 60) + K + "h" + K + tt(e % 60);
 }
-function St(t, e, r) {
-  return t.kind === "time" ? Nt(t, e, r) : it(e, t.decimals || 0, t.unit);
+function Et(t, e, r) {
+  return t.kind === "time" ? $t(t, e, r) : it(e, t.decimals || 0, t.unit);
 }
-function xe(t, e, r, i) {
-  for (var a = [60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400], n = r - e, l = a[a.length - 1], o = 0; o < a.length; o++)
-    if (n / a[o] <= i) {
-      l = a[o];
+function we(t, e, r, i) {
+  for (var a = [60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400], n = r - e, o = a[a.length - 1], s = 0; s < a.length; s++)
+    if (n / a[s] <= i) {
+      o = a[s];
       break;
     }
-  for (var s = t.origin_ms / 1e3 + t.offset_min * 60, c = Math.ceil((s + e) / l) * l - s, d = [], h = c; h <= r; h += l) d.push(h);
+  for (var l = t.origin_ms / 1e3 + t.offset_min * 60, c = Math.ceil((l + e) / o) * o - l, d = [], h = c; h <= r; h += o) d.push(h);
   return d;
 }
-function ye(t, e, r) {
-  for (var i = _t(e - t, r), a = [], n = Math.ceil(t / i) * i; n <= e + i / 1e6; n += i) a.push(n);
+function ke(t, e, r) {
+  for (var i = Ct(e - t, r), a = [], n = Math.ceil(t / i) * i; n <= e + i / 1e6; n += i) a.push(n);
   return a;
 }
 function J(t, e) {
@@ -842,24 +856,24 @@ function J(t, e) {
   }
   return Math.abs(t[r] - e) <= Math.abs(t[i] - e) ? r : i;
 }
-function we(t) {
+function _e(t) {
   return 1 - Math.pow(1 - t, 3);
 }
-function $t(t, e, r) {
-  if (be()) {
+function Tt(t, e, r) {
+  if (xe()) {
     e(1);
     return;
   }
   var i = null;
   function a(n) {
     i === null && (i = n);
-    var l = Math.min(1, (n - i) / t);
-    e(we(l)), l < 1 && window.requestAnimationFrame(a);
+    var o = Math.min(1, (n - i) / t);
+    e(_e(o)), o < 1 && window.requestAnimationFrame(a);
   }
   window.requestAnimationFrame(a);
 }
-function N(t, e) {
-  if (this.figure = t, this.data = e, this.id = "c" + ++me, this.plot = t.querySelector(".chart-plot"), this.sync = t.getAttribute("data-sync"), this.active = -1, this.reveal = 0, e.kind === "line" && (this.full = [e.t[0], e.t[e.t.length - 1]], this.view = this.full.slice()), (!this.sync || !H[this.sync]) && t.classList.add("chart-lead"), this.build(), this.sync && ((H[this.sync] = H[this.sync] || []).push(this), this.map = document.querySelector('svg.map[data-sync="' + this.sync + '"]'), this.map)) {
+function $(t, e) {
+  if (this.figure = t, this.data = e, this.id = "c" + ++ve, this.plot = t.querySelector(".chart-plot"), this.sync = t.getAttribute("data-sync"), this.active = -1, this.reveal = 0, e.kind === "line" && (this.full = [e.t[0], e.t[e.t.length - 1]], this.view = this.full.slice()), (!this.sync || !G[this.sync]) && t.classList.add("chart-lead"), this.build(), this.sync && ((G[this.sync] = G[this.sync] || []).push(this), this.map = document.querySelector('svg.map[data-sync="' + this.sync + '"]'), this.map)) {
     try {
       this.mapXY = JSON.parse(this.map.getAttribute("data-xy") || "[]");
     } catch {
@@ -868,211 +882,211 @@ function N(t, e) {
     this.mapCursor = this.map.querySelector(".map-cursor");
   }
 }
-N.prototype.build = function() {
+$.prototype.build = function() {
   var t = this;
-  if (this.figure.classList.add("chart-ready"), this.root = y("svg", { class: "chart-svg", role: "presentation", "aria-hidden": "true", focusable: "false" }, this.plot), this.tip = D("div", "chart-tooltip", this.plot), this.tip.setAttribute("aria-hidden", "true"), this.live = D("p", "visually-hidden", this.figure), this.live.setAttribute("aria-live", "polite"), this.data.kind === "line") {
-    var e = D("div", "chart-tools", this.figure), r = D("button", "ghost small", e);
+  if (this.figure.classList.add("chart-ready"), this.root = x("svg", { class: "chart-svg", role: "presentation", "aria-hidden": "true", focusable: "false" }, this.plot), this.tip = P("div", "chart-tooltip", this.plot), this.tip.setAttribute("aria-hidden", "true"), this.live = P("p", "visually-hidden", this.figure), this.live.setAttribute("aria-live", "polite"), this.data.kind === "line") {
+    var e = P("div", "chart-tools", this.figure), r = P("button", "ghost small", e);
     r.type = "button", r.textContent = "Réinitialiser le zoom", r.addEventListener("click", function() {
       t.zoomTo(t.full[0], t.full[1], !0);
     });
   }
   if (this.data.series.length > 1) {
-    var i = D("p", "chart-legend", this.figure);
+    var i = P("p", "chart-legend", this.figure);
     this.data.series.forEach(function(a) {
-      var n = D("span", "", i);
-      D("span", "tip-swatch tone-" + a.tone, n), n.appendChild(document.createTextNode(a.name));
+      var n = P("span", "", i);
+      P("span", "tip-swatch tone-" + a.tone, n), n.appendChild(document.createTextNode(a.name));
     }), this.figure.insertBefore(i, this.plot);
   }
-  this.bind(), this.render(), $t(700, function(a) {
+  this.bind(), this.render(), Tt(700, function(a) {
     t.reveal = a, t.render();
   });
 };
-N.prototype.size = function() {
+$.prototype.size = function() {
   var t = Math.max(240, Math.round(this.plot.clientWidth || 600)), e = t < 520 ? 170 : 200;
   return this.data.kind === "bar" && (e += 16), { width: t, height: e, left: 44, right: 10, top: 10, bottom: 24 };
 };
-N.prototype.render = function() {
+$.prototype.render = function() {
   this.data.kind === "bar" ? this.renderBars() : this.renderLines();
 };
-N.prototype.renderLines = function() {
+$.prototype.renderLines = function() {
   for (var t = this.data, e = this.size(), r = this.root; r.firstChild; ) r.removeChild(r.firstChild);
   r.setAttribute("viewBox", "0 0 " + e.width + " " + e.height), r.setAttribute("width", e.width), r.setAttribute("height", e.height);
-  var i = e.width - e.left - e.right, a = e.height - e.top - e.bottom, n = this.view[0], l = this.view[1] > n ? this.view[1] : n + 1, o = t.t, s = Math.max(0, J(o, n) - 1), c = Math.min(o.length - 1, J(o, l) + 1), d = 1 / 0, h = -1 / 0, g = !1;
+  var i = e.width - e.left - e.right, a = e.height - e.top - e.bottom, n = this.view[0], o = this.view[1] > n ? this.view[1] : n + 1, s = t.t, l = Math.max(0, J(s, n) - 1), c = Math.min(s.length - 1, J(s, o) + 1), d = 1 / 0, h = -1 / 0, g = !1;
   t.series.forEach(function(p) {
     p.signed && (g = !0);
-    for (var T = s; T <= c; T++) {
-      var S = p.values[T];
-      S != null && (S < d && (d = S), S > h && (h = S));
+    for (var N = l; N <= c; N++) {
+      var C = p.values[N];
+      C != null && (C < d && (d = C), C > h && (h = C));
     }
   }), isFinite(d) || (d = 0, h = 1);
-  var f = Mt(d, h, e.height < 190 ? 3 : 4, g), A = Ct(f.step);
+  var f = Nt(d, h, e.height < 190 ? 3 : 4, g), _ = St(f.step);
   function b(p) {
-    return e.left + (p - n) / (l - n) * i;
+    return e.left + (p - n) / (o - n) * i;
   }
-  function w(p) {
+  function k(p) {
     return e.top + a - (p - f.lo) / (f.hi - f.lo) * a;
   }
-  this.px = b, this.py = w, this.box = e;
-  var k = y("g", { class: "chart-axis" }, r);
+  this.px = b, this.py = k, this.box = e;
+  var y = x("g", { class: "chart-axis" }, r);
   f.ticks.forEach(function(p) {
-    var T = Math.round(w(p)) + 0.5;
-    y("line", { class: p === 0 && g ? "chart-zero" : "chart-grid-line", x1: e.left, x2: e.width - e.right, y1: T, y2: T }, k);
-    var S = y("text", { class: "chart-tick", x: e.left - 8, y: T, "text-anchor": "end", "dominant-baseline": "middle" }, k);
-    S.textContent = rt(p, A);
+    var N = Math.round(k(p)) + 0.5;
+    x("line", { class: p === 0 && g ? "chart-zero" : "chart-grid-line", x1: e.left, x2: e.width - e.right, y1: N, y2: N }, y);
+    var C = x("text", { class: "chart-tick", x: e.left - 8, y: N, "text-anchor": "end", "dominant-baseline": "middle" }, y);
+    C.textContent = rt(p, _);
   });
-  var C = t.x.kind === "time" ? xe(t.x, n, l, Math.floor(i / 72)) : ye(n, l, Math.floor(i / 72));
-  C.forEach(function(p) {
-    var T = y("text", { class: "chart-tick", x: b(p), y: e.height - 6, "text-anchor": "middle" }, k);
-    T.textContent = t.x.kind === "time" ? Nt(t.x, p, !1) : rt(p, t.x.decimals || 0);
+  var S = t.x.kind === "time" ? we(t.x, n, o, Math.floor(i / 72)) : ke(n, o, Math.floor(i / 72));
+  S.forEach(function(p) {
+    var N = x("text", { class: "chart-tick", x: b(p), y: e.height - 6, "text-anchor": "middle" }, y);
+    N.textContent = t.x.kind === "time" ? $t(t.x, p, !1) : rt(p, t.x.decimals || 0);
   });
-  var E = y("defs", null, r), v = y("clipPath", { id: this.id + "-clip" }, E);
-  y("rect", { x: e.left, y: 0, width: Math.max(0, i * this.reveal), height: e.height }, v);
-  var m = y("g", { "clip-path": "url(#" + this.id + "-clip)" }, r), M = this;
-  t.series.forEach(function(p, T) {
-    for (var S = [], B = [], W = s; W <= c; W++) {
-      var $ = p.values[W];
-      if ($ == null) {
-        B.length && S.push(B), B = [];
+  var T = x("defs", null, r), w = x("clipPath", { id: this.id + "-clip" }, T);
+  x("rect", { x: e.left, y: 0, width: Math.max(0, i * this.reveal), height: e.height }, w);
+  var m = x("g", { "clip-path": "url(#" + this.id + "-clip)" }, r), M = this;
+  t.series.forEach(function(p, N) {
+    for (var C = [], B = [], W = l; W <= c; W++) {
+      var E = p.values[W];
+      if (E == null) {
+        B.length && C.push(B), B = [];
         continue;
       }
-      B.push([b(o[W]), w($)]);
+      B.push([b(s[W]), k(E)]);
     }
-    B.length && S.push(B);
-    var z = "", F = "", O = g ? w(0) : e.top + a;
-    S.forEach(function(X) {
-      var lt = X.map(function(ct, Dt) {
-        return (Dt ? "L" : "M") + ct[0].toFixed(1) + " " + ct[1].toFixed(1);
+    B.length && C.push(B);
+    var z = "", F = "", O = g ? k(0) : e.top + a;
+    C.forEach(function(X) {
+      var ut = X.map(function(dt, jt) {
+        return (jt ? "L" : "M") + dt[0].toFixed(1) + " " + dt[1].toFixed(1);
       }).join("");
-      z += lt, p.area && X.length > 1 && (F += lt + "L" + X[X.length - 1][0].toFixed(1) + " " + O.toFixed(1) + "L" + X[0][0].toFixed(1) + " " + O.toFixed(1) + "Z");
+      z += ut, p.area && X.length > 1 && (F += ut + "L" + X[X.length - 1][0].toFixed(1) + " " + O.toFixed(1) + "L" + X[0][0].toFixed(1) + " " + O.toFixed(1) + "Z");
     });
     var q = "tone-" + p.tone;
     if (F) {
-      var V = M.id + "-g" + T, Z = y("linearGradient", { id: V, class: q, x1: 0, y1: 0, x2: 0, y2: 1 }, E);
-      y("stop", { offset: 0, "stop-color": "currentColor", "stop-opacity": g ? 0.22 : 0.26 }, Z), y("stop", { offset: 1, "stop-color": "currentColor", "stop-opacity": 0.02 }, Z), y("path", { class: "chart-area", d: F, fill: "url(#" + V + ")" }, m);
+      var V = M.id + "-g" + N, Z = x("linearGradient", { id: V, class: q, x1: 0, y1: 0, x2: 0, y2: 1 }, T);
+      x("stop", { offset: 0, "stop-color": "currentColor", "stop-opacity": g ? 0.22 : 0.26 }, Z), x("stop", { offset: 1, "stop-color": "currentColor", "stop-opacity": 0.02 }, Z), x("path", { class: "chart-area", d: F, fill: "url(#" + V + ")" }, m);
     }
-    y("path", { class: "chart-line " + q, d: z }, m);
+    x("path", { class: "chart-line " + q, d: z }, m);
   });
-  var L = y("g", { class: "chart-cursor" }, r);
-  this.crosshair = y("line", { class: "chart-crosshair", x1: -10, x2: -10, y1: e.top, y2: e.top + a }, L), this.dots = t.series.map(function(p) {
-    return y("circle", { class: "chart-dot tone-" + p.tone, r: 4, cx: -10, cy: -10 }, L);
-  }), this.brush = y("rect", { class: "chart-brush", x: 0, y: e.top, width: 0, height: a }, r), this.figure.classList.toggle("zoomed", this.view[0] > this.full[0] || this.view[1] < this.full[1]), this.active >= 0 && this.showIndex(this.active, !1);
+  var L = x("g", { class: "chart-cursor" }, r);
+  this.crosshair = x("line", { class: "chart-crosshair", x1: -10, x2: -10, y1: e.top, y2: e.top + a }, L), this.dots = t.series.map(function(p) {
+    return x("circle", { class: "chart-dot tone-" + p.tone, r: 4, cx: -10, cy: -10 }, L);
+  }), this.brush = x("rect", { class: "chart-brush", x: 0, y: e.top, width: 0, height: a }, r), this.figure.classList.toggle("zoomed", this.view[0] > this.full[0] || this.view[1] < this.full[1]), this.active >= 0 && this.showIndex(this.active, !1);
 };
-N.prototype.renderBars = function() {
+$.prototype.renderBars = function() {
   var t = this.data, e = this.size();
   e.bottom = 30;
   for (var r = this.root; r.firstChild; ) r.removeChild(r.firstChild);
   r.setAttribute("viewBox", "0 0 " + e.width + " " + e.height), r.setAttribute("width", e.width), r.setAttribute("height", e.height);
-  for (var i = e.width - e.left - e.right, a = e.height - e.top - e.bottom, n = t.labels.length, l = [], o = 0, s = 0; s < n; s++) {
+  for (var i = e.width - e.left - e.right, a = e.height - e.top - e.bottom, n = t.labels.length, o = [], s = 0, l = 0; l < n; l++) {
     var c = 0, d = 0;
-    t.series.forEach(function($) {
-      var z = $.values[s] || 0;
+    t.series.forEach(function(E) {
+      var z = E.values[l] || 0;
       c += z, z > d && (d = z);
-    }), l.push(c), o = Math.max(o, t.stacked ? c : d);
+    }), o.push(c), s = Math.max(s, t.stacked ? c : d);
   }
-  var h = Mt(0, o || 1, e.height < 200 ? 3 : 4, !1), g = Ct(h.step);
-  function f($) {
-    return e.top + a - ($ - h.lo) / (h.hi - h.lo) * a;
+  var h = Nt(0, s || 1, e.height < 200 ? 3 : 4, !1), g = St(h.step);
+  function f(E) {
+    return e.top + a - (E - h.lo) / (h.hi - h.lo) * a;
   }
-  var A = y("g", { class: "chart-axis" }, r);
-  h.ticks.forEach(function($) {
-    var z = Math.round(f($)) + 0.5;
-    y("line", { class: "chart-grid-line", x1: e.left, x2: e.width - e.right, y1: z, y2: z }, A);
-    var F = y("text", { class: "chart-tick", x: e.left - 8, y: z, "text-anchor": "end", "dominant-baseline": "middle" }, A);
-    F.textContent = rt($, g);
+  var _ = x("g", { class: "chart-axis" }, r);
+  h.ticks.forEach(function(E) {
+    var z = Math.round(f(E)) + 0.5;
+    x("line", { class: "chart-grid-line", x1: e.left, x2: e.width - e.right, y1: z, y2: z }, _);
+    var F = x("text", { class: "chart-tick", x: e.left - 8, y: z, "text-anchor": "end", "dominant-baseline": "middle" }, _);
+    F.textContent = rt(E, g);
   });
-  var b = i / Math.max(1, n), w = Math.max(3, Math.min(42, b * 0.62)), k = Math.max(1, Math.ceil(52 / b)), C = y("g", { class: "chart-bars" }, r), E = this;
+  var b = i / Math.max(1, n), k = Math.max(3, Math.min(42, b * 0.62)), y = Math.max(1, Math.ceil(52 / b)), S = x("g", { class: "chart-bars" }, r), T = this;
   this.barGroups = [];
-  for (var v = 0; v < n; v++) {
-    var m = e.left + b * v + b / 2, M = y("g", { class: "chart-bar-group" }, C), L = f(0), p = t.series;
+  for (var w = 0; w < n; w++) {
+    var m = e.left + b * w + b / 2, M = x("g", { class: "chart-bar-group" }, S), L = f(0), p = t.series;
     if (t.stacked) {
-      var T = 0;
-      p.forEach(function($, z) {
-        var F = ($.values[v] || 0) * E.reveal;
+      var N = 0;
+      p.forEach(function(E, z) {
+        var F = (E.values[w] || 0) * T.reveal;
         if (!(F <= 0)) {
-          var O = f(T), q = f(T + F);
-          T += F;
+          var O = f(N), q = f(N + F);
+          N += F;
           var V = z === p.length - 1 || p.slice(z + 1).every(function(Z) {
-            return !(Z.values[v] > 0);
+            return !(Z.values[w] > 0);
           });
-          y("rect", { class: "chart-bar tone-" + $.tone, x: (m - w / 2).toFixed(1), y: q.toFixed(1), width: w.toFixed(1), height: Math.max(0.5, O - q).toFixed(1), rx: V ? Math.min(4, w / 4) : 0 }, M);
+          x("rect", { class: "chart-bar tone-" + E.tone, x: (m - k / 2).toFixed(1), y: q.toFixed(1), width: k.toFixed(1), height: Math.max(0.5, O - q).toFixed(1), rx: V ? Math.min(4, k / 4) : 0 }, M);
         }
       });
     } else {
-      var S = w / p.length;
-      p.forEach(function($, z) {
-        var F = $.values[v];
+      var C = k / p.length;
+      p.forEach(function(E, z) {
+        var F = E.values[w];
         if (F != null) {
-          var O = f(F * E.reveal);
-          y("rect", { class: "chart-bar tone-" + $.tone, x: (m - w / 2 + S * z).toFixed(1), y: Math.min(O, L).toFixed(1), width: Math.max(1, S - 1).toFixed(1), height: Math.max(0.5, Math.abs(L - O)).toFixed(1), rx: Math.min(4, S / 4) }, M);
+          var O = f(F * T.reveal);
+          x("rect", { class: "chart-bar tone-" + E.tone, x: (m - k / 2 + C * z).toFixed(1), y: Math.min(O, L).toFixed(1), width: Math.max(1, C - 1).toFixed(1), height: Math.max(0.5, Math.abs(L - O)).toFixed(1), rx: Math.min(4, C / 4) }, M);
         }
       });
     }
-    var B = y("rect", { class: "chart-bar-hit", x: e.left + b * v, y: e.top, width: b, height: a + e.bottom }, M);
-    if (B.setAttribute("data-index", v), this.barGroups.push(M), v % k === 0) {
-      var W = y("text", { class: "chart-tick", x: m, y: e.height - 10, "text-anchor": "middle" }, A);
-      W.textContent = t.labels[v];
+    var B = x("rect", { class: "chart-bar-hit", x: e.left + b * w, y: e.top, width: b, height: a + e.bottom }, M);
+    if (B.setAttribute("data-index", w), this.barGroups.push(M), w % y === 0) {
+      var W = x("text", { class: "chart-tick", x: m, y: e.height - 10, "text-anchor": "middle" }, _);
+      W.textContent = t.labels[w];
     }
   }
-  this.barBand = b, this.box = e, this.totals = l, this.active >= 0 && this.showBar(this.active, !1);
+  this.barBand = b, this.box = e, this.totals = o, this.active >= 0 && this.showBar(this.active, !1);
 };
-N.prototype.bind = function() {
+$.prototype.bind = function() {
   var t = this, e = this.plot, r = null;
-  function i(o) {
-    var s = e.getBoundingClientRect(), c = t.box ? t.box.width / s.width : 1;
-    return (o.clientX - s.left) * c;
+  function i(s) {
+    var l = e.getBoundingClientRect(), c = t.box ? t.box.width / l.width : 1;
+    return (s.clientX - l.left) * c;
   }
-  function a(o) {
-    var s = t.box, c = (o - s.left) / (s.width - s.left - s.right);
+  function a(s) {
+    var l = t.box, c = (s - l.left) / (l.width - l.left - l.right);
     return t.view[0] + Math.max(0, Math.min(1, c)) * (t.view[1] - t.view[0]);
   }
-  e.addEventListener("pointermove", function(o) {
-    var s = i(o);
+  e.addEventListener("pointermove", function(s) {
+    var l = i(s);
     if (t.data.kind === "bar") {
-      var c = Math.floor((s - t.box.left) / t.barBand);
+      var c = Math.floor((l - t.box.left) / t.barBand);
       c >= 0 && c < t.data.labels.length && t.showBar(c, !0);
       return;
     }
     if (r) {
-      r.current = s;
-      var d = Math.max(t.box.left, Math.min(r.start, s)), h = Math.min(t.box.width - t.box.right, Math.max(r.start, s));
+      r.current = l;
+      var d = Math.max(t.box.left, Math.min(r.start, l)), h = Math.min(t.box.width - t.box.right, Math.max(r.start, l));
       t.brush.setAttribute("x", d), t.brush.setAttribute("width", Math.max(0, h - d));
     }
-    var g = J(t.data.t, a(s));
+    var g = J(t.data.t, a(l));
     t.broadcast(g);
   }), e.addEventListener("pointerleave", function() {
     r || t.clearGroup();
-  }), e.addEventListener("pointerdown", function(o) {
-    t.data.kind !== "line" || o.button !== 0 || (r = { start: i(o), current: i(o), pointer: o.pointerId }, e.setPointerCapture && e.setPointerCapture(o.pointerId));
+  }), e.addEventListener("pointerdown", function(s) {
+    t.data.kind !== "line" || s.button !== 0 || (r = { start: i(s), current: i(s), pointer: s.pointerId }, e.setPointerCapture && e.setPointerCapture(s.pointerId));
   });
-  function n(o) {
+  function n(s) {
     if (r) {
-      var s = r.start, c = r.current;
+      var l = r.start, c = r.current;
       if (e.releasePointerCapture && r.pointer !== void 0)
         try {
           e.releasePointerCapture(r.pointer);
         } catch {
         }
-      if (r = null, t.brush.setAttribute("width", 0), Math.abs(c - s) > 12) {
-        var d = a(Math.min(s, c)), h = a(Math.max(s, c));
+      if (r = null, t.brush.setAttribute("width", 0), Math.abs(c - l) > 12) {
+        var d = a(Math.min(l, c)), h = a(Math.max(l, c));
         t.zoomTo(d, h, !0);
       }
-      o && o.type === "pointercancel" && t.clearGroup();
+      s && s.type === "pointercancel" && t.clearGroup();
     }
   }
   if (e.addEventListener("pointerup", n), e.addEventListener("pointercancel", n), e.addEventListener("dblclick", function() {
     t.data.kind === "line" && t.zoomTo(t.full[0], t.full[1], !0);
-  }), e.addEventListener("click", function(o) {
+  }), e.addEventListener("click", function(s) {
     if (!(t.data.kind !== "bar" || !t.data.hrefs)) {
-      var s = o.target, c = s && s.getAttribute ? s.getAttribute("data-index") : null;
+      var l = s.target, c = l && l.getAttribute ? l.getAttribute("data-index") : null;
       c !== null && t.data.hrefs[c] && (window.location.href = t.data.hrefs[c]);
     }
-  }), this.figure.addEventListener("keydown", function(o) {
-    var s = t.data.kind === "bar" ? t.data.labels.length : t.data.t.length, c = o.shiftKey ? 10 : 1, d = t.active;
-    d < 0 && (d = t.data.kind === "bar" ? s - 1 : J(t.data.t, (t.view[0] + t.view[1]) / 2));
+  }), this.figure.addEventListener("keydown", function(s) {
+    var l = t.data.kind === "bar" ? t.data.labels.length : t.data.t.length, c = s.shiftKey ? 10 : 1, d = t.active;
+    d < 0 && (d = t.data.kind === "bar" ? l - 1 : J(t.data.t, (t.view[0] + t.view[1]) / 2));
     var h = !0;
-    switch (o.key) {
+    switch (s.key) {
       case "ArrowRight":
-        d = Math.min(s - 1, d + c);
+        d = Math.min(l - 1, d + c);
         break;
       case "ArrowLeft":
         d = Math.max(0, d - c);
@@ -1081,7 +1095,7 @@ N.prototype.bind = function() {
         d = 0;
         break;
       case "End":
-        d = s - 1;
+        d = l - 1;
         break;
       case "+":
       case "=":
@@ -1104,12 +1118,12 @@ N.prototype.bind = function() {
         h = !1;
     }
     if (h) {
-      if (o.preventDefault(), t.data.kind === "bar") t.showBar(d, !0);
+      if (s.preventDefault(), t.data.kind === "bar") t.showBar(d, !0);
       else {
         var g = t.data.t[d];
         if (g < t.view[0] || g > t.view[1]) {
-          var f = t.view[1] - t.view[0], A = Math.max(t.full[0], Math.min(t.full[1] - f, g - f / 2));
-          t.zoomTo(A, A + f, !0);
+          var f = t.view[1] - t.view[0], _ = Math.max(t.full[0], Math.min(t.full[1] - f, g - f / 2));
+          t.zoomTo(_, _ + f, !0);
         }
         t.broadcast(d);
       }
@@ -1118,23 +1132,23 @@ N.prototype.bind = function() {
   }), this.figure.addEventListener("blur", function() {
     t.clearGroup();
   }), window.ResizeObserver) {
-    var l = 0;
+    var o = 0;
     new ResizeObserver(function() {
-      var o = Math.round(e.clientWidth);
-      o !== l && (l = o, t.render());
+      var s = Math.round(e.clientWidth);
+      s !== o && (o = s, t.render());
     }).observe(e);
   } else
     window.addEventListener("resize", function() {
       t.render();
     });
 };
-N.prototype.zoomAround = function(t, e) {
+$.prototype.zoomAround = function(t, e) {
   var r = (this.view[1] - this.view[0]) * e, i = this.full[1] - this.full[0];
   r = Math.max(Math.min(r, i), i / 200);
   var a = Math.max(this.full[0], Math.min(this.full[1] - r, t - r / 2));
   this.zoomTo(a, a + r, !0);
 };
-N.prototype.zoomTo = function(t, e, r) {
+$.prototype.zoomTo = function(t, e, r) {
   if (this.data.kind === "line") {
     var i = (this.full[1] - this.full[0]) / 200;
     if (e - t < i) {
@@ -1142,62 +1156,62 @@ N.prototype.zoomTo = function(t, e, r) {
       t = a - i / 2, e = a + i / 2;
     }
     t = Math.max(this.full[0], t), e = Math.min(this.full[1], e);
-    var n = this, l = this.view.slice();
-    $t(320, function(o) {
-      n.view = [l[0] + (t - l[0]) * o, l[1] + (e - l[1]) * o], n.render();
-    }), r && this.sync && this.data.x.kind === "time" && (H[this.sync] || []).forEach(function(o) {
-      o !== n && o.data.kind === "line" && o.data.x.kind === "time" && o.zoomTo(t, e, !1);
+    var n = this, o = this.view.slice();
+    Tt(320, function(s) {
+      n.view = [o[0] + (t - o[0]) * s, o[1] + (e - o[1]) * s], n.render();
+    }), r && this.sync && this.data.x.kind === "time" && (G[this.sync] || []).forEach(function(s) {
+      s !== n && s.data.kind === "line" && s.data.x.kind === "time" && s.zoomTo(t, e, !1);
     });
   }
 };
-N.prototype.broadcast = function(t) {
+$.prototype.broadcast = function(t) {
   var e = this.data.t[t], r = this;
-  this.showIndex(t, !0), this.sync && (H[this.sync] || []).forEach(function(i) {
+  this.showIndex(t, !0), this.sync && (G[this.sync] || []).forEach(function(i) {
     i !== r && i.data.kind === "line" && i.showIndex(J(i.data.t, e), !1);
   }), this.moveMap(t);
 };
-N.prototype.clearGroup = function() {
-  var t = this.sync ? H[this.sync] || [this] : [this];
+$.prototype.clearGroup = function() {
+  var t = this.sync ? G[this.sync] || [this] : [this];
   t.forEach(function(e) {
     e.clear();
   }), this.mapCursor && this.mapCursor.classList.remove("on"), this.sync && window.teslaMapHide && window.teslaMapHide(this.sync);
 };
-N.prototype.clear = function() {
+$.prototype.clear = function() {
   this.active = -1, this.figure.classList.remove("chart-on"), this.barGroups && this.barGroups.forEach(function(t) {
     t.querySelectorAll(".chart-bar").forEach(function(e) {
       e.classList.remove("on");
     });
   });
 };
-N.prototype.moveMap = function(t) {
+$.prototype.moveMap = function(t) {
   if (this.mapCursor && this.mapXY && this.mapXY[t] && this.mapXY[t][0] >= -50) {
     var e = this.mapXY[t];
     this.mapCursor.setAttribute("cx", e[0]), this.mapCursor.setAttribute("cy", e[1]), this.mapCursor.classList.add("on");
   }
   this.sync && window.teslaMapMove && window.teslaMapMove(this.sync, t);
 };
-N.prototype.showIndex = function(t, e) {
+$.prototype.showIndex = function(t, e) {
   var r = this.data, i = r.t[t];
   if (!(i === void 0 || !this.px)) {
     this.active = t;
     var a = this.px(i), n = i >= this.view[0] && i <= this.view[1];
     this.crosshair.setAttribute("x1", a), this.crosshair.setAttribute("x2", a);
-    var l = this, o = [];
-    r.series.forEach(function(s, c) {
-      var d = s.values[t], h = l.dots[c];
+    var o = this, s = [];
+    r.series.forEach(function(l, c) {
+      var d = l.values[t], h = o.dots[c];
       if (d == null || !n) {
         h.setAttribute("cx", -10);
         return;
       }
-      h.setAttribute("cx", a), h.setAttribute("cy", l.py(d)), o.push([s, d]);
-    }), this.figure.classList.toggle("chart-on", n), this.fillTip(St(r.x, i, !0) + (r.x.kind === "time" && i > 0 ? " · +" + ve(i) : ""), o, a, e);
+      h.setAttribute("cx", a), h.setAttribute("cy", o.py(d)), s.push([l, d]);
+    }), this.figure.classList.toggle("chart-on", n), this.fillTip(Et(r.x, i, !0) + (r.x.kind === "time" && i > 0 ? " · +" + ye(i) : ""), s, a, e);
   }
 };
-N.prototype.showBar = function(t, e) {
+$.prototype.showBar = function(t, e) {
   var r = this.data;
-  this.active = t, this.barGroups.forEach(function(n, l) {
-    n.querySelectorAll(".chart-bar").forEach(function(o) {
-      o.classList.toggle("on", l === t);
+  this.active = t, this.barGroups.forEach(function(n, o) {
+    n.querySelectorAll(".chart-bar").forEach(function(s) {
+      s.classList.toggle("on", o === t);
     });
   });
   var i = r.series.map(function(n) {
@@ -1207,32 +1221,32 @@ N.prototype.showBar = function(t, e) {
   var a = this.box.left + this.barBand * t + this.barBand / 2;
   this.fillTip(r.titles && r.titles[t] || r.labels[t], i, a, e);
 };
-N.prototype.fillTip = function(t, e, r, i) {
+$.prototype.fillTip = function(t, e, r, i) {
   for (var a = this.tip; a.firstChild; ) a.removeChild(a.firstChild);
   if (!i) {
     a.classList.add("visually-hidden");
     return;
   }
-  a.classList.remove("visually-hidden"), D("div", "tip-head", a).textContent = t, e.forEach(function(c) {
-    var d = D("div", "tip-row", a);
-    c[0].tone && D("span", "tip-swatch tone-" + c[0].tone, d);
-    var h = D("span", "", d);
+  a.classList.remove("visually-hidden"), P("div", "tip-head", a).textContent = t, e.forEach(function(c) {
+    var d = P("div", "tip-row", a);
+    c[0].tone && P("span", "tip-swatch tone-" + c[0].tone, d);
+    var h = P("span", "", d);
     h.textContent = c[0].name;
-    var g = D("b", "", d);
+    var g = P("b", "", d);
     g.textContent = it(c[1], c[0].decimals, c[0].unit);
   });
-  var n = this.plot.clientWidth || 1, l = n / this.box.width, o = r * l + 14, s = a.offsetWidth || 140;
-  o + s > n && (o = r * l - s - 14), a.style.transform = "translate(" + Math.max(0, Math.round(o)) + "px, 4px)";
+  var n = this.plot.clientWidth || 1, o = n / this.box.width, s = r * o + 14, l = a.offsetWidth || 140;
+  s + l > n && (s = r * o - l - 14), a.style.transform = "translate(" + Math.max(0, Math.round(s)) + "px, 4px)";
 };
-N.prototype.announce = function(t) {
+$.prototype.announce = function(t) {
   var e = this.data, r, i = [];
   e.kind === "bar" ? (r = e.titles && e.titles[t] || e.labels[t], e.series.forEach(function(a) {
     i.push(a.name + " " + it(a.values[t], a.decimals, a.unit));
-  })) : (r = St(e.x, e.t[t], !1), e.series.forEach(function(a) {
+  })) : (r = Et(e.x, e.t[t], !1), e.series.forEach(function(a) {
     i.push(a.name + " " + it(a.values[t], a.decimals, a.unit));
   })), this.live.textContent = r + " : " + i.join(", ");
 };
-function Oe(t) {
+function He(t) {
   var e = t || document, r = e.querySelectorAll("figure.chart[data-chart]");
   Array.prototype.forEach.call(r, function(i) {
     if (!(i.closest && i.closest("tl-chart"))) {
@@ -1242,25 +1256,25 @@ function Oe(t) {
       } catch {
         return;
       }
-      Et(i, a);
+      zt(i, a);
     }
   });
 }
-function Et(t, e) {
-  return !t || !e || !e.series || !e.series.length || e.kind === "line" && (!e.t || e.t.length < 2) || e.kind === "bar" && (!e.labels || !e.labels.length) ? null : new N(t, e);
+function zt(t, e) {
+  return !t || !e || !e.series || !e.series.length || e.kind === "line" && (!e.t || e.t.length < 2) || e.kind === "bar" && (!e.labels || !e.labels.length) ? null : new $(t, e);
 }
-function ke(t) {
+function Ae(t) {
   var e;
   if (!t || t.kind === "line") {
     const r = [], i = (e = t == null ? void 0 : t.series) == null ? void 0 : e[0], a = (t == null ? void 0 : t.t) || [];
-    if (i && a.length > 1 && a.forEach((f, A) => {
-      const b = i.values[A];
+    if (i && a.length > 1 && a.forEach((f, _) => {
+      const b = i.values[_];
       b != null && r.push([f, b]);
     }), r.length < 2) return null;
-    const n = r[0][0], l = r[r.length - 1][0] || 1, o = Math.min(...r.map((f) => f[1])), s = Math.max(...r.map((f) => f[1])), c = l - n || 1, d = s - o || 1, h = r.map(([f, A]) => {
-      const b = (f - n) / c * 100, w = 40 - (A - o) / d * 36;
-      return `${b.toFixed(2)},${w.toFixed(2)}`;
-    }).join(" "), g = x("svg", {
+    const n = r[0][0], o = r[r.length - 1][0] || 1, s = Math.min(...r.map((f) => f[1])), l = Math.max(...r.map((f) => f[1])), c = o - n || 1, d = l - s || 1, h = r.map(([f, _]) => {
+      const b = (f - n) / c * 100, k = 40 - (_ - s) / d * 36;
+      return `${b.toFixed(2)},${k.toFixed(2)}`;
+    }).join(" "), g = v("svg", {
       class: "chart-fallback",
       viewBox: "0 0 100 44",
       width: "640",
@@ -1269,24 +1283,24 @@ function ke(t) {
       role: "img",
       "aria-hidden": "true"
     });
-    return x("polyline", { fill: "none", stroke: "currentColor", "stroke-width": "1.2", points: h }, g), g;
+    return v("polyline", { fill: "none", stroke: "currentColor", "stroke-width": "1.2", points: h }, g), g;
   }
   return null;
 }
-class Ae extends _ {
+class Me extends A {
   constructor() {
-    super(P(fe));
+    super(D(ge));
   }
   static get observedAttributes() {
-    return [..._.observedAttributes, "title", "summary", "variant", "sync"];
+    return [...A.observedAttributes, "title", "summary", "variant", "sync"];
   }
   paint(e) {
     const r = this._chart(), i = this.getAttribute("title") || (r == null ? void 0 : r.title) || "", a = this.getAttribute("summary") || (r == null ? void 0 : r.summary) || "", n = u("figure", { class: "chart", tabindex: "0", "aria-label": `${i}. ${a}` }, e);
     this.getAttribute("sync") && n.setAttribute("data-sync", this.getAttribute("sync"));
-    const l = u("figcaption", null, n);
-    u("span", { class: "chart-title", text: i }, l), u("span", { class: "chart-summary", text: a }, l);
-    const o = u("div", { class: "chart-plot" }, n), s = ke(r);
-    s && o.append(s), r && (Et(n, r), this.classList.add("ready"));
+    const o = u("figcaption", null, n);
+    u("span", { class: "chart-title", text: i }, o), u("span", { class: "chart-summary", text: a }, o);
+    const s = u("div", { class: "chart-plot" }, n), l = Ae(r);
+    l && s.append(l), r && (zt(n, r), this.classList.add("ready"));
   }
   _chart() {
     const e = j(this);
@@ -1300,8 +1314,8 @@ class Ae extends _ {
     }
   }
 }
-function _e(t, e) {
-  const r = st(Number(t.energy_used_kwh), Number(t.distance_km));
+function Ce(t, e) {
+  const r = lt(Number(t.energy_used_kwh), Number(t.distance_km));
   return [
     { label: e.strings.drives, value: e.number(Number(t.drive_count) || 0, 0) },
     { label: e.strings.distance, value: e.distance(t.distance_km) },
@@ -1310,40 +1324,40 @@ function _e(t, e) {
     { label: e.strings.efficiency, value: r == null ? "—" : e.unit(r, 0, "Wh/km") }
   ];
 }
-class Me extends _ {
+class Ne extends A {
   constructor() {
-    super(P(ue));
+    super(D(he));
   }
   static get observedAttributes() {
-    return [..._.observedAttributes, "variant", "title", "label", "link-href", "link-label"];
+    return [...A.observedAttributes, "variant", "title", "label", "link-href", "link-label"];
   }
   paint(e) {
     const r = I(this);
     let i = j(this);
-    i && !Array.isArray(i) && i.drive_count != null && (i = _e(i, r)), Array.isArray(i) || (i = []);
+    i && !Array.isArray(i) && i.drive_count != null && (i = Ce(i, r)), Array.isArray(i) || (i = []);
     const a = this.getAttribute("variant") || "strip";
     if (a === "card") {
-      const l = u("div", { class: "card-head" }, e);
-      u("h2", { text: this.getAttribute("title") || "" }, l);
-      const o = this.getAttribute("link-href"), s = this.getAttribute("link-label");
-      o && s && u("a", { class: "text-link", href: o, text: s }, l);
+      const o = u("div", { class: "card-head" }, e);
+      u("h2", { text: this.getAttribute("title") || "" }, o);
+      const s = this.getAttribute("link-href"), l = this.getAttribute("link-label");
+      s && l && u("a", { class: "text-link", href: s, text: l }, o);
     }
     const n = u("dl", {
       class: a === "strip" ? "metrics summary" : "metrics",
       "aria-label": this.getAttribute("label") || this.getAttribute("title") || ""
     }, e);
-    for (const l of i) {
-      const o = u("div", null, n);
-      u("dt", { text: l.label }, o), u("dd", { text: l.value }, o);
+    for (const o of i) {
+      const s = u("div", null, n);
+      u("dt", { text: o.label }, s), u("dd", { text: o.value }, s);
     }
   }
 }
-class Ce extends _ {
+class Se extends A {
   constructor() {
-    super(P(de));
+    super(D(fe));
   }
   static get observedAttributes() {
-    return [..._.observedAttributes, "label"];
+    return [...A.observedAttributes, "label"];
   }
   paint(e) {
     const r = this.getAttribute("label") || "";
@@ -1351,15 +1365,15 @@ class Ce extends _ {
     const i = j(this) || [];
     for (const a of i) {
       const n = u("a", { href: a.href || "#", text: a.label || "" }, e);
-      a.current && n.setAttribute("aria-current", "page"), n.addEventListener("click", (l) => {
-        Y(this, "tl-change", { id: a.id, href: a.href || "" }), a.href || l.preventDefault();
+      a.current && n.setAttribute("aria-current", "page"), n.addEventListener("click", (o) => {
+        Y(this, "tl-change", { id: a.id, href: a.href || "" }), a.href || o.preventDefault();
       });
     }
   }
 }
-class Ne extends _ {
+class $e extends A {
   constructor() {
-    super(P(he)), this.addEventListener("keydown", (e) => {
+    super(D(pe)), this.addEventListener("keydown", (e) => {
       const r = [...this.shadowRoot.querySelectorAll("[role='tab']")], i = r.indexOf(this.shadowRoot.activeElement);
       if (i < 0) return;
       let a = null;
@@ -1367,7 +1381,7 @@ class Ne extends _ {
     });
   }
   static get observedAttributes() {
-    return [..._.observedAttributes, "label"];
+    return [...A.observedAttributes, "label"];
   }
   paint(e) {
     const r = this.getAttribute("label") || "";
@@ -1384,9 +1398,9 @@ class Ne extends _ {
     }
   }
 }
-class Se extends _ {
+class Ee extends A {
   constructor() {
-    super(P(oe)), this._lat = null, this._lon = null, this._headingProp = null, this._tiles = !1;
+    super(D(ce)), this._lat = null, this._lon = null, this._headingProp = null, this._tiles = !1;
   }
   set latitude(e) {
     this._lat = e == null ? null : Number(e), this.isConnected && !this._rendering && this.render();
@@ -1407,61 +1421,61 @@ class Se extends _ {
     return this._headingProp;
   }
   paint(e) {
-    var v;
+    var w;
     const r = I(this), i = { ...j(this) || {} }, a = Number.isFinite(this._lat) && Number.isFinite(this._lon);
     a && i.empty !== !0 && !i.roads && (i.empty = !1);
-    const n = Number(i.width) || 360, l = Number(i.height) || 220, o = n / 2, s = l / 2, c = u("div", { class: "map-stack" }, e), d = u("div", { class: "tiles" }, c), h = document.createElement("slot");
+    const n = Number(i.width) || 360, o = Number(i.height) || 220, s = n / 2, l = o / 2, c = u("div", { class: "map-stack" }, e), d = u("div", { class: "tiles" }, c), h = document.createElement("slot");
     h.name = "tiles", d.append(h);
     const g = h.assignedNodes({ flatten: !0 }).some((m) => m.nodeType === 1);
     this.classList.toggle("has-tiles", g), g !== this._tiles && (this._tiles = g), h.addEventListener("slotchange", () => {
       const m = h.assignedNodes({ flatten: !0 }).some((M) => M.nodeType === 1);
       m === this._tiles || this._rendering || (this._tiles = m, this.render());
     });
-    const f = i.empty !== !1 && !((v = i.roads) != null && v.length) && !a, A = !!i.moving;
+    const f = i.empty !== !1 && !((w = i.roads) != null && w.length) && !a, _ = !!i.moving;
     let b = "mini-map";
-    A && (b += " live"), f && (b += " empty");
-    const w = i.label || r.strings.unknownPosition, k = x("svg", {
+    _ && (b += " live"), f && (b += " empty");
+    const k = i.label || r.strings.unknownPosition, y = v("svg", {
       class: b,
-      viewBox: `0 0 ${n} ${l}`,
+      viewBox: `0 0 ${n} ${o}`,
       role: "img",
-      "aria-label": w,
+      "aria-label": k,
       focusable: "false"
-    }, c), C = x("defs", null, k), E = x("pattern", { id: "dots", width: "18", height: "18", patternUnits: "userSpaceOnUse" }, C);
-    if (x("circle", { class: "map-dot", cx: "1.5", cy: "1.5", r: "1" }, E), !f) {
-      const m = x("radialGradient", { id: "fade", cx: "0.5", cy: "0.5", r: "0.62" }, C);
-      x("stop", { offset: "0.55", "stop-color": "#000", "stop-opacity": "0" }, m), x("stop", { offset: "1", "stop-color": "#000", "stop-opacity": "1" }, m);
+    }, c), S = v("defs", null, y), T = v("pattern", { id: "dots", width: "18", height: "18", patternUnits: "userSpaceOnUse" }, S);
+    if (v("circle", { class: "map-dot", cx: "1.5", cy: "1.5", r: "1" }, T), !f) {
+      const m = v("radialGradient", { id: "fade", cx: "0.5", cy: "0.5", r: "0.62" }, S);
+      v("stop", { offset: "0.55", "stop-color": "#000", "stop-opacity": "0" }, m), v("stop", { offset: "1", "stop-color": "#000", "stop-opacity": "1" }, m);
     }
-    if (g || (x("rect", { class: "map-bg", width: String(n), height: String(l) }, k), x("rect", { class: "map-dots", width: String(n), height: String(l), fill: "url(#dots)" }, k)), !f) {
+    if (g || (v("rect", { class: "map-bg", width: String(n), height: String(o) }, y), v("rect", { class: "map-dots", width: String(n), height: String(o), fill: "url(#dots)" }, y)), !f) {
       for (const m of i.roads || [])
-        m && x("path", { class: "map-road", d: m }, k);
-      x("rect", { class: "map-vignette", width: String(n), height: String(l), fill: "url(#fade)" }, k);
+        m && v("path", { class: "map-road", d: m }, y);
+      v("rect", { class: "map-vignette", width: String(n), height: String(o), fill: "url(#fade)" }, y);
     }
-    if (x("circle", { class: "map-pulse", cx: String(o), cy: String(s), r: "26" }, k), x("circle", { class: "map-halo", cx: String(o), cy: String(s), r: "15" }, k), !f) {
+    if (v("circle", { class: "map-pulse", cx: String(s), cy: String(l), r: "26" }, y), v("circle", { class: "map-halo", cx: String(s), cy: String(l), r: "15" }, y), !f) {
       const m = i.heading ?? this._headingProp;
-      if (m != null && Number.isFinite(Number(m)) && x("path", {
+      if (m != null && Number.isFinite(Number(m)) && v("path", {
         class: "map-heading",
-        d: `M${o} ${(s - 22).toFixed(1)} l7 13 l-7 -4 l-7 4 z`,
-        transform: `rotate(${Math.round(Number(m))} ${o} ${s})`
-      }, k), x("circle", { class: "map-car", cx: String(o), cy: String(s), r: "7" }, k), i.scale_label) {
-        const M = x("g", { class: "map-scale", transform: `translate(16 ${Math.round(l - 16)})` }, k), L = Number(i.scale_width) || 0;
-        x("path", { d: `M0 -4 V0 H${L.toFixed(1)} V-4` }, M), x("text", { x: (L + 6).toFixed(1), y: "0", text: i.scale_label }, M);
+        d: `M${s} ${(l - 22).toFixed(1)} l7 13 l-7 -4 l-7 4 z`,
+        transform: `rotate(${Math.round(Number(m))} ${s} ${l})`
+      }, y), v("circle", { class: "map-car", cx: String(s), cy: String(l), r: "7" }, y), i.scale_label) {
+        const M = v("g", { class: "map-scale", transform: `translate(16 ${Math.round(o - 16)})` }, y), L = Number(i.scale_width) || 0;
+        v("path", { d: `M0 -4 V0 H${L.toFixed(1)} V-4` }, M), v("text", { x: (L + 6).toFixed(1), y: "0", text: i.scale_label }, M);
       }
     }
   }
 }
-function Tt(t, e, r) {
+function Lt(t, e, r) {
   return e != null && r != null ? `${t.number(Number(e), 0)} → ${t.percent(r)}` : e != null ? t.percent(e) : "—";
 }
-function $e(t, e) {
+function Te(t, e) {
   if (t == null || e == null) return null;
-  const r = Math.min(Number(t), Number(e)), i = Math.max(Number(t), Number(e)), a = x("svg", {
+  const r = Math.min(Number(t), Number(e)), i = Math.max(Number(t), Number(e)), a = v("svg", {
     class: e >= t ? "soc-bar gain" : "soc-bar use",
     viewBox: "0 0 100 6",
     preserveAspectRatio: "none",
     "aria-hidden": "true",
     focusable: "false"
   });
-  return x("rect", { class: "soc-track", x: "0", y: "0", width: "100", height: "6", rx: "3" }, a), x("rect", {
+  return v("rect", { class: "soc-track", x: "0", y: "0", width: "100", height: "6", rx: "3" }, a), v("rect", {
     class: "soc-fill",
     x: Math.max(0, Math.min(100, r)).toFixed(1),
     y: "0",
@@ -1470,7 +1484,7 @@ function $e(t, e) {
     rx: "3"
   }, a), a;
 }
-function zt(t, e, r) {
+function Ft(t, e, r) {
   const i = u("span", { class: "trip-times" }, t);
   if (u("time", { datetime: e.start_at || "", text: e.start_at ? r.clock(e.start_at) : "—" }, i), e.end_at) u("span", { text: r.clock(e.end_at) }, i);
   else {
@@ -1479,20 +1493,20 @@ function zt(t, e, r) {
   }
   return i;
 }
-function Lt(t, e) {
+function Pt(t, e) {
   !e || e === "poll" || e === "stream" || u("span", { class: "chip source", text: e }, t);
 }
-function Ft(t) {
+function Dt(t) {
   if (t) return u("a", { class: "trip", href: t });
   const e = u("div", { class: "trip" });
   return e.tabIndex = 0, e.setAttribute("role", "link"), e;
 }
-class Ee extends _ {
+class ze extends A {
   constructor() {
-    super(P(kt));
+    super(D(At));
   }
   static get observedAttributes() {
-    return [..._.observedAttributes, "href"];
+    return [...A.observedAttributes, "href"];
   }
   set href(e) {
     e ? this.setAttribute("href", e) : this.removeAttribute("href");
@@ -1501,35 +1515,35 @@ class Ee extends _ {
     return this.getAttribute("href");
   }
   paint(e) {
-    const r = I(this), i = j(this) || {}, a = this.getAttribute("href") || i.href || "", n = G(i.start_address, i.start_geofence), l = G(i.end_address, i.end_geofence), o = n ? n.name : r.strings.unknownPlace, s = i.end_at ? l ? l.name : r.strings.unknownPlace : r.strings.enRoute, c = Ft(a);
+    const r = I(this), i = j(this) || {}, a = this.getAttribute("href") || i.href || "", n = H(i.start_address, i.start_geofence), o = H(i.end_address, i.end_geofence), s = n ? n.name : r.strings.unknownPlace, l = i.end_at ? o ? o.name : r.strings.unknownPlace : r.strings.enRoute, c = Dt(a);
     c.classList.add("trip");
-    const d = i.start_at ? r.dayLabel(i.start_at, ot(this)) : "", h = i.start_at ? r.clock(i.start_at) : "";
-    c.setAttribute("aria-label", `${d} ${h}, ${o}, ${s}, ${r.distance(i.distance_km)}`.trim()), zt(c, i, r);
-    const g = u("span", { class: "route" }, c), f = u("span", { class: "route-stop start", text: o }, g);
+    const d = i.start_at ? r.dayLabel(i.start_at, ct(this)) : "", h = i.start_at ? r.clock(i.start_at) : "";
+    c.setAttribute("aria-label", `${d} ${h}, ${s}, ${l}, ${r.distance(i.distance_km)}`.trim()), Ft(c, i, r);
+    const g = u("span", { class: "route" }, c), f = u("span", { class: "route-stop start", text: s }, g);
     n != null && n.detail && (f.title = n.detail);
-    const A = u("span", { class: "route-stop end", text: s }, g);
-    l != null && l.detail && i.end_at && (A.title = l.detail);
+    const _ = u("span", { class: "route-stop end", text: l }, g);
+    o != null && o.detail && i.end_at && (_.title = o.detail);
     const b = u("span", { class: "trip-figures" }, c);
     u("span", { class: "figure", text: r.distance(i.distance_km) }, b), u("span", { class: "muted", text: r.duration(i.duration_s) }, b);
-    const w = i.energy_kwh != null ? i.energy_kwh : i.energy_used_kwh, k = i.energy_kwh != null && i.energy_used_kwh == null;
-    let C = w == null ? "—" : r.energy(w);
-    k && w != null && (C = `≈${C}`);
-    const E = st(Number(w), Number(i.distance_km)), v = u("span", { class: "trip-stats" }, c), m = u("span", null, v);
-    u("span", { class: "stat-label", text: r.strings.energy }, m), m.append(document.createTextNode(C));
-    const M = u("span", null, v);
-    u("span", { class: "stat-label", text: r.strings.efficiency }, M), M.append(document.createTextNode(E == null ? "—" : r.unit(E, 0, "Wh/km")));
-    const L = u("span", null, v);
-    u("span", { class: "stat-label", text: r.strings.battery }, L), L.append(document.createTextNode(Tt(r, i.start_battery_level, i.end_battery_level))), Lt(c, i.source), a || (c.addEventListener("click", () => Y(this, "tl-open", { id: i.id })), c.addEventListener("keydown", (p) => {
+    const k = i.energy_kwh != null ? i.energy_kwh : i.energy_used_kwh, y = i.energy_kwh != null && i.energy_used_kwh == null;
+    let S = k == null ? "—" : r.energy(k);
+    y && k != null && (S = `≈${S}`);
+    const T = lt(Number(k), Number(i.distance_km)), w = u("span", { class: "trip-stats" }, c), m = u("span", null, w);
+    u("span", { class: "stat-label", text: r.strings.energy }, m), m.append(document.createTextNode(S));
+    const M = u("span", null, w);
+    u("span", { class: "stat-label", text: r.strings.efficiency }, M), M.append(document.createTextNode(T == null ? "—" : r.unit(T, 0, "Wh/km")));
+    const L = u("span", null, w);
+    u("span", { class: "stat-label", text: r.strings.battery }, L), L.append(document.createTextNode(Lt(r, i.start_battery_level, i.end_battery_level))), Pt(c, i.source), a || (c.addEventListener("click", () => Y(this, "tl-open", { id: i.id })), c.addEventListener("keydown", (p) => {
       (p.key === "Enter" || p.key === " ") && (p.preventDefault(), Y(this, "tl-open", { id: i.id }));
     })), e.append(c);
   }
 }
-class Te extends _ {
+class Le extends A {
   constructor() {
-    super(P(kt));
+    super(D(At));
   }
   static get observedAttributes() {
-    return [..._.observedAttributes, "href"];
+    return [...A.observedAttributes, "href"];
   }
   set href(e) {
     e ? this.setAttribute("href", e) : this.removeAttribute("href");
@@ -1538,102 +1552,131 @@ class Te extends _ {
     return this.getAttribute("href");
   }
   paint(e) {
-    const r = I(this), i = j(this) || {}, a = this.getAttribute("href") || i.href || "", n = G(i.address, i.geofence), l = n ? n.name : r.strings.unknownPlace, o = i.is_dc === !0, s = i.energy_added_kwh, c = s == null ? r.strings.inProgress.replace(/^./, (M) => M.toLocaleUpperCase(r.locale)) : `+${r.energy(s)}`, d = Ft(a);
-    d.classList.add("charge"), o && d.classList.add("dc"), d.setAttribute("aria-label", `${i.start_at ? r.clock(i.start_at) : ""} ${l} ${c}`.trim()), zt(d, i, r);
-    const h = u("span", { class: "route single" }, d), g = u("span", { class: "route-stop charge-stop", text: l }, h);
+    const r = I(this), i = j(this) || {}, a = this.getAttribute("href") || i.href || "", n = H(i.address, i.geofence), o = n ? n.name : r.strings.unknownPlace, s = i.is_dc === !0, l = i.energy_added_kwh, c = l == null ? r.strings.inProgress.replace(/^./, (M) => M.toLocaleUpperCase(r.locale)) : `+${r.energy(l)}`, d = Dt(a);
+    d.classList.add("charge"), s && d.classList.add("dc"), d.setAttribute("aria-label", `${i.start_at ? r.clock(i.start_at) : ""} ${o} ${c}`.trim()), Ft(d, i, r);
+    const h = u("span", { class: "route single" }, d), g = u("span", { class: "route-stop charge-stop", text: o }, h);
     n != null && n.detail && (g.title = n.detail);
     const f = u("span", { class: "muted kind" }, h);
-    o && u("span", { class: "chip dc", text: "DC" }, f);
-    const A = i.charger_type || (i.is_dc === !1 ? "AC" : i.is_dc == null ? r.strings.charging : "");
-    A && f.append(document.createTextNode(o ? ` ${A}` : A));
+    s && u("span", { class: "chip dc", text: "DC" }, f);
+    const _ = i.charger_type || (i.is_dc === !1 ? "AC" : i.is_dc == null ? r.strings.charging : "");
+    _ && f.append(document.createTextNode(s ? ` ${_}` : _));
     const b = u("span", { class: "trip-figures" }, d);
     u("span", { class: "figure", text: c }, b);
-    const w = i.duration_s ?? (i.start_at ? Math.max(0, Math.round(((i.end_at ? new Date(i.end_at) : new Date(ot(this))) - new Date(i.start_at)) / 1e3)) : null);
-    u("span", { class: "muted", text: r.duration(w) }, b);
-    const k = u("span", { class: "trip-stats" }, d), C = u("span", { class: "soc" }, k);
-    u("span", { class: "stat-label", text: r.strings.battery }, C), C.append(document.createTextNode(Tt(r, i.start_battery_level, i.end_battery_level)));
-    const E = $e(i.start_battery_level, i.end_battery_level);
-    E && C.append(E);
-    const v = u("span", null, k);
-    u("span", { class: "stat-label", text: r.strings.maxPower }, v), v.append(document.createTextNode(r.unit(i.max_power_kw, 0, "kW")));
-    const m = u("span", null, k);
-    u("span", { class: "stat-label", text: r.strings.cost }, m), m.append(document.createTextNode(r.money(i.cost))), Lt(d, i.source), a || d.addEventListener("click", () => Y(this, "tl-open", { id: i.id })), e.append(d);
+    const k = i.duration_s ?? (i.start_at ? Math.max(0, Math.round(((i.end_at ? new Date(i.end_at) : new Date(ct(this))) - new Date(i.start_at)) / 1e3)) : null);
+    u("span", { class: "muted", text: r.duration(k) }, b);
+    const y = u("span", { class: "trip-stats" }, d), S = u("span", { class: "soc" }, y);
+    u("span", { class: "stat-label", text: r.strings.battery }, S), S.append(document.createTextNode(Lt(r, i.start_battery_level, i.end_battery_level)));
+    const T = Te(i.start_battery_level, i.end_battery_level);
+    T && S.append(T);
+    const w = u("span", null, y);
+    u("span", { class: "stat-label", text: r.strings.maxPower }, w), w.append(document.createTextNode(r.unit(i.max_power_kw, 0, "kW")));
+    const m = u("span", null, y);
+    u("span", { class: "stat-label", text: r.strings.cost }, m), m.append(document.createTextNode(r.money(i.cost))), Pt(d, i.source), a || d.addEventListener("click", () => Y(this, "tl-open", { id: i.id })), e.append(d);
   }
 }
-class ze extends _ {
+class Fe extends A {
   constructor() {
-    super(P(le));
+    super(D(ue));
   }
   static get observedAttributes() {
-    return [..._.observedAttributes, "heading", "summary"];
+    return [...A.observedAttributes, "heading", "summary"];
   }
   paint(e) {
     const r = this.getAttribute("heading") || "", i = u("section", { class: "day", "aria-label": r }, e), a = u("header", { class: "day-head" }, i);
     u("h2", { text: r }, a), u("p", { class: "muted", text: this.getAttribute("summary") || "" }, a), u("div", { class: "trips", role: "list" }, i).append(document.createElement("slot"));
   }
 }
-function Le(t, e, r) {
+function Pe(t, e, r) {
   if (!t) return null;
   if (t.when || t.primary) return t;
   if (!t.start_at) return null;
   const i = !t.end_at;
   if (t.energy_added_kwh != null || t.is_dc != null || t.charger_type) {
-    const s = G(t.address, t.geofence);
+    const l = H(t.address, t.geofence);
     return {
       href: t.href || "",
       when: `${e.dayLabel(t.start_at, r)} · ${e.clock(t.start_at)}`,
       from: null,
-      to: s ? s.name : e.strings.unknownPlace,
+      to: l ? l.name : e.strings.unknownPlace,
       primary: t.energy_added_kwh == null ? "—" : `+${e.energy(t.energy_added_kwh)}`,
       secondary: e.duration(t.duration_s),
       open: i
     };
   }
-  const a = G(t.start_address, t.start_geofence), n = G(t.end_address, t.end_geofence), l = st(Number(t.energy_used_kwh), Number(t.distance_km)), o = [e.duration(t.duration_s)];
-  return l != null && o.push(e.unit(l, 0, "Wh/km")), {
+  const a = H(t.start_address, t.start_geofence), n = H(t.end_address, t.end_geofence), o = lt(Number(t.energy_used_kwh), Number(t.distance_km)), s = [e.duration(t.duration_s)];
+  return o != null && s.push(e.unit(o, 0, "Wh/km")), {
     href: t.href || "",
     when: `${e.dayLabel(t.start_at, r)} · ${e.clock(t.start_at)}`,
     from: a ? a.name : e.strings.unknownPlace,
     to: i ? e.strings.enRoute : n ? n.name : e.strings.unknownPlace,
     primary: e.distance(t.distance_km),
-    secondary: o.join(" · "),
+    secondary: s.join(" · "),
     open: i
   };
 }
-class Fe extends _ {
+class De extends A {
   constructor() {
-    super(P(ce));
+    super(D(de));
   }
   static get observedAttributes() {
-    return [..._.observedAttributes, "title", "empty", "link-href", "link-label"];
+    return [...A.observedAttributes, "title", "empty", "link-href", "link-label"];
   }
   paint(e) {
-    const r = I(this), i = Le(j(this), r, ot(this)), a = u("div", { class: "card-head" }, e);
+    const r = I(this), i = Pe(j(this), r, ct(this)), a = u("div", { class: "card-head" }, e);
     u("h2", { text: this.getAttribute("title") || "" }, a);
-    const n = this.getAttribute("link-href"), l = this.getAttribute("link-label");
-    if (n && l && u("a", { class: "text-link", href: n, text: l }, a), !i) {
+    const n = this.getAttribute("link-href"), o = this.getAttribute("link-label");
+    if (n && o && u("a", { class: "text-link", href: n, text: o }, a), !i) {
       u("p", { class: "muted", text: this.getAttribute("empty") || "" }, e);
       return;
     }
-    const o = u("a", { class: "recent-link", href: i.href || "#" }, e), s = u("p", { class: "recent-when" }, o);
-    s.append(document.createTextNode(i.when || "")), i.open && (s.append(document.createTextNode(" · ")), u("span", { class: "live-dot" }, s), s.append(document.createTextNode(` ${r.strings.inProgress}`)));
-    const c = u("div", { class: i.from ? "route" : "route single" }, o);
+    const s = u("a", { class: "recent-link", href: i.href || "#" }, e), l = u("p", { class: "recent-when" }, s);
+    l.append(document.createTextNode(i.when || "")), i.open && (l.append(document.createTextNode(" · ")), u("span", { class: "live-dot" }, l), l.append(document.createTextNode(` ${r.strings.inProgress}`)));
+    const c = u("div", { class: i.from ? "route" : "route single" }, s);
     i.from && u("span", { class: "route-stop start", text: i.from }, c), u("span", { class: "route-stop end", text: i.to || "" }, c);
-    const d = u("p", { class: "recent-metrics" }, o);
+    const d = u("p", { class: "recent-metrics" }, s);
     u("span", { class: "figure", text: i.primary || "" }, d), u("span", { class: "muted", text: i.secondary || "" }, d);
   }
 }
-function De(t, e) {
+function nt(t) {
+  if (t == null || !Number.isFinite(Number(t))) return "";
+  const e = Math.trunc(Number(t));
+  if (e < 0 || e > 1440) return "";
+  const r = e === 1440 ? 0 : e, i = Math.floor(r / 60), a = r % 60;
+  return `${String(i).padStart(2, "0")}:${String(a).padStart(2, "0")}`;
+}
+function st(t, e) {
+  return String(t || "").replace("{time}", e);
+}
+function je(t, e) {
+  if (!t) return "";
+  if (t.schedule) return String(t.schedule);
+  const r = String(t.scheduled_charging_mode || "").trim().toLowerCase(), i = r === "off" || r === "scheduledchargingmodeoff", a = r === "departby" || r === "depart_by" || r === "scheduledchargingmodedepartby", n = r === "startat" || r === "start_at" || r === "scheduledchargingmodestartat", o = [];
+  if (!i) {
+    if (a) {
+      const s = nt(t.scheduled_departure_time);
+      o.push(s ? st(e.departAt, s) : e.departScheduled);
+    } else if (n || r === "" && t.scheduled_charging_start_time != null) {
+      const s = nt(t.scheduled_charging_start_time);
+      s ? o.push(st(e.chargeAt, s)) : n && o.push(e.chargeScheduled);
+    }
+  }
+  if (t.off_peak_charging_enabled === !0) {
+    const s = nt(t.off_peak_hours_end_time);
+    o.push(s ? st(e.offPeakUntil, s) : e.offPeak);
+  }
+  return o.join(" · ");
+}
+function Ue(t, e) {
   if (t && t.status_label)
     return {
       label: t.status_label,
       tone: t.status_tone || "idle",
       charging: !!t.charging
     };
-  const r = String((t == null ? void 0 : t.activity) || "").toLowerCase(), i = String((t == null ? void 0 : t.charging_state) || "").toLowerCase();
-  let a = "unknown";
-  r === "driving" ? a = "driving" : r === "charging" || i === "charging" || i === "starting" ? a = "charging" : r === "updating" ? a = "updating" : r === "asleep" ? a = "asleep" : r === "offline" ? a = "offline" : (t == null ? void 0 : t.plugged_in) === !0 || i === "complete" || i === "stopped" || i === "nopower" ? a = "plugged" : (r === "online" || r === "parked") && (a = "parked");
-  const n = {
+  const r = String((t == null ? void 0 : t.activity) || "").toLowerCase(), i = String((t == null ? void 0 : t.charging_state) || "").toLowerCase(), a = i === "starting" || i === "complete" || i === "stopped" || i === "nopower";
+  let n = "unknown";
+  r === "driving" ? n = "driving" : i === "charging" ? n = "charging" : r === "updating" ? n = "updating" : r === "asleep" ? n = "asleep" : r === "offline" ? n = "offline" : a ? n = "plugged" : r === "charging" && i !== "disconnected" ? n = "charging" : i !== "disconnected" && (t == null ? void 0 : t.plugged_in) === !0 ? n = "plugged" : (r === "online" || r === "parked" || r === "charging") && (n = "parked");
+  const o = {
     driving: ["drive", e.driving],
     charging: ["charge", e.charging],
     plugged: ["charge", e.plugged],
@@ -1642,30 +1685,30 @@ function De(t, e) {
     asleep: ["idle", e.asleep],
     offline: ["idle", e.offline],
     unknown: ["idle", e.unknown]
-  }, [l, o] = n[a];
-  return { label: o, tone: l, charging: a === "charging" };
+  }, [s, l] = o[n];
+  return { label: l, tone: s, charging: n === "charging" };
 }
-function vt(t, e) {
+function yt(t, e) {
   return e == null || !Number.isFinite(Number(e)) ? null : `${t.number(Number(e), 1)}${t.sep}°C`;
 }
-function Pe(t, e) {
+function Be(t, e) {
   if (Array.isArray(t.facts)) return t.facts;
   const r = e.locale.toLowerCase().startsWith("fr"), i = [];
   typeof t.locked == "boolean" && i.push({
     label: r ? "Portes" : "Doors",
     value: t.locked ? r ? "Verrouillées" : "Locked" : r ? "Déverrouillées" : "Unlocked"
   });
-  const a = vt(e, t.inside_temp_c);
+  const a = yt(e, t.inside_temp_c);
   a && i.push({ label: r ? "Intérieur" : "Inside", value: a });
-  const n = vt(e, t.outside_temp_c);
+  const n = yt(e, t.outside_temp_c);
   return n && i.push({ label: r ? "Extérieur" : "Outside", value: n }), t.odometer_km != null && i.push({ label: r ? "Compteur" : "Odometer", value: e.unit(t.odometer_km, 0, e.strings.km) }), t.sentry_mode === !0 && i.push({ label: r ? "Sentinelle" : "Sentry", value: r ? "Active" : "On" }), t.software_version && i.push({ label: r ? "Logiciel" : "Software", value: String(t.software_version) }), i;
 }
-class je extends _ {
+class Ie extends A {
   constructor() {
-    super(P(ae));
+    super(D(se));
   }
   static get observedAttributes() {
-    return [..._.observedAttributes, "image-url", "alt", "unavailable"];
+    return [...A.observedAttributes, "image-url", "alt", "unavailable"];
   }
   set imageUrl(e) {
     e ? this.setAttribute("image-url", e) : this.removeAttribute("image-url");
@@ -1674,71 +1717,73 @@ class je extends _ {
     return this.getAttribute("image-url");
   }
   paint(e) {
-    const r = I(this), i = j(this) || {}, a = De(i, r.strings), n = u("div", { class: "hero-head" }, e), l = u("div", null, n), o = u("p", { class: "eyebrow" }, l), s = i.model || r.strings.vehicle;
-    o.textContent = i.trim ? `${s} · ${i.trim}` : s, u("h2", { class: "hero-name", id: "hero-name", text: i.name || r.strings.vehicle }, l);
-    const c = u("span", { class: `chip status ${a.tone}` }, n);
-    u("span", { class: "status-dot", "aria-hidden": "true" }, c), c.append(document.createTextNode(a.label));
-    const d = u("div", { class: "hero-car" }, e), h = new At(), g = this.getAttribute("image-url") || i.image_url || "";
-    g && (h.imageUrl = g);
-    const f = this.getAttribute("alt") || i.name || r.strings.vehicle;
-    h.setAttribute("alt", f);
-    const A = this.getAttribute("unavailable");
-    A && h.setAttribute("unavailable", A), h.setAttribute("locale", r.locale), this.getAttribute("theme") && h.setAttribute("theme", this.getAttribute("theme")), d.append(h);
-    const b = u("div", { class: "hero-energy" }, e), w = u("p", { class: "hero-battery" }, b), k = i.battery_text || (i.battery_level == null ? "—" : r.percent(i.battery_level));
-    u("span", { class: "hero-figure", text: k }, w), u("span", { class: "hero-label", text: r.strings.battery }, w);
-    const C = u("p", { class: "hero-range" }, b), E = i.range_text || (i.rated_range_km == null ? "—" : r.distance(i.rated_range_km));
-    u("span", { class: "hero-figure", text: E }, C), u("span", { class: "hero-label", text: r.strings.range }, C);
-    const v = document.createElement("tl-battery");
-    i.battery_level != null && (v.level = i.battery_level), i.charge_limit_soc != null && (v.limit = i.charge_limit_soc), v.charging = a.charging, v.setAttribute("locale", r.locale), e.append(v), i.note && u("p", { class: "hero-note", text: i.note }, e);
-    const m = Pe(i, r);
-    if (m.length) {
-      const M = u("dl", { class: "hero-facts" }, e);
-      for (const L of m) {
-        const p = u("div", null, M);
-        u("dt", { text: L.label }, p), u("dd", { text: L.value }, p);
+    const r = I(this), i = j(this) || {}, a = Ue(i, r.strings), n = u("div", { class: "hero-head" }, e), o = u("div", null, n), s = u("p", { class: "eyebrow" }, o), l = i.model || r.strings.vehicle;
+    s.textContent = i.trim ? `${l} · ${i.trim}` : l, u("h2", { class: "hero-name", id: "hero-name", text: i.name || r.strings.vehicle }, o);
+    const c = u("div", { class: "hero-status" }, n), d = u("span", { class: `chip status ${a.tone}` }, c);
+    u("span", { class: "status-dot", "aria-hidden": "true" }, d), d.append(document.createTextNode(a.label));
+    const h = je(i, r.strings);
+    h && u("p", { class: "hero-schedule", text: h }, c);
+    const g = u("div", { class: "hero-car" }, e), f = new Mt(), _ = this.getAttribute("image-url") || i.image_url || "";
+    _ && (f.imageUrl = _);
+    const b = this.getAttribute("alt") || i.name || r.strings.vehicle;
+    f.setAttribute("alt", b);
+    const k = this.getAttribute("unavailable");
+    k && f.setAttribute("unavailable", k), f.setAttribute("locale", r.locale), this.getAttribute("theme") && f.setAttribute("theme", this.getAttribute("theme")), g.append(f);
+    const y = u("div", { class: "hero-energy" }, e), S = u("p", { class: "hero-battery" }, y), T = i.battery_text || (i.battery_level == null ? "—" : r.percent(i.battery_level));
+    u("span", { class: "hero-figure", text: T }, S), u("span", { class: "hero-label", text: r.strings.battery }, S);
+    const w = u("p", { class: "hero-range" }, y), m = i.range_text || (i.rated_range_km == null ? "—" : r.distance(i.rated_range_km));
+    u("span", { class: "hero-figure", text: m }, w), u("span", { class: "hero-label", text: r.strings.range }, w);
+    const M = document.createElement("tl-battery");
+    i.battery_level != null && (M.level = i.battery_level), i.charge_limit_soc != null && (M.limit = i.charge_limit_soc), M.charging = a.charging, M.setAttribute("locale", r.locale), e.append(M), i.note && u("p", { class: "hero-note", text: i.note }, e);
+    const L = Be(i, r);
+    if (L.length) {
+      const p = u("dl", { class: "hero-facts" }, e);
+      for (const N of L) {
+        const C = u("div", null, p);
+        u("dt", { text: N.label }, C), u("dd", { text: N.value }, C);
       }
     }
   }
 }
-const Ue = [
-  ["tl-battery", pe],
-  ["tl-car-image", At],
-  ["tl-vehicle-card", je],
-  ["tl-mini-map", Se],
-  ["tl-drive-row", Ee],
-  ["tl-charge-row", Te],
-  ["tl-day-group", ze],
-  ["tl-recent-card", Fe],
-  ["tl-summary-strip", Me],
-  ["tl-period-chips", Ce],
-  ["tl-tabs", Ne],
-  ["tl-chart", Ae]
+const Oe = [
+  ["tl-battery", me],
+  ["tl-car-image", Mt],
+  ["tl-vehicle-card", Ie],
+  ["tl-mini-map", Ee],
+  ["tl-drive-row", ze],
+  ["tl-charge-row", Le],
+  ["tl-day-group", Fe],
+  ["tl-recent-card", De],
+  ["tl-summary-strip", Ne],
+  ["tl-period-chips", Se],
+  ["tl-tabs", $e],
+  ["tl-chart", Me]
 ];
-function Be(t = customElements) {
-  for (const [e, r] of Ue)
+function We(t = customElements) {
+  for (const [e, r] of Oe)
     t.get(e) || t.define(e, r);
 }
-Be();
+We();
 export {
   at as NNBSP,
-  pe as TlBattery,
-  At as TlCarImage,
-  Te as TlChargeRow,
-  Ae as TlChart,
-  ze as TlDayGroup,
-  Ee as TlDriveRow,
-  Se as TlMiniMap,
-  Ce as TlPeriodChips,
-  Fe as TlRecentCard,
-  Me as TlSummaryStrip,
-  Ne as TlTabs,
-  je as TlVehicleCard,
-  Yt as dayLabel,
-  Be as defineElements,
-  Wt as duration,
-  te as makeFormat,
-  Et as mountChart,
-  Oe as mountCharts,
-  It as number,
-  Bt as stringsFor
+  me as TlBattery,
+  Mt as TlCarImage,
+  Le as TlChargeRow,
+  Me as TlChart,
+  Fe as TlDayGroup,
+  ze as TlDriveRow,
+  Ee as TlMiniMap,
+  Se as TlPeriodChips,
+  De as TlRecentCard,
+  Ne as TlSummaryStrip,
+  $e as TlTabs,
+  Ie as TlVehicleCard,
+  Vt as dayLabel,
+  We as defineElements,
+  Ht as duration,
+  re as makeFormat,
+  zt as mountChart,
+  He as mountCharts,
+  Wt as number,
+  Ot as stringsFor
 };

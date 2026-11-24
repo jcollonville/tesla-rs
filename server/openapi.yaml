@@ -439,12 +439,39 @@ components:
         plugged_in:
           type: boolean
           nullable: true
-          description: Derived from charge_port_latch, charging_state, and conn_charge_cable
+          description: >
+            Derived from the charge cable, charging_state, and charge_port_latch.
+            charging_state is vehicle_data charge_state.charging_state, or Fleet
+            Telemetry DetailedChargeState. The deprecated ChargeState field is
+            only a fallback.
+        charge_status:
+          type: string
+          nullable: true
+          enum: [charging, plugged, unplugged]
+          description: >
+            Cable state. charging while charging_state is Charging. plugged for
+            Starting, Stopped, Complete, and NoPower, or when plugged_in is true
+            and the state is not Disconnected. unplugged for Disconnected.
+            Omitted when unknown. Driving and sleep stay on activity.
         time_to_full_charge_h: { type: number, nullable: true, description: Hours }
         scheduled_charging_start_time:
           type: integer
           nullable: true
-          description: Minutes after midnight, as reported by the vehicle
+          description: Minutes after midnight on the car's local clock
+        scheduled_charging_mode:
+          type: string
+          nullable: true
+          enum: [Off, StartAt, DepartBy]
+          description: Scheduled charging mode from vehicle_data or Fleet Telemetry
+        scheduled_departure_time:
+          type: integer
+          nullable: true
+          description: Minutes after midnight on the car's local clock
+        off_peak_charging_enabled: { type: boolean, nullable: true }
+        off_peak_hours_end_time:
+          type: integer
+          nullable: true
+          description: Minutes after midnight on the car's local clock
         tpms_pressure_fl: { type: number, nullable: true, description: Bar }
         tpms_pressure_fr: { type: number, nullable: true, description: Bar }
         tpms_pressure_rl: { type: number, nullable: true, description: Bar }
