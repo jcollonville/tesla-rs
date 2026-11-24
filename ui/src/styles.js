@@ -73,6 +73,8 @@ export const card = `
 }
 .eyebrow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; color: var(--tl-muted, #5c5e62); font-size: 0.75rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
 .hero-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.hero-status { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; max-width: 16rem; }
+.hero-schedule { margin: 0; color: var(--tl-muted, #5c5e62); font-size: 0.75rem; line-height: 1.3; text-align: right; }
 .hero-name { margin: 6px 0 0; font-size: clamp(1.5rem, 5vw, 2rem); font-weight: 500; letter-spacing: -0.02em; }
 .hero-car { margin: 16px -12px 8px; }
 .hero-energy { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; margin: 0 0 12px; }

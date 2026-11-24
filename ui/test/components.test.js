@@ -31,6 +31,61 @@ function mount(tag, props = {}) {
   return el;
 }
 
+test("plugged without charging is Branchée and a schedule stays by the status", () => {
+  const plugged = mount("tl-vehicle-card", {
+    attrs: { locale: "fr" },
+    data: { name: "Example", activity: "online", charging_state: "Stopped", plugged_in: true },
+  });
+  assert.match(plugged.shadowRoot.textContent, /Branchée/);
+  assert.equal(plugged.shadowRoot.querySelector(".hero-schedule"), null);
+
+  const starting = mount("tl-vehicle-card", {
+    attrs: { locale: "fr" },
+    data: { name: "Example", activity: "charging", charging_state: "Starting", plugged_in: true },
+  });
+  assert.match(starting.shadowRoot.textContent, /Branchée/);
+  assert.equal(starting.shadowRoot.textContent.includes("En charge"), false);
+
+  const charging = mount("tl-vehicle-card", {
+    attrs: { locale: "fr" },
+    data: { name: "Example", activity: "online", charging_state: "Charging", plugged_in: true },
+  });
+  assert.match(charging.shadowRoot.textContent, /En charge/);
+
+  const loose = mount("tl-vehicle-card", {
+    attrs: { locale: "fr" },
+    data: { name: "Example", activity: "online", charging_state: "Disconnected", plugged_in: true },
+  });
+  assert.match(loose.shadowRoot.textContent, /Garée/);
+
+  const scheduled = mount("tl-vehicle-card", {
+    attrs: { locale: "fr" },
+    data: {
+      name: "Example",
+      activity: "online",
+      charging_state: "Stopped",
+      scheduled_charging_mode: "DepartBy",
+      scheduled_charging_start_time: 1320,
+      scheduled_departure_time: 450,
+      off_peak_charging_enabled: true,
+      off_peak_hours_end_time: 360,
+    },
+  });
+  const line = scheduled.shadowRoot.querySelector(".hero-schedule").textContent;
+  assert.equal(line, "Départ programmé à 07:30 · Heures creuses jusqu'à 06:00");
+
+  const off = mount("tl-vehicle-card", {
+    attrs: { locale: "en" },
+    data: {
+      name: "Example",
+      activity: "online",
+      scheduled_charging_mode: "Off",
+      scheduled_charging_start_time: 1320,
+    },
+  });
+  assert.equal(off.shadowRoot.querySelector(".hero-schedule"), null);
+});
+
 test("vehicle image has no drawing and names the failure", () => {
   const missing = mount("tl-car-image", { attrs: { locale: "fr" } });
   const shadow = missing.shadowRoot.innerHTML;

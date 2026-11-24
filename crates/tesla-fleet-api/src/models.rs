@@ -446,9 +446,27 @@ pub struct ChargeState {
     /// Requested charge current, amperes.
     #[serde(default)]
     pub charge_current_request: Option<f64>,
-    /// Scheduled charging start, minutes after midnight. Null when unset.
+    /// Scheduled charging start, minutes after midnight on the car's local clock.
+    /// Null when unset.
     #[serde(default)]
     pub scheduled_charging_start_time: Option<f64>,
+    /// `Off`, `StartAt`, or `DepartBy`.
+    #[serde(default)]
+    pub scheduled_charging_mode: Option<String>,
+    /// Scheduled departure, minutes after midnight on the car's local clock.
+    /// Some payloads send a timestamp here instead; callers then use
+    /// [`Self::scheduled_departure_time_minutes`].
+    #[serde(default)]
+    pub scheduled_departure_time: Option<f64>,
+    /// Scheduled departure in local minutes when the other field is not minutes.
+    #[serde(default)]
+    pub scheduled_departure_time_minutes: Option<f64>,
+    /// Off-peak charging is enabled.
+    #[serde(default)]
+    pub off_peak_charging_enabled: Option<bool>,
+    /// Off-peak window end, minutes after midnight on the car's local clock.
+    #[serde(default)]
+    pub off_peak_hours_end_time: Option<f64>,
     /// Charge port door.
     #[serde(default)]
     pub charge_port_door_open: Option<bool>,
@@ -1110,6 +1128,9 @@ mod tests {
                 "charge_state": {
                     "charge_current_request": 16,
                     "scheduled_charging_start_time": 1320,
+                    "scheduled_charging_mode": "DepartBy",
+                    "scheduled_departure_time_minutes": 420,
+                    "off_peak_charging_enabled": false,
                     "time_to_full_charge": 1.5
                 },
                 "climate_state": {"battery_heater": true, "is_preconditioning": false},
@@ -1124,6 +1145,9 @@ mod tests {
         let charge = data.charge_state.unwrap();
         assert_eq!(charge.charge_current_request, Some(16.0));
         assert_eq!(charge.scheduled_charging_start_time, Some(1320.0));
+        assert_eq!(charge.scheduled_charging_mode.as_deref(), Some("DepartBy"));
+        assert_eq!(charge.scheduled_departure_time_minutes, Some(420.0));
+        assert_eq!(charge.off_peak_charging_enabled, Some(false));
         assert!(charge.additional.is_empty());
         let climate = data.climate_state.unwrap();
         assert_eq!(climate.battery_heater, Some(true));

@@ -50,6 +50,11 @@ fn openapi_lists_the_read_api() {
         "ft:",
         "is_preconditioning",
         "scheduled_charging_start_time",
+        "scheduled_charging_mode",
+        "scheduled_departure_time",
+        "off_peak_charging_enabled",
+        "off_peak_hours_end_time",
+        "charge_status",
         "stream_status",
         "car_render",
         "position_mode",
@@ -164,6 +169,7 @@ async fn api_requires_a_token_and_returns_drives() {
     assert!(state_body.contains("\"fd_window\":0"));
     assert!(state_body.contains("\"ft\":0"));
     assert!(state_body.contains("\"scheduled_charging_start_time\":1320"));
+    assert!(state_body.contains("\"charge_status\":\"plugged\""));
     assert!(state_body.contains("\"is_preconditioning\":true"));
     assert!(state_body.contains("\"elevation_m\":35"));
     assert!(state_body.contains("\"stream_status\":\"disabled\""));

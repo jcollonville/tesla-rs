@@ -59,6 +59,7 @@ pub(super) struct FleetCard {
     pub month: String,
     pub look: Look,
     pub status: Status,
+    pub schedule: Option<String>,
     pub battery_pct: Option<f64>,
     pub limit_pct: Option<f64>,
     pub range: String,
@@ -80,27 +81,33 @@ pub(crate) enum Status {
 }
 
 impl Status {
+    /// `Charging` is "En charge". `Starting`, `Stopped`, `Complete`, and `NoPower`
+    /// are plugged in ("Branchée"), including while a charge session is open.
+    /// `Disconnected` stays parked. Sleep, offline, and a software update keep
+    /// those labels.
     pub(crate) fn from(
         activity: Option<&str>,
         charging_state: Option<&str>,
         plugged_in: Option<bool>,
     ) -> Self {
         let charging = charging_state.unwrap_or("").trim().to_ascii_lowercase();
+        let plugged_idle = matches!(
+            charging.as_str(),
+            "starting" | "complete" | "stopped" | "nopower"
+        );
         match activity.unwrap_or("") {
             "driving" => Self::Driving,
-            "charging" => Self::Charging,
-            _ if matches!(charging.as_str(), "charging" | "starting") => Self::Charging,
+            _ if charging == "charging" => Self::Charging,
             "updating" => Self::Updating,
             "asleep" => Self::Asleep,
             "offline" => Self::Offline,
+            _ if plugged_idle => Self::Plugged,
+            // An open session with no newer idle state is still charging.
+            // `Disconnected` is unplugged and must not stay "En charge".
+            "charging" if charging != "disconnected" => Self::Charging,
             // `Disconnected` is unplugged. A stored `plugged_in` flag must not override it.
-            _ if charging != "disconnected"
-                && (plugged_in == Some(true)
-                    || matches!(charging.as_str(), "complete" | "stopped" | "nopower")) =>
-            {
-                Self::Plugged
-            }
-            "online" => Self::Parked,
+            _ if charging != "disconnected" && plugged_in == Some(true) => Self::Plugged,
+            "online" | "charging" => Self::Parked,
             _ => Self::Unknown,
         }
     }
@@ -150,6 +157,8 @@ pub(super) struct CarCard {
     pub range: String,
     /// One line under the battery, such as the charging power and time to full.
     pub note: Option<String>,
+    /// Charge schedule in the car's local clock. Hidden when absent.
+    pub schedule: Option<String>,
     pub facts: Vec<(&'static str, String)>,
     pub map: MiniMapModel,
     pub place: Option<Place>,
@@ -438,7 +447,12 @@ pub(super) fn fleet_page(chrome: &Chrome, cards: &[FleetCard], month_total: &str
                                 h2 class="fleet-name" { (card.name) }
                                 p class="eyebrow" { (card.look.model.unwrap_or("Voiture")) }
                             }
-                            span class="status-wrap" title=(card.activity) { (status_chip(card.status)) }
+                            div class="status-wrap" title=(card.activity) {
+                                (status_chip(card.status))
+                                @if let Some(schedule) = &card.schedule {
+                                    p class="muted fleet-schedule" { (schedule) }
+                                }
+                            }
                         }
                         div class="fleet-car" { (car_media(image_url(&card.look, card.id).as_deref(), &card.look.label())) }
                         div class="fleet-battery" {
@@ -521,6 +535,8 @@ struct VehicleJson<'a> {
     battery_text: &'a str,
     range_text: &'a str,
     note: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule: Option<&'a str>,
     facts: Vec<FactJson<'a>>,
 }
 
@@ -595,6 +611,7 @@ pub(super) fn overview_page(chrome: &Chrome, overview: &Overview) -> String {
         battery_text: &overview.battery,
         range_text: &car.range,
         note: car.note.as_deref(),
+        schedule: car.schedule.as_deref(),
         facts,
     });
     let image = id.and_then(|vehicle_id| image_url(&car.look, vehicle_id));
@@ -1330,7 +1347,7 @@ pub(crate) fn document(debug_script: bool, body: Markup) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview, Party, Status,
+        CarCard, Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview, Party, Status,
         VehicleTab, connection_page, fleet_page, login_page, overview_page,
     };
 
@@ -1370,6 +1387,63 @@ mod tests {
             Status::from(Some("online"), Some("Charging"), Some(true)).label(),
             "En charge"
         );
+    }
+
+    #[test]
+    fn starting_and_idle_plugged_states_render_branchee_while_charging_stays_en_charge() {
+        for state in ["Starting", "starting", "Stopped", "Complete", "NoPower"] {
+            let parked = Status::from(Some("online"), Some(state), Some(true));
+            assert_eq!(parked, Status::Plugged, "{state}");
+            assert_eq!(parked.label(), "Branchée", "{state}");
+            let session = Status::from(Some("charging"), Some(state), Some(true));
+            assert_eq!(session, Status::Plugged, "activity charging + {state}");
+            assert_eq!(session.label(), "Branchée", "{state}");
+        }
+        assert_eq!(
+            Status::from(Some("charging"), Some("Charging"), Some(true)),
+            Status::Charging
+        );
+        assert_eq!(
+            Status::from(Some("charging"), Some("Charging"), Some(true)).label(),
+            "En charge"
+        );
+        assert_eq!(
+            Status::from(Some("charging"), None, Some(true)),
+            Status::Charging,
+            "an open charge with no newer state stays En charge"
+        );
+        assert_eq!(
+            Status::from(Some("asleep"), Some("Stopped"), Some(true)),
+            Status::Asleep
+        );
+        assert_eq!(
+            Status::from(Some("online"), Some("Disconnected"), Some(true)).label(),
+            "Garée"
+        );
+    }
+
+    #[test]
+    fn overview_puts_the_schedule_next_to_the_status() {
+        let chrome = Chrome {
+            vehicles: vec![vehicle(4, "Faucon")],
+            section: Some(VehicleTab::Overview),
+            ..chrome()
+        };
+        let overview = Overview {
+            name: "Faucon".to_owned(),
+            car: CarCard {
+                status: Status::Plugged,
+                schedule: Some("Charge programmée à 22:00".to_owned()),
+                ..CarCard::default()
+            },
+            ..Overview::default()
+        };
+        let html = overview_page(&chrome, &overview);
+        assert!(html.contains("Branchée"));
+        assert!(html.contains("Charge programmée à 22:00"));
+        let bare = overview_page(&chrome, &Overview::default());
+        assert!(!bare.contains("Charge programmée"));
+        assert!(!bare.contains("hero-schedule"));
     }
 
     #[test]

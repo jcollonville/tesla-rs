@@ -88,6 +88,7 @@ pub(crate) async fn vehicle_state(
         .await
         .map_err(internal)?
         .unwrap_or_else(|| StateJson::offline(id));
+    annotate_charge_status(&mut row);
     let snapshot = app.inner.stream_board.snapshot().await;
     let (status, error) = snapshot.for_vehicle(id);
     row.stream_status = status;
@@ -443,6 +444,7 @@ async fn handle_socket(
         for mut row in rows {
             let snapshot = board.snapshot().await;
             let (status, error) = snapshot.for_vehicle(row.state.vehicle_id);
+            annotate_charge_status(&mut row.state);
             row.state.stream_status = status;
             row.state.stream_error = error;
             row.state.position_mode = gps.mode_name(row.state.vehicle_id).await;
@@ -703,6 +705,10 @@ const STATE_FIELDS: &[&str] = &[
     "plugged_in",
     "time_to_full_charge_h",
     "scheduled_charging_start_time",
+    "scheduled_charging_mode",
+    "scheduled_departure_time",
+    "off_peak_charging_enabled",
+    "off_peak_hours_end_time",
     "tpms_pressure_fl",
     "tpms_pressure_fr",
     "tpms_pressure_rl",
@@ -771,6 +777,14 @@ pub(crate) struct StateJson {
     pub plugged_in: Option<bool>,
     pub time_to_full_charge_h: Option<f64>,
     pub scheduled_charging_start_time: Option<i32>,
+    pub scheduled_charging_mode: Option<String>,
+    pub scheduled_departure_time: Option<i32>,
+    pub off_peak_charging_enabled: Option<bool>,
+    pub off_peak_hours_end_time: Option<i32>,
+    /// `charging`, `plugged`, or `unplugged`. Not a column: filled after the query.
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charge_status: Option<String>,
     pub tpms_pressure_fl: Option<f64>,
     pub tpms_pressure_fr: Option<f64>,
     pub tpms_pressure_rl: Option<f64>,
@@ -800,6 +814,12 @@ pub(crate) struct StateJson {
     #[sqlx(default)]
     #[serde(default = "default_position_mode")]
     pub position_mode: String,
+}
+
+fn annotate_charge_status(state: &mut StateJson) {
+    state.charge_status =
+        crate::state::cable_status(state.charging_state.as_deref(), state.plugged_in)
+            .map(|status| status.as_str().to_owned());
 }
 
 fn default_stream_status() -> String {
@@ -851,6 +871,11 @@ impl StateJson {
             plugged_in: None,
             time_to_full_charge_h: None,
             scheduled_charging_start_time: None,
+            scheduled_charging_mode: None,
+            scheduled_departure_time: None,
+            off_peak_charging_enabled: None,
+            off_peak_hours_end_time: None,
+            charge_status: None,
             tpms_pressure_fl: None,
             tpms_pressure_fr: None,
             tpms_pressure_rl: None,

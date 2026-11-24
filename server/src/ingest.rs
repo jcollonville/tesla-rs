@@ -792,6 +792,15 @@ pub(crate) fn observation_from_vehicle_data(data: VehicleData) -> Observation {
             .or_else(|| finite(charge.minutes_to_full_charge).map(|minutes| minutes / 60.0));
         obs.scheduled_charging_start_time =
             minutes_after_midnight(charge.scheduled_charging_start_time);
+        obs.scheduled_charging_mode = charge
+            .scheduled_charging_mode
+            .as_deref()
+            .and_then(crate::state::normalize_charging_mode)
+            .map(str::to_owned);
+        obs.scheduled_departure_time = minutes_after_midnight(charge.scheduled_departure_time)
+            .or_else(|| minutes_after_midnight(charge.scheduled_departure_time_minutes));
+        obs.off_peak_charging_enabled = charge.off_peak_charging_enabled;
+        obs.off_peak_hours_end_time = minutes_after_midnight(charge.off_peak_hours_end_time);
         obs.battery_heater_on = json_bool(charge.additional.get("battery_heater_on"));
     }
     if let Some(climate) = data.climate_state {
@@ -1832,6 +1841,38 @@ mod tests {
         assert_eq!(obs.is_user_present, Some(true));
         assert_eq!(obs.locked, Some(false));
         assert_eq!(obs.software_version.as_deref(), Some("2026.4"));
+    }
+
+    #[test]
+    fn stopped_with_the_door_shut_stays_plugged_and_keeps_the_schedule() {
+        let data: tesla_fleet_api::VehicleData = serde_json::from_str(
+            r#"{
+                "id": 1,
+                "vin": "V",
+                "charge_state": {
+                    "charging_state": "Stopped",
+                    "charge_port_latch": "Engaged",
+                    "charge_port_door_open": false,
+                    "charger_power": 0,
+                    "conn_charge_cable": "<invalid>",
+                    "scheduled_charging_mode": "StartAt",
+                    "scheduled_charging_start_time": 1320,
+                    "scheduled_departure_time": 2500,
+                    "scheduled_departure_time_minutes": 420,
+                    "off_peak_charging_enabled": true,
+                    "off_peak_hours_end_time": 360
+                }
+            }"#,
+        )
+        .unwrap();
+        let obs = super::observation_from_vehicle_data(data);
+        assert_eq!(obs.charging_state.as_deref(), Some("Stopped"));
+        assert_eq!(obs.plugged_in, Some(true));
+        assert_eq!(obs.scheduled_charging_mode.as_deref(), Some("StartAt"));
+        assert_eq!(obs.scheduled_charging_start_time, Some(1320));
+        assert_eq!(obs.scheduled_departure_time, Some(420));
+        assert_eq!(obs.off_peak_charging_enabled, Some(true));
+        assert_eq!(obs.off_peak_hours_end_time, Some(360));
     }
 
     #[test]
