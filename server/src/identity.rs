@@ -136,6 +136,9 @@ pub(crate) async fn login(
     .fetch_optional(&app.inner.db)
     .await?;
     let Some((id, password_hash, totp_secret, totp_enabled)) = row else {
+        // Spend the same argon2 cost as a real user so timing does not leak
+        // whether the username exists.
+        let _ = verify_password(dummy_password_hash(), password);
         throttle_fail(&app.inner.db, &ip_key).await?;
         throttle_fail(&app.inner.db, &user_key).await?;
         audit(&app.inner.db, None, "login", "failure", "{}").await;
@@ -347,7 +350,8 @@ pub(crate) async fn ensure_pending_totp(
     let raw = crypto::random_token().map_err(|_| AppError::message("entropy failed"))?;
     let raw = raw.into_bytes();
     let key = totp_key(&app.inner.config)?;
-    let sealed = crypto::seal(&key, &raw).map_err(|_| AppError::message("could not store totp"))?;
+    let sealed =
+        crypto::seal(key.primary(), &raw).map_err(|_| AppError::message("could not store totp"))?;
     let updated = sqlx::query(
         "UPDATE sessions
          SET totp_pending = $2, totp_pending_until = now() + interval '15 minutes'
@@ -388,8 +392,8 @@ pub(crate) async fn confirm_totp(
         return Ok(TotpConfirm::Rejected);
     }
     let key = totp_key(&app.inner.config)?;
-    let sealed =
-        crypto::seal(&key, &secret).map_err(|_| AppError::message("could not store totp"))?;
+    let sealed = crypto::seal(key.primary(), &secret)
+        .map_err(|_| AppError::message("could not store totp"))?;
     let mut codes = Vec::with_capacity(8);
     for _ in 0..8 {
         codes.push(recovery_code()?);
@@ -445,7 +449,7 @@ async fn pending_secret(
         return Ok(None);
     };
     let key = totp_key(config)?;
-    let secret = crypto::open_payload(&sealed, Some(&key))
+    let secret = crypto::open_payload_with(&sealed, Some(&key))
         .map_err(|_| AppError::message("totp unreadable"))?;
     Ok(Some(secret))
 }
@@ -669,17 +673,24 @@ fn verify_password(hash: &str, password: &str) -> bool {
         .is_ok()
 }
 
+/// Fixed argon2id hash used only to equalise login timing for unknown usernames.
+fn dummy_password_hash() -> &'static str {
+    use std::sync::OnceLock;
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| hash_password("timing-oracle-dummy-password").expect("dummy password hash"))
+}
+
 fn hasher() -> Argon2<'static> {
     let params = Params::new(19 * 1024, 2, 1, None).expect("argon2id parameters");
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
-fn totp_key(config: &Config) -> Result<[u8; 32], AppError> {
+fn totp_key(config: &Config) -> Result<crypto::EncryptionKey, AppError> {
     let material = config
         .token_encryption_key
         .as_deref()
         .unwrap_or_else(|| config.client_secret.expose_secret());
-    crypto::derive_key(material)
+    crypto::derive_encryption_key(material)
 }
 
 async fn second_factor(
@@ -694,7 +705,7 @@ async fn second_factor(
     }
     if let Some(sealed) = &user.totp_secret {
         let key = totp_key(config)?;
-        if let Ok(secret) = crypto::open_payload(sealed, Some(&key))
+        if let Ok(secret) = crypto::open_payload_with(sealed, Some(&key))
             && totp_matches(&secret, code, unix_now())
         {
             return Ok(true);
@@ -718,8 +729,15 @@ fn totp_matches(secret: &[u8], code: &str, now: u64) -> bool {
     };
     let step = 30;
     let current = now / step;
-    (current.saturating_sub(1)..=current.saturating_add(1))
-        .any(|counter| hotp(secret, counter) == presented)
+    let mut matched = false;
+    for counter in current.saturating_sub(1)..=current.saturating_add(1) {
+        let expected = format!("{:06}", hotp(secret, counter));
+        let presented = format!("{presented:06}");
+        if crate::crypto::constant_time_eq(expected.as_bytes(), presented.as_bytes()) {
+            matched = true;
+        }
+    }
+    matched
 }
 
 fn hotp(secret: &[u8], counter: u64) -> u32 {

@@ -10,29 +10,53 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::sync::{broadcast, watch};
 
-use crate::config::Config;
 use crate::debug::DebugBoard;
 use crate::error::redact_secrets;
 use crate::persist::LiveEvent;
 
 pub(crate) async fn run(
-    config: &Config,
+    runtime: crate::settings::RuntimeConfig,
     db: PgPool,
     mut events: broadcast::Receiver<LiveEvent>,
     debug: DebugBoard,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    if !config.mqtt_enabled {
-        debug.set_mqtt("disabled", None);
-        return;
-    }
+    let mut settings = runtime.subscribe();
     loop {
         if *shutdown.borrow() {
             break;
         }
+        let snap = settings.borrow().clone();
+        if !snap.mqtt_enabled {
+            debug.set_mqtt("disabled", None);
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                }
+                changed = settings.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
         debug.set_mqtt("connecting", None);
-        match session(config, &db, &mut events, &debug, &mut shutdown).await {
-            Ok(()) => break,
+        match session(
+            &runtime,
+            &snap,
+            &db,
+            &mut events,
+            &debug,
+            &mut shutdown,
+            &mut settings,
+        )
+        .await
+        {
+            Ok(SessionEnd::Shutdown) => break,
+            Ok(SessionEnd::Reload) => {}
             Err(err) => {
                 let err = redact_secrets(&err);
                 debug.set_mqtt("error", Some(err.clone()));
@@ -43,6 +67,11 @@ pub(crate) async fn run(
                             break;
                         }
                     }
+                    changed = settings.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
                     () = tokio::time::sleep(Duration::from_secs(15)) => {}
                 }
             }
@@ -50,32 +79,59 @@ pub(crate) async fn run(
     }
 }
 
+enum SessionEnd {
+    Shutdown,
+    Reload,
+}
+
 async fn session(
-    config: &Config,
+    runtime: &crate::settings::RuntimeConfig,
+    snap: &crate::settings::RuntimeSnapshot,
     db: &PgPool,
     events: &mut broadcast::Receiver<LiveEvent>,
     debug: &DebugBoard,
     shutdown: &mut watch::Receiver<bool>,
-) -> Result<(), String> {
-    let mut options = MqttOptions::new("tesla-logger", config.mqtt_host.as_str(), config.mqtt_port);
+    settings: &mut watch::Receiver<crate::settings::RuntimeSnapshot>,
+) -> Result<SessionEnd, String> {
+    let mut options = MqttOptions::new("tesla-logger", snap.mqtt_host.as_str(), snap.mqtt_port);
     options.set_keep_alive(Duration::from_secs(30));
-    if let (Some(username), Some(password)) = (&config.mqtt_username, &config.mqtt_password) {
+    let boot = runtime.boot();
+    if let (Some(username), Some(password)) = (&boot.mqtt_username, &boot.mqtt_password) {
         options.set_credentials(username, secrecy::ExposeSecret::expose_secret(password));
     }
     let (client, mut eventloop) = AsyncClient::new(options, 32);
-    publish_current(&client, config, db).await?;
+    publish_current(&client, snap, db).await?;
+    let started = (
+        snap.mqtt_enabled,
+        snap.mqtt_host.clone(),
+        snap.mqtt_port,
+        snap.mqtt_prefix.clone(),
+    );
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    return Ok(());
+                    return Ok(SessionEnd::Shutdown);
+                }
+            }
+            changed = settings.changed() => {
+                if changed.is_err() {
+                    return Ok(SessionEnd::Shutdown);
+                }
+                let next = settings.borrow().clone();
+                let now = (next.mqtt_enabled, next.mqtt_host.clone(), next.mqtt_port, next.mqtt_prefix.clone());
+                if now != started {
+                    return Ok(SessionEnd::Reload);
                 }
             }
             incoming = events.recv() => {
                 match incoming {
-                    Ok(event) => publish_event(&client, config, &event).await?,
+                    Ok(event) => {
+                        let prefix = settings.borrow().mqtt_prefix.clone();
+                        publish_event(&client, &prefix, &event).await?;
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    Err(broadcast::error::RecvError::Closed) => return Ok(SessionEnd::Shutdown),
                 }
             }
             polled = eventloop.poll() => {
@@ -91,7 +147,11 @@ async fn session(
     }
 }
 
-async fn publish_current(client: &AsyncClient, config: &Config, db: &PgPool) -> Result<(), String> {
+async fn publish_current(
+    client: &AsyncClient,
+    snap: &crate::settings::RuntimeSnapshot,
+    db: &PgPool,
+) -> Result<(), String> {
     let rows = sqlx::query_as::<_, CurrentRow>(
         "SELECT v.vin, v.name, v.model, s.activity, s.battery_level, s.rated_range_km,
                 s.odometer_km, s.speed_kmh, s.power_kw, s.charger_power_kw, s.inside_temp_c,
@@ -121,7 +181,7 @@ async fn publish_current(client: &AsyncClient, config: &Config, db: &PgPool) -> 
             // LiveEvent::activity is &'static. Map known values.
             event.activity = crate::state::Activity::parse(&activity).as_str();
         }
-        publish_event(client, config, &event).await?;
+        publish_event(client, &snap.mqtt_prefix, &event).await?;
     }
     Ok(())
 }
@@ -146,14 +206,14 @@ struct CurrentRow {
 
 async fn publish_event(
     client: &AsyncClient,
-    config: &Config,
+    mqtt_prefix: &str,
     event: &LiveEvent,
 ) -> Result<(), String> {
     let vin = topic_id(&event.vin);
     if vin.is_empty() {
         return Ok(());
     }
-    let prefix = topic_id(&config.mqtt_prefix);
+    let prefix = topic_id(mqtt_prefix);
     let device = device_payload(&vin, event.name.as_deref(), event.model.as_deref());
     for sensor in sensors(&prefix, &vin, &device) {
         publish(

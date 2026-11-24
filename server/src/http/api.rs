@@ -276,6 +276,9 @@ pub(crate) async fn list_charges(
     State(app): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Page<ChargeJson>>, ApiError> {
+    if let Some(id) = query.vehicle_id {
+        allow_vehicle(id)?;
+    }
     let page = page_params(query.page, query.per_page)?;
     let total: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM charges
@@ -290,7 +293,7 @@ pub(crate) async fn list_charges(
     .fetch_one(&app.inner.db)
     .await
     .map_err(internal)?;
-    let data = sqlx::query_as::<_, ChargeJson>(&charge_select(
+    let mut data = sqlx::query_as::<_, ChargeJson>(&charge_select(
         "WHERE ($1::bigint IS NULL OR c.vehicle_id = $1)
            AND ($2::timestamptz IS NULL OR c.start_at >= $2)
            AND ($3::timestamptz IS NULL OR c.start_at < $3)
@@ -304,6 +307,7 @@ pub(crate) async fn list_charges(
     .fetch_all(&app.inner.db)
     .await
     .map_err(internal)?;
+    data.retain(|row| super::vehicle_visible(row.vehicle_id));
     Ok(Json(Page {
         data,
         page: page.page,
@@ -322,6 +326,7 @@ pub(crate) async fn charge_detail(
         .await
         .map_err(internal)?
         .ok_or(ApiError::NotFound)?;
+    allow_vehicle(charge.vehicle_id)?;
     let samples = sqlx::query_as::<_, ChargeSampleJson>(
         "SELECT recorded_at, battery_level, charger_power_kw, charger_voltage, charger_current,
                 charge_energy_added_kwh, rated_range_km, ideal_range_km, outside_temp_c
@@ -404,11 +409,12 @@ pub(crate) async fn ws(
     State(app): State<AppState>,
     upgrade: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    let allowed = super::api_vehicle_ids();
     let events = app.inner.events.subscribe();
     let db = app.inner.db.clone();
     let board = app.inner.stream_board.clone();
     let gps = app.inner.archive.gps.clone();
-    upgrade.on_upgrade(move |socket| handle_socket(socket, db, events, board, gps))
+    upgrade.on_upgrade(move |socket| handle_socket(socket, db, events, board, gps, allowed))
 }
 
 async fn handle_socket(
@@ -417,6 +423,7 @@ async fn handle_socket(
     mut events: tokio::sync::broadcast::Receiver<crate::persist::LiveEvent>,
     board: crate::owner_stream::StreamBoard,
     gps: crate::position_mode::GpsBoard,
+    allowed: Option<Vec<i64>>,
 ) {
     let snapshot = format!(
         "SELECT v.vin, v.name, v.model, v.id AS vehicle_id,
@@ -426,10 +433,13 @@ async fn handle_socket(
          ORDER BY v.id",
         prefixed = state_columns("s")
     );
-    if let Ok(rows) = sqlx::query_as::<_, WsSnapshot>(&snapshot)
+    if let Ok(mut rows) = sqlx::query_as::<_, WsSnapshot>(&snapshot)
         .fetch_all(&db)
         .await
     {
+        if let Some(ids) = &allowed {
+            rows.retain(|row| ids.contains(&row.state.vehicle_id));
+        }
         for mut row in rows {
             let snapshot = board.snapshot().await;
             let (status, error) = snapshot.for_vehicle(row.state.vehicle_id);
@@ -478,6 +488,9 @@ async fn handle_socket(
             event = events.recv() => {
                 match event {
                     Ok(event) => {
+                        if allowed.as_ref().is_some_and(|ids| !ids.contains(&event.vehicle_id)) {
+                            continue;
+                        }
                         let Ok(mut value) = serde_json::to_value(&event) else {
                             continue;
                         };

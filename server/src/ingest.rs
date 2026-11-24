@@ -272,6 +272,8 @@ pub(crate) struct Archive {
     pub fences: crate::persist::FenceCache,
     /// How long an open drive survives a gap or a confirmed park.
     pub drive_grace: crate::state::DriveGrace,
+    /// Hot-reloadable settings. Absent in unit tests that construct an archive alone.
+    pub runtime: Option<crate::settings::RuntimeConfig>,
 }
 
 impl Archive {
@@ -295,7 +297,18 @@ impl Archive {
             fleet_strikes: Arc::new(Mutex::new(crate::budget::StrikeBook::default())),
             fences: crate::persist::FenceCache::default(),
             drive_grace: crate::state::DriveGrace::standard(),
+            runtime: None,
         }
+    }
+
+    pub(crate) fn live_drive_grace(&self) -> crate::state::DriveGrace {
+        self.runtime.as_ref().map_or(self.drive_grace, |runtime| {
+            let snap = runtime.snapshot();
+            crate::state::DriveGrace::from_secs(
+                snap.drive_end_grace.as_secs(),
+                snap.drive_park_grace.as_secs(),
+            )
+        })
     }
 }
 
@@ -354,7 +367,7 @@ async fn ensure_runtime(
         return Ok(slot);
     }
     let mut loaded = load_runtime(&archive.db, vehicle_id, vin).await?;
-    loaded.drive_grace = archive.drive_grace;
+    loaded.drive_grace = archive.live_drive_grace();
     let mut guard = archive.runtimes.lock().await;
     Ok(Arc::clone(
         guard
@@ -438,7 +451,7 @@ pub(crate) async fn expire_drives(
     for (vehicle_id, vin) in rows {
         let slot = ensure_runtime(archive, &vin, vehicle_id).await?;
         let mut runtime = slot.lock().await;
-        runtime.drive_grace = archive.drive_grace;
+        runtime.drive_grace = archive.live_drive_grace();
         let due = crate::persist::close_drive_if_due(
             &archive.db,
             &mut runtime,
@@ -892,58 +905,88 @@ pub(crate) async fn run_poll<T: AccessTokenProvider>(
             break;
         }
         let mut policy = policy;
-        policy.drive_fallback = crate::settings::bounded_secs(
-            &archive.db,
-            "POLL_DRIVE_FALLBACK_SECS",
-            policy.drive_fallback,
-            crate::budget::DRIVE_FALLBACK_MIN_SECS,
-            crate::budget::DRIVE_FALLBACK_MAX_SECS,
-        )
-        .await;
-        policy.charge = crate::settings::bounded_secs(
-            &archive.db,
-            "POLL_CHARGE_SECS",
-            policy.charge,
-            crate::budget::CHARGE_POLL_MIN_SECS,
-            crate::budget::CHARGE_POLL_MAX_SECS,
-        )
-        .await;
-        policy.parked =
-            crate::settings::secs_or(&archive.db, "POLL_PARKED_SECS", policy.parked).await;
-        policy.asleep =
-            crate::settings::secs_or(&archive.db, "POLL_ASLEEP_SECS", policy.asleep).await;
-        policy.backoff =
-            crate::settings::secs_or(&archive.db, "POLL_BACKOFF_SECS", policy.backoff).await;
-        policy.gps_fallback =
-            crate::settings::secs_or(&archive.db, "POLL_GPS_FALLBACK_SECS", policy.gps_fallback)
-                .await;
-        policy.daily_cap = crate::settings::bounded_u64(
-            &archive.db,
-            "FLEET_DATA_DAILY_CAP",
-            policy.daily_cap,
-            crate::budget::DAILY_CAP_MIN,
-            crate::budget::DAILY_CAP_MAX,
-        )
-        .await;
-        policy.monthly_cap = crate::settings::bounded_u64(
-            &archive.db,
-            "FLEET_DATA_MONTHLY_CAP",
-            policy.monthly_cap,
-            crate::budget::MONTHLY_CAP_MIN,
-            crate::budget::MONTHLY_CAP_MAX,
-        )
-        .await;
-        if policy.monthly_cap < policy.daily_cap {
-            policy.monthly_cap = policy.daily_cap;
+        // Prefer the runtime snapshot (DB overrides) when the archive carries one;
+        // otherwise fall back to per-key reads for unit tests.
+        if let Some(runtime) = archive.runtime.as_ref() {
+            let snap = runtime.snapshot();
+            policy.drive_fallback = snap.drive_fallback;
+            policy.charge = snap.charge;
+            policy.parked = snap.parked;
+            policy.asleep = snap.asleep;
+            policy.backoff = snap.backoff;
+            policy.gps_fallback = snap.gps_fallback;
+            policy.parked_live_limit = snap.parked_live_limit;
+            policy.daily_cap = snap.daily_cap;
+            policy.monthly_cap = snap.monthly_cap;
+            policy.blocked_probe = snap.blocked_probe;
+        } else {
+            policy.drive_fallback = crate::settings::bounded_secs(
+                &archive.db,
+                "POLL_DRIVE_FALLBACK_SECS",
+                policy.drive_fallback,
+                crate::budget::DRIVE_FALLBACK_MIN_SECS,
+                crate::budget::DRIVE_FALLBACK_MAX_SECS,
+            )
+            .await;
+            policy.charge = crate::settings::bounded_secs(
+                &archive.db,
+                "POLL_CHARGE_SECS",
+                policy.charge,
+                crate::budget::CHARGE_POLL_MIN_SECS,
+                crate::budget::CHARGE_POLL_MAX_SECS,
+            )
+            .await;
+            policy.parked =
+                crate::settings::secs_or(&archive.db, "POLL_PARKED_SECS", policy.parked).await;
+            policy.asleep =
+                crate::settings::secs_or(&archive.db, "POLL_ASLEEP_SECS", policy.asleep).await;
+            policy.backoff =
+                crate::settings::secs_or(&archive.db, "POLL_BACKOFF_SECS", policy.backoff).await;
+            policy.gps_fallback = crate::settings::secs_or(
+                &archive.db,
+                "POLL_GPS_FALLBACK_SECS",
+                policy.gps_fallback,
+            )
+            .await;
+            policy.parked_live_limit = u32::try_from(
+                crate::settings::bounded_u64(
+                    &archive.db,
+                    "POLL_PARKED_LIVE_LIMIT",
+                    u64::from(policy.parked_live_limit),
+                    0,
+                    100,
+                )
+                .await,
+            )
+            .unwrap_or(policy.parked_live_limit);
+            policy.daily_cap = crate::settings::bounded_u64(
+                &archive.db,
+                "FLEET_DATA_DAILY_CAP",
+                policy.daily_cap,
+                crate::budget::DAILY_CAP_MIN,
+                crate::budget::DAILY_CAP_MAX,
+            )
+            .await;
+            policy.monthly_cap = crate::settings::bounded_u64(
+                &archive.db,
+                "FLEET_DATA_MONTHLY_CAP",
+                policy.monthly_cap,
+                crate::budget::MONTHLY_CAP_MIN,
+                crate::budget::MONTHLY_CAP_MAX,
+            )
+            .await;
+            if policy.monthly_cap < policy.daily_cap {
+                policy.monthly_cap = policy.daily_cap;
+            }
+            policy.blocked_probe = crate::settings::bounded_secs(
+                &archive.db,
+                "FLEET_BLOCKED_PROBE_SECS",
+                policy.blocked_probe,
+                crate::budget::BLOCKED_PROBE_MIN_SECS,
+                crate::budget::BLOCKED_PROBE_MAX_SECS,
+            )
+            .await;
         }
-        policy.blocked_probe = crate::settings::bounded_secs(
-            &archive.db,
-            "FLEET_BLOCKED_PROBE_SECS",
-            policy.blocked_probe,
-            crate::budget::BLOCKED_PROBE_MIN_SECS,
-            crate::budget::BLOCKED_PROBE_MAX_SECS,
-        )
-        .await;
         let control = run_cycle(source, &archive, &policy, account_id).await;
         let gate = crate::budget::gate(
             &archive.db,

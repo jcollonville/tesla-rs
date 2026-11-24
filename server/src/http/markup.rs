@@ -747,69 +747,69 @@ pub(super) fn connection_page(chrome: &Chrome, view: &ConnectionView<'_>) -> Str
                     }
                 }
             }
-            section class="card" lang="en" {
-                h2 { "Owner API streaming" }
-                p { "This uses Tesla's legacy Owner API and streaming socket. They are unofficial and Tesla may shut them down. Fleet API polling stays the source for everything else. The stream adds about one position per second while driving." }
+            section class="card" {
+                h2 { "Streaming Owner API" }
+                p { "Utilise l'Owner API et le socket de streaming historiques de Tesla. Ils sont non officiels et Tesla peut les retirer. Le polling Fleet reste la source pour le reste. Le stream ajoute environ une position par seconde en conduite." }
                 div class="meta" {
                     span class=(format!("chip {}", stream_tone(view.stream_status))) {
                         "Stream " (view.stream_status)
                     }
                     @if view.owner_connected {
-                        span class="chip ok" { "Owner token stored" }
+                        span class="chip ok" { "Jeton Owner enregistré" }
                     } @else {
-                        span class="chip" { "No owner token" }
+                        span class="chip" { "Pas de jeton Owner" }
                     }
                 }
                 @if !view.streaming_enabled {
                     div class="banner note" role="status" {
-                        p { "Streaming is off because OWNER_STREAM_ENABLED is false. Tokens can still be saved." }
+                        p { "Le streaming est désactivé (OWNER_STREAM_ENABLED=false). Les jetons peuvent toujours être enregistrés." }
                     }
                 }
                 ol class="steps" {
-                    li { "Choose " strong { "Prepare Tesla sign-in" } "." }
-                    li { "Open the Tesla link and sign in with the account that owns the car. The link opens in a new tab so this page stays here." }
-                    li { "The browser cannot open " code { "tesla://" } ". It may say the address is not understood, the site cannot be reached, or offer to open the Tesla app. Do not open the Tesla app." }
-                    li { "Copy the full URL from the address bar. It starts with " code { "tesla://auth/callback?" } ". If Chrome drops it, the Network tab in developer tools still lists the failed navigation." }
-                    li { "Paste that URL into " strong { "Redirect URL" } " and choose " strong { "Save sign-in" } ". The field is masked so the authorization code is not displayed." }
+                    li { "Choisissez " strong { "Préparer la connexion Tesla" } "." }
+                    li { "Ouvrez le lien Tesla et connectez-vous avec le compte qui possède la voiture. Le lien s'ouvre dans un nouvel onglet." }
+                    li { "Le navigateur ne peut pas ouvrir " code { "tesla://" } ". Ne lancez pas l'application Tesla." }
+                    li { "Copiez l'URL complète depuis la barre d'adresse. Elle commence par " code { "tesla://auth/callback?" } "." }
+                    li { "Collez-la dans " strong { "URL de redirection" } " puis " strong { "Enregistrer" } ". Le champ est masqué." }
                 }
                 form class="stack" method="post" action="/auth/owner/start" {
                     input type="hidden" name="csrf" value=(view.csrf);
                     (vehicle_field(view.vehicle_id))
-                    button type="submit" { "Prepare Tesla sign-in" }
+                    button type="submit" { "Préparer la connexion Tesla" }
                 }
                 @if let Some(url) = view.authorize_url {
                     p class="stack" {
-                        a class="button" href=(url) rel="noreferrer noopener" target="_blank" { "Open the Tesla sign-in" }
+                        a class="button" href=(url) rel="noreferrer noopener" target="_blank" { "Ouvrir la connexion Tesla" }
                     }
                 } @else {
-                    p class="muted" { "Prepare a sign-in to get the Tesla link." }
+                    p class="muted" { "Préparez une connexion pour obtenir le lien Tesla." }
                 }
                 form class="stack" method="post" action="/auth/owner/callback" {
                     input type="hidden" name="csrf" value=(view.csrf);
                     (vehicle_field(view.vehicle_id))
                     label class="field" for="redirect_url" {
-                        "Redirect URL"
+                        "URL de redirection"
                         input id="redirect_url" type="password" name="redirect_url" autocomplete="off" spellcheck="false" maxlength="8000" required;
                     }
-                    button type="submit" { "Save sign-in" }
+                    button type="submit" { "Enregistrer" }
                 }
-                h2 { "Refresh token" }
-                p { "Paste a refresh token created for this logger. Do not reuse TeslaMate's refresh token. Tesla rotates refresh tokens, and using TeslaMate's token here can sign TeslaMate out." }
+                h2 { "Jeton de rafraîchissement" }
+                p { "Collez un refresh token créé pour ce logger. N'utilisez pas celui de TeslaMate : Tesla les fait tourner et cela peut déconnecter TeslaMate." }
                 form class="stack" method="post" action="/auth/owner/refresh" {
                     input type="hidden" name="csrf" value=(view.csrf);
                     (vehicle_field(view.vehicle_id))
                     label class="field" for="refresh_token" {
-                        "Owner API refresh token"
+                        "Refresh token Owner API"
                         input id="refresh_token" type="password" name="refresh_token" autocomplete="off" spellcheck="false" maxlength="8000" required;
                     }
-                    button type="submit" { "Save refresh token" }
+                    button type="submit" { "Enregistrer le refresh token" }
                 }
-                h2 { "Disconnect" }
-                p class="muted" { "Removes the stored Owner API token. Fleet API polling is unchanged." }
+                h2 { "Déconnexion" }
+                p class="muted" { "Supprime le jeton Owner API stocké. Le polling Fleet n'est pas modifié." }
                 form method="post" action="/auth/owner/disconnect" {
                     input type="hidden" name="csrf" value=(view.csrf);
                     (vehicle_field(view.vehicle_id))
-                    button class="danger" type="submit" { "Disconnect Owner API" }
+                    button class="danger" type="submit" { "Déconnecter l'Owner API" }
                 }
             }
             section class="card" {
@@ -836,12 +836,18 @@ pub(super) fn connection_page(chrome: &Chrome, view: &ConnectionView<'_>) -> Str
     document(chrome.debug_script, body)
 }
 
-pub(super) fn settings_page(chrome: &Chrome, rows: &[SettingRow]) -> String {
+pub(super) fn settings_page(
+    chrome: &Chrome,
+    rows: &[SettingRow],
+    override_form: Option<&str>,
+) -> String {
     let body = html! {
         (toolbar(chrome, "Réglages"))
         section class="card" {
             h2 { "Configuration effective" }
-            p class="muted" { "Lecture seule. La source est l'environnement, ou la valeur par défaut du programme. Les secrets restent dans l'environnement et ne sont pas affichés." }
+            p class="muted" {
+                "Valeurs résolues : réglage en base, sinon environnement, sinon défaut. Les secrets restent dans l'environnement et ne sont pas affichés."
+            }
             table class="settings" {
                 caption class="muted" { "Réglages publics" }
                 thead {
@@ -858,17 +864,17 @@ pub(super) fn settings_page(chrome: &Chrome, rows: &[SettingRow]) -> String {
                 }
             }
         }
+        @if let Some(form) = override_form {
+            (maud::PreEscaped(form))
+        }
     };
     document(chrome.debug_script, body)
 }
 
-pub(super) fn system_page(chrome: &Chrome) -> String {
+pub(super) fn system_page(chrome: &Chrome, status: &str) -> String {
     let body = html! {
         (toolbar(chrome, "Système"))
-        section class="card" {
-            h2 { "Système" }
-            p { "La taille de la base, les migrations, les tâches de fond et la sauvegarde arrivent dans une phase suivante." }
-        }
+        (maud::PreEscaped(status))
     };
     document(chrome.debug_script, body)
 }
@@ -895,6 +901,40 @@ pub(super) fn security_page(
                 }
                 button class="tonal" type="submit" { "Confirmer pour 5 minutes" }
             }
+        }
+        section class="card" {
+            h2 { "Mot de passe" }
+            form class="stack" method="post" action="/security/password" {
+                input type="hidden" name="csrf" value=(&chrome.csrf);
+                label class="field" for="current-password" {
+                    "Mot de passe actuel"
+                    input id="current-password" type="password" name="current" autocomplete="current-password" required;
+                }
+                label class="field" for="new-password" {
+                    "Nouveau mot de passe"
+                    input id="new-password" type="password" name="password" autocomplete="new-password" required minlength="12";
+                }
+                label class="field" for="confirm-password" {
+                    "Confirmer le mot de passe"
+                    input id="confirm-password" type="password" name="confirm" autocomplete="new-password" required minlength="12";
+                }
+                button type="submit" { "Changer le mot de passe" }
+            }
+        }
+        section class="card" {
+            h2 { "Authentification à deux facteurs" }
+            p class="muted" { "Ré-enrôler remplace le secret TOTP actuel et affiche de nouveaux codes de secours." }
+            form class="stack" method="post" action="/security/totp" {
+                input type="hidden" name="csrf" value=(&chrome.csrf);
+                button class="tonal" type="submit" { "Configurer / régénérer le TOTP" }
+            }
+        }
+        section class="card" {
+            h2 { "Passkeys" }
+            p class="muted" { "Enregistrer une clé d'accès pour ce compte. Nécessite un navigateur compatible." }
+            button id="passkey-register" class="tonal" type="button" data-csrf=(&chrome.csrf) { "Enregistrer une passkey" }
+            p id="passkey-status" class="muted" aria-live="polite" {}
+            script src="/static/setup.js" defer {}
         }
         section class="card" {
             h2 { "Utilisateurs et véhicules" }
@@ -1354,10 +1394,10 @@ mod tests {
         vec![
             (
                 "settings",
-                settings_page(&page(GlobalTab::Settings), &[] as &[SettingRow]),
+                settings_page(&page(GlobalTab::Settings), &[] as &[SettingRow], None),
             ),
             ("debug", debug_page(&page(GlobalTab::Debug), 0, 0, "")),
-            ("system", system_page(&page(GlobalTab::System))),
+            ("system", system_page(&page(GlobalTab::System), "")),
             (
                 "security",
                 security_page(
@@ -1512,9 +1552,9 @@ mod tests {
             },
         );
         assert!(html.contains("tesla://auth/callback?"));
-        assert!(html.contains("Do not open the Tesla app"));
-        assert!(html.contains("Network tab"));
-        assert!(html.contains("Do not reuse TeslaMate's refresh token"));
+        assert!(html.contains("Ne lancez pas l'application Tesla"));
+        assert!(html.contains("Préparer la connexion Tesla"));
+        assert!(html.contains("N'utilisez pas celui de TeslaMate"));
         assert!(!html.contains("void/callback"));
         assert!(html.contains("href=\"/debug\""));
         assert!(html.contains("href=\"/auth/login\""));
@@ -1728,6 +1768,7 @@ mod tests {
                         ..chrome()
                     },
                     &[],
+                    None,
                 ),
             ),
             (
@@ -1745,10 +1786,13 @@ mod tests {
             ),
             (
                 "system",
-                system_page(&Chrome {
-                    global: GlobalTab::System,
-                    ..chrome()
-                }),
+                system_page(
+                    &Chrome {
+                        global: GlobalTab::System,
+                        ..chrome()
+                    },
+                    "",
+                ),
             ),
             (
                 "security",

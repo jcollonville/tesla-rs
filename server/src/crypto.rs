@@ -32,7 +32,7 @@ pub(crate) type TokenSaved = std::sync::Arc<dyn Fn(std::time::SystemTime) + Send
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TokenFile {
     path: PathBuf,
-    key: Option<[u8; 32]>,
+    key: Option<EncryptionKey>,
     lock: Mutex<()>,
     saved: std::sync::Mutex<Option<TokenSaved>>,
 }
@@ -56,6 +56,36 @@ impl Drop for TokenFile {
     }
 }
 
+/// AES-256 key material. Passphrases derive with Argon2id; a legacy SHA-256
+/// digest is kept so files sealed before that change still open.
+pub(crate) struct EncryptionKey {
+    primary: [u8; 32],
+    legacy_sha256: Option<[u8; 32]>,
+}
+
+impl EncryptionKey {
+    pub(crate) fn primary(&self) -> &[u8; 32] {
+        &self.primary
+    }
+
+    fn candidates(&self) -> impl Iterator<Item = &[u8; 32]> {
+        std::iter::once(&self.primary).chain(self.legacy_sha256.as_ref())
+    }
+
+    fn zeroize(&mut self) {
+        self.primary.zeroize();
+        if let Some(legacy) = self.legacy_sha256.as_mut() {
+            legacy.zeroize();
+        }
+    }
+}
+
+impl Drop for EncryptionKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 impl TokenFile {
     pub(crate) fn open(
@@ -66,7 +96,7 @@ impl TokenFile {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            Some(value) => Some(derive_key(value)?),
+            Some(value) => Some(derive_encryption_key(value)?),
             None => None,
         };
         Ok(Self {
@@ -93,7 +123,7 @@ impl TokenFile {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(store_err(err)),
         };
-        let mut plaintext = match open_payload(&bytes, self.key.as_ref()) {
+        let mut plaintext = match open_payload_with(&bytes, self.key.as_ref()) {
             Ok(plaintext) => plaintext,
             Err(err) => return Err(store_err(err)),
         };
@@ -106,7 +136,7 @@ impl TokenFile {
         let _guard = self.lock.lock().await;
         let mut plaintext = tokens_to_json(tokens).map_err(store_err)?;
         let sealed = match self.key.as_ref() {
-            Some(key) => seal(key, &plaintext).map_err(store_err)?,
+            Some(key) => seal(key.primary(), &plaintext).map_err(store_err)?,
             None => plaintext.clone(),
         };
         plaintext.zeroize();
@@ -192,16 +222,57 @@ pub(crate) fn public_key_fingerprint(pem: &str) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(pem.as_bytes())))
 }
 
-pub(crate) fn derive_key(material: &str) -> Result<[u8; 32], AppError> {
+/// Constant-time equality for equal-length byte slices. Different lengths return false.
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Derive the token-file encryption key.
+///
+/// 64 hex characters are the raw 32-byte key. Any other value is hashed with
+/// Argon2id (same memory/time as the login hasher). A legacy SHA-256 digest is
+/// retained so ciphertext sealed before the Argon2id change still decrypts.
+pub(crate) fn derive_encryption_key(material: &str) -> Result<EncryptionKey, AppError> {
     if material.len() == 64 && material.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         let mut key = [0u8; 32];
         hex::decode_to_slice(material, &mut key)
             .map_err(|_| AppError::message("TESLA_TOKEN_ENCRYPTION_KEY is not valid hex"))?;
-        return Ok(key);
+        return Ok(EncryptionKey {
+            primary: key,
+            legacy_sha256: None,
+        });
     }
-    let digest = Sha256::digest(material.as_bytes());
+    Ok(EncryptionKey {
+        primary: argon2id_key(material.as_bytes())?,
+        legacy_sha256: Some(sha256_key(material.as_bytes())),
+    })
+}
+
+fn sha256_key(material: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(material);
     let mut key = [0u8; 32];
     key.copy_from_slice(&digest);
+    key
+}
+
+fn argon2id_key(material: &[u8]) -> Result<[u8; 32], AppError> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    // Fixed public salt: this is a KDF for a configured secret, not a password store.
+    const SALT: &[u8] = b"tesla-logger-tok1";
+    let params = Params::new(19 * 1024, 2, 1, Some(32))
+        .map_err(|_| AppError::message("token encryption key derivation failed"))?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = [0u8; 32];
+    argon
+        .hash_password_into(material, SALT, &mut key)
+        .map_err(|_| AppError::message("token encryption key derivation failed"))?;
     Ok(key)
 }
 
@@ -221,7 +292,10 @@ pub(crate) fn seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> 
     Ok(out)
 }
 
-pub(crate) fn open_payload(bytes: &[u8], key: Option<&[u8; 32]>) -> Result<Vec<u8>, String> {
+pub(crate) fn open_payload_with(
+    bytes: &[u8],
+    key: Option<&EncryptionKey>,
+) -> Result<Vec<u8>, String> {
     if bytes.starts_with(MAGIC) {
         let Some(key) = key else {
             return Err("token file is encrypted; set TESLA_TOKEN_ENCRYPTION_KEY".to_owned());
@@ -230,11 +304,18 @@ pub(crate) fn open_payload(bytes: &[u8], key: Option<&[u8; 32]>) -> Result<Vec<u
             return Err("token file is truncated".to_owned());
         }
         let nonce = Nonce::from_slice(&bytes[4..16]);
-        let cipher =
-            Aes256Gcm::new_from_slice(key).map_err(|_| "encryption key was rejected".to_owned())?;
-        return cipher
-            .decrypt(nonce, &bytes[16..])
-            .map_err(|_| "token file could not be decrypted".to_owned());
+        let mut last_err = "token file could not be decrypted";
+        for candidate in key.candidates() {
+            let Ok(cipher) = Aes256Gcm::new_from_slice(candidate) else {
+                last_err = "encryption key was rejected";
+                continue;
+            };
+            match cipher.decrypt(nonce, &bytes[16..]) {
+                Ok(plaintext) => return Ok(plaintext),
+                Err(_) => last_err = "token file could not be decrypted",
+            }
+        }
+        return Err(last_err.to_owned());
     }
     if key.is_some() && !bytes.starts_with(b"{") {
         return Err("token file is not a tesla-logger token store".to_owned());
@@ -380,6 +461,25 @@ mod tests {
         assert!(public_pem.contains("BEGIN PUBLIC KEY"));
         assert!(!public_pem.contains("PRIVATE KEY"));
         assert!(!public_pem.contains(private_pem.as_str()));
+    }
+
+    #[test]
+    fn passphrase_keys_keep_sha256_legacy_for_old_ciphertext() {
+        let material = "legacy-passphrase-value";
+        let keys = super::derive_encryption_key(material).unwrap();
+        let legacy = super::sha256_key(material.as_bytes());
+        let plaintext = b"{\"access_token\":\"x\",\"token_type\":\"Bearer\",\"expires_at\":1}";
+        let sealed = super::seal(&legacy, plaintext).unwrap();
+        let opened = super::open_payload_with(&sealed, Some(&keys)).unwrap();
+        assert_eq!(opened, plaintext);
+        assert_ne!(keys.primary(), &legacy);
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_length_mismatches() {
+        assert!(super::constant_time_eq(b"abcd", b"abcd"));
+        assert!(!super::constant_time_eq(b"abcd", b"abce"));
+        assert!(!super::constant_time_eq(b"abc", b"abcd"));
     }
 
     #[tokio::test]

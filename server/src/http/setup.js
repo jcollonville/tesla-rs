@@ -59,4 +59,84 @@
       URL.revokeObjectURL(url);
     });
   });
+
+  function b64urlToBuffer(value) {
+    var padded = value.replace(/-/g, "+").replace(/_/g, "/");
+    while (padded.length % 4) padded += "=";
+    var binary = atob(padded);
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes.buffer;
+  }
+
+  function bufferToB64url(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var binary = "";
+    for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
+  function reviveCreationOptions(options) {
+    options.challenge = b64urlToBuffer(options.challenge);
+    options.user.id = b64urlToBuffer(options.user.id);
+    if (options.excludeCredentials) {
+      options.excludeCredentials = options.excludeCredentials.map(function (cred) {
+        return Object.assign({}, cred, { id: b64urlToBuffer(cred.id) });
+      });
+    }
+    return options;
+  }
+
+  function publicKeyCredentialToJSON(cred) {
+    var response = cred.response;
+    return {
+      id: cred.id,
+      rawId: bufferToB64url(cred.rawId),
+      type: cred.type,
+      response: {
+        clientDataJSON: bufferToB64url(response.clientDataJSON),
+        attestationObject: bufferToB64url(response.attestationObject),
+      },
+    };
+  }
+
+  var passkeyButton = document.getElementById("passkey-register");
+  var passkeyStatus = document.getElementById("passkey-status");
+  if (passkeyButton && window.PublicKeyCredential) {
+    passkeyButton.addEventListener("click", function () {
+      if (passkeyStatus) passkeyStatus.textContent = "Préparation…";
+      fetch("/security/passkey/start", { method: "POST", credentials: "same-origin" })
+        .then(function (response) {
+          if (!response.ok) throw new Error("start failed");
+          return response.json();
+        })
+        .then(function (body) {
+          var publicKey = reviveCreationOptions(body.publicKey || body);
+          return navigator.credentials.create({ publicKey: publicKey });
+        })
+        .then(function (cred) {
+          if (!cred) throw new Error("cancelled");
+          return fetch("/security/passkey/finish", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(publicKeyCredentialToJSON(cred)),
+          });
+        })
+        .then(function (response) {
+          if (!response.ok) throw new Error("finish failed");
+          if (passkeyStatus) passkeyStatus.textContent = "Passkey enregistrée.";
+          window.location.href = "/security";
+        })
+        .catch(function () {
+          if (passkeyStatus) {
+            passkeyStatus.textContent =
+              "Enregistrement impossible. Vérifiez le navigateur et réessayez.";
+          }
+        });
+    });
+  } else if (passkeyButton && passkeyStatus) {
+    passkeyStatus.textContent = "Ce navigateur ne gère pas les passkeys.";
+    passkeyButton.disabled = true;
+  }
 })();

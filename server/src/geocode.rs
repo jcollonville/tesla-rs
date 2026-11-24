@@ -31,32 +31,42 @@ pub(crate) struct ParsedAddress {
 }
 
 /// Nominatim client with a cache key and a minimum interval between requests.
+///
+/// Enabled flag, base URL, and interval are read from the runtime snapshot on
+/// each reverse lookup so settings changes apply without a restart.
 pub(crate) struct Geocoder {
-    enabled: bool,
     http: reqwest::Client,
-    base: Url,
-    min_interval: Duration,
+    runtime: Option<tokio::sync::watch::Receiver<crate::settings::RuntimeSnapshot>>,
+    /// Fallback when no runtime watch is attached (tests, disabled).
+    fallback_enabled: bool,
+    fallback_base: Url,
+    fallback_interval: Duration,
     last: Mutex<Option<Instant>>,
 }
 
 impl Geocoder {
-    pub(crate) fn from_config(config: &Config) -> Result<Self, AppError> {
+    pub(crate) fn from_runtime(
+        runtime: tokio::sync::watch::Receiver<crate::settings::RuntimeSnapshot>,
+        config: &Config,
+    ) -> Result<Self, AppError> {
+        let snap = runtime.borrow().clone();
+        let base = Url::parse(snap.nominatim_url.trim_end_matches('/'))
+            .map_err(|_| AppError::message("NOMINATIM_URL is invalid"))?;
+        if snap.nominatim_enabled && base.scheme() != "https" {
+            return Err(AppError::message("NOMINATIM_URL must be https"));
+        }
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(15))
             .user_agent(user_agent(config.nominatim_contact.as_deref()))
             .build()
             .map_err(|_| AppError::message("could not build the geocoder http client"))?;
-        let base = Url::parse(config.nominatim_url.trim_end_matches('/'))
-            .map_err(|_| AppError::message("NOMINATIM_URL is invalid"))?;
-        if config.nominatim_enabled && base.scheme() != "https" {
-            return Err(AppError::message("NOMINATIM_URL must be https"));
-        }
         Ok(Self {
-            enabled: config.nominatim_enabled,
             http,
-            base,
-            min_interval: config.nominatim_min_interval,
+            runtime: Some(runtime),
+            fallback_enabled: snap.nominatim_enabled,
+            fallback_base: base,
+            fallback_interval: snap.nominatim_min_interval,
             last: Mutex::new(None),
         })
     }
@@ -64,10 +74,11 @@ impl Geocoder {
     #[allow(dead_code)]
     pub(crate) fn disabled() -> Self {
         Self {
-            enabled: false,
             http: reqwest::Client::new(),
-            base: Url::parse("https://nominatim.openstreetmap.org").expect("static url"),
-            min_interval: Duration::from_secs(1),
+            runtime: None,
+            fallback_enabled: false,
+            fallback_base: Url::parse("https://nominatim.openstreetmap.org").expect("static url"),
+            fallback_interval: Duration::from_secs(1),
             last: Mutex::new(None),
         }
     }
@@ -77,12 +88,12 @@ impl Geocoder {
         latitude: f64,
         longitude: f64,
     ) -> Result<Option<ParsedAddress>, AppError> {
-        if !self.enabled || !latitude.is_finite() || !longitude.is_finite() {
+        let (enabled, base, min_interval) = self.live_params()?;
+        if !enabled || !latitude.is_finite() || !longitude.is_finite() {
             return Ok(None);
         }
-        self.wait_turn().await;
-        let mut url = self
-            .base
+        self.wait_turn(min_interval).await;
+        let mut url = base
             .join("reverse")
             .map_err(|_| AppError::message("NOMINATIM_URL is invalid"))?;
         url.query_pairs_mut()
@@ -109,10 +120,27 @@ impl Geocoder {
         Ok(parse_nominatim(&body))
     }
 
-    async fn wait_turn(&self) {
+    fn live_params(&self) -> Result<(bool, Url, Duration), AppError> {
+        if let Some(runtime) = &self.runtime {
+            let snap = runtime.borrow().clone();
+            let base = Url::parse(snap.nominatim_url.trim_end_matches('/'))
+                .map_err(|_| AppError::message("NOMINATIM_URL is invalid"))?;
+            if snap.nominatim_enabled && base.scheme() != "https" {
+                return Err(AppError::message("NOMINATIM_URL must be https"));
+            }
+            return Ok((snap.nominatim_enabled, base, snap.nominatim_min_interval));
+        }
+        Ok((
+            self.fallback_enabled,
+            self.fallback_base.clone(),
+            self.fallback_interval,
+        ))
+    }
+
+    async fn wait_turn(&self, min_interval: Duration) {
         let mut last = self.last.lock().await;
         if let Some(previous) = *last
-            && let Some(wait) = self.min_interval.checked_sub(previous.elapsed())
+            && let Some(wait) = min_interval.checked_sub(previous.elapsed())
         {
             tokio::time::sleep(wait).await;
         }

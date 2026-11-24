@@ -13,6 +13,7 @@ use url::Url;
 use crate::error::{AppError, redact_secrets};
 
 /// Process configuration. Secrets are redacted in [`Debug`].
+#[derive(Clone)]
 pub(crate) struct Config {
     pub database_url: String,
     pub listen_addr: SocketAddr,
@@ -407,12 +408,16 @@ impl Config {
         rows
     }
 
-    fn source_label(&self, key: &str) -> &'static str {
-        if self.explicit_env.contains(key) {
+    pub(crate) fn source_label(&self, key: &str) -> &'static str {
+        if self.env_explicit(key) {
             "env"
         } else {
             "défaut"
         }
+    }
+
+    pub(crate) fn env_explicit(&self, key: &str) -> bool {
+        self.explicit_env.contains(key)
     }
 }
 
