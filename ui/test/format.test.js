@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { NNBSP, dayLabel, duration, makeFormat, number } from "../src/format.js";
+import { NNBSP, dayLabel, duration, makeFormat, number, place } from "../src/format.js";
 import { stringsFor } from "../src/i18n.js";
 
 test("french numbers match the console", () => {
@@ -29,6 +29,40 @@ test("day labels are relative then long", () => {
   assert.equal(dayLabel("2026-11-17T12:00:00Z", "UTC", today, strings, "fr"), "Hier");
   assert.equal(dayLabel("2026-11-16T12:00:00Z", "UTC", today, strings, "fr"), "Lundi 16 novembre");
   assert.equal(dayLabel("2025-02-01T12:00:00Z", "UTC", today, strings, "fr"), "Samedi 1 février 2025");
+});
+
+test("place titles use the street and details keep the house number", () => {
+  const numbered = place("12, rue Example, Localité");
+  assert.equal(numbered.name, "rue Example");
+  assert.equal(numbered.detail, "12 rue Example, Localité");
+
+  const suffixed = place("12 bis, rue Example");
+  assert.equal(suffixed.name, "rue Example");
+  assert.equal(suffixed.detail, "12 bis rue Example");
+
+  const street = place("rue Example, Localité");
+  assert.equal(street.name, "rue Example");
+  assert.equal(street.detail, "Localité");
+
+  const numberOnly = place("12");
+  assert.equal(numberOnly.name, "12");
+  assert.equal(numberOnly.detail, null);
+
+  const locality = place("12, Localité");
+  assert.equal(locality.name, "Localité");
+  assert.equal(locality.detail, "12 Localité");
+
+  const noStreet = place("Localité, Région");
+  assert.equal(noStreet.name, "Localité");
+  assert.equal(noStreet.detail, "Région");
+
+  const named = place("Café Example, 12, rue Example, Localité");
+  assert.equal(named.name, "Café Example");
+  assert.equal(named.detail, "12 rue Example, Localité");
+
+  const fenced = place("12, rue Example, Localité", "Maison");
+  assert.equal(fenced.name, "Maison");
+  assert.equal(fenced.detail, "12 rue Example, Localité");
 });
 
 test("a format hook replaces the built-in distance", () => {

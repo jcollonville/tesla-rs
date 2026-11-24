@@ -250,28 +250,146 @@ pub(crate) struct Place {
     pub detail: Option<String>,
 }
 
+const HOUSE_SUFFIXES: [&str; 3] = ["quater", "bis", "ter"];
+
+fn boundary(rest: &str) -> bool {
+    rest.is_empty() || rest.starts_with([' ', '-', '/'])
+}
+
+fn starts_with_ignore_ascii(text: &str, word: &str) -> bool {
+    let mut chars = text.chars();
+    for expected in word.chars() {
+        match chars.next() {
+            Some(ch) if ch.eq_ignore_ascii_case(&expected) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Bytes of an optional `bis` / `ter` / `quater` or a single letter.
+fn eat_suffix(rest: &str) -> usize {
+    let spaced = usize::from(rest.starts_with(' '));
+    let tail = &rest[spaced..];
+    for word in HOUSE_SUFFIXES {
+        if starts_with_ignore_ascii(tail, word) {
+            let end = spaced + word.len();
+            if boundary(&rest[end..]) {
+                return end;
+            }
+        }
+    }
+    if let Some(ch) = tail.chars().next()
+        && ch.is_ascii_alphabetic()
+        && boundary(&tail[ch.len_utf8()..])
+    {
+        return spaced + ch.len_utf8();
+    }
+    0
+}
+
+/// End index of one house-number token (`12`, `12 bis`, `12a`).
+fn eat_house_token(text: &str) -> Option<usize> {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    Some(digits + eat_suffix(&text[digits..]))
+}
+
+fn is_house_number(part: &str) -> bool {
+    let text = part.trim();
+    let Some(end) = eat_house_token(text) else {
+        return false;
+    };
+    if end == text.len() {
+        return true;
+    }
+    let rest = &text[end..];
+    let Some(sep) = rest.chars().next() else {
+        return true;
+    };
+    if sep != '-' && sep != '/' {
+        return false;
+    }
+    let mut after = sep.len_utf8();
+    if rest[after..].starts_with(' ') {
+        after += 1;
+    }
+    matches!(eat_house_token(&rest[after..]), Some(len) if after + len == rest.len())
+}
+
+fn address_parts(address: &str) -> Vec<&str> {
+    address
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+/// `12, rue Example` becomes `12 rue Example`. A bare number stays its own segment.
+fn join_house_numbers(parts: &[&str]) -> Vec<String> {
+    let mut joined = Vec::new();
+    let mut index = 0;
+    while index < parts.len() {
+        if let Some(next) = parts.get(index + 1)
+            && is_house_number(parts[index])
+            && !is_house_number(next)
+        {
+            joined.push(format!("{} {next}", parts[index]));
+            index += 2;
+        } else {
+            joined.push(parts[index].to_owned());
+            index += 1;
+        }
+    }
+    joined
+}
+
+fn format_address(address: &str) -> String {
+    join_house_numbers(&address_parts(address)).join(", ")
+}
+
+/// Title skips a leading house number. The detail keeps that number on the street.
+fn label_address(address: &str) -> Option<Place> {
+    let parts = address_parts(address);
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = join_house_numbers(&parts);
+    let leading_number =
+        is_house_number(parts[0]) && parts.get(1).is_some_and(|next| !is_house_number(next));
+    let name = if leading_number {
+        parts[1].to_owned()
+    } else {
+        joined[0].clone()
+    };
+    let detail = if joined[0] == name {
+        let tail = joined[1..].join(", ");
+        (!tail.is_empty()).then_some(tail)
+    } else {
+        Some(joined.join(", "))
+    };
+    Some(Place { name, detail })
+}
+
 impl Place {
-    /// Geofence names win; otherwise the first address segment is the name.
+    /// Geofence names win. Otherwise the title is the street: a leading house
+    /// number (`12, rue Example`) is not used alone. With no street, the next
+    /// segment (place name, locality) stays the title.
     pub(crate) fn from(address: Option<&str>, geofence: Option<&str>) -> Option<Self> {
         let address = address.map(str::trim).filter(|text| !text.is_empty());
         let geofence = geofence.map(str::trim).filter(|text| !text.is_empty());
         match (geofence, address) {
             (Some(fence), Some(address)) if fence != address => Some(Self {
                 name: fence.to_owned(),
-                detail: Some(address.to_owned()),
+                detail: Some(format_address(address)),
             }),
             (Some(fence), _) => Some(Self {
                 name: fence.to_owned(),
                 detail: None,
             }),
-            (None, Some(address)) => {
-                let (head, tail) = address.split_once(',').unwrap_or((address, ""));
-                let tail = tail.trim();
-                Some(Self {
-                    name: head.trim().to_owned(),
-                    detail: (!tail.is_empty()).then(|| tail.to_owned()),
-                })
-            }
+            (None, Some(address)) => label_address(address),
             (None, None) => None,
         }
     }
@@ -328,6 +446,40 @@ mod tests {
             format!("il y a 4{NNBSP}min")
         );
         assert_eq!(ago(None, now), "jamais");
+    }
+
+    #[test]
+    fn place_titles_use_the_street_not_a_bare_house_number() {
+        let numbered = Place::from(Some("12, rue Example, Localité"), None).unwrap();
+        assert_eq!(numbered.name, "rue Example");
+        assert_eq!(numbered.detail.as_deref(), Some("12 rue Example, Localité"));
+        let suffixed = Place::from(Some("12 bis, rue Example"), None).unwrap();
+        assert_eq!(suffixed.name, "rue Example");
+        assert_eq!(suffixed.detail.as_deref(), Some("12 bis rue Example"));
+
+        let street = Place::from(Some("rue Example, Localité"), None).unwrap();
+        assert_eq!(street.name, "rue Example");
+        assert_eq!(street.detail.as_deref(), Some("Localité"));
+
+        let number_only = Place::from(Some("12"), None).unwrap();
+        assert_eq!(number_only.name, "12");
+        assert_eq!(number_only.detail, None);
+
+        let locality = Place::from(Some("12, Localité"), None).unwrap();
+        assert_eq!(locality.name, "Localité");
+        assert_eq!(locality.detail.as_deref(), Some("12 Localité"));
+
+        let no_street = Place::from(Some("Localité, Région"), None).unwrap();
+        assert_eq!(no_street.name, "Localité");
+        assert_eq!(no_street.detail.as_deref(), Some("Région"));
+
+        let named = Place::from(Some("Café Example, 12, rue Example, Localité"), None).unwrap();
+        assert_eq!(named.name, "Café Example");
+        assert_eq!(named.detail.as_deref(), Some("12 rue Example, Localité"));
+
+        let fenced = Place::from(Some("12, rue Example, Localité"), Some("Maison")).unwrap();
+        assert_eq!(fenced.name, "Maison");
+        assert_eq!(fenced.detail.as_deref(), Some("12 rue Example, Localité"));
     }
 
     #[test]

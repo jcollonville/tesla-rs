@@ -114,6 +114,29 @@ test("drive row shows the geofence and keeps the address as the title", () => {
   assert.equal(el.shadowRoot.querySelector("svg.car"), null);
 });
 
+test("drive row titles use the street and the tooltip keeps the house number", () => {
+  const el = mount("tl-drive-row", {
+    attrs: { href: "/drives/2", locale: "fr", "time-zone": "UTC", now: "2026-11-18T12:00:00Z" },
+    data: {
+      id: 2,
+      start_at: "2024-07-02T08:00:00Z",
+      end_at: "2024-07-02T08:10:00Z",
+      distance_km: 3,
+      duration_s: 600,
+      start_address: "12, rue Example, Localité",
+      end_address: "rue Example, Localité",
+    },
+  });
+  const start = el.shadowRoot.querySelector(".route-stop.start");
+  const end = el.shadowRoot.querySelector(".route-stop.end");
+  assert.equal(start.textContent, "rue Example");
+  assert.equal(start.getAttribute("title"), "12 rue Example, Localité");
+  assert.equal(end.textContent, "rue Example");
+  assert.equal(end.getAttribute("title"), "Localité");
+  assert.match(el.shadowRoot.querySelector(".trip").getAttribute("aria-label"), /rue Example/);
+  assert.equal(el.shadowRoot.querySelector(".trip").getAttribute("aria-label").includes("12,"), false);
+});
+
 test("charge row shows energy, power and cost", () => {
   const el = mount("tl-charge-row", {
     attrs: { href: "/charges/2", locale: "fr", "time-zone": "UTC" },
