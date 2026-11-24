@@ -285,6 +285,7 @@ pub(crate) async fn recompute_drive(
     drive_id: i64,
 ) -> Result<bool, AppError> {
     let before = drive_json(pool, drive_id).await?;
+    let _ = crate::persist::detach_drive_park_tail(pool, drive_id).await?;
     let samples = load_samples(pool, drive_id).await?;
     if !keep_closed_drive(&samples) {
         let mut tx = pool.begin().await?;

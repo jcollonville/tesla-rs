@@ -13,8 +13,8 @@ use crate::geofence::{Fence, haversine_m, matching_geofence};
 use crate::state::{
     Activity, ClosePlan, ClosedDrive, DriveClock, DriveGrace, DriveMotion, DriveSummary, GapFacts,
     Observation, PositionCue, Presence, Sample, Tracker, Transition, clock_from_tail,
-    gate_stream_sample, keep_closed_drive, merge_clock, observation_motion, plan_drive_close,
-    should_reopen_drive, soc_level, summarize_charge, summarize_drive,
+    drive_end_cutoff, gate_stream_sample, keep_closed_drive, merge_clock, observation_motion,
+    plan_drive_close, should_reopen_drive, soc_level, summarize_charge, summarize_drive,
 };
 
 /// Identity fields learned from a vehicle list response.
@@ -1576,6 +1576,10 @@ struct PairRow {
 /// below 0.01 km, is deleted in this transaction. Its positions stay, with
 /// `drive_id` set to NULL before the delete. Callers must not read the row
 /// when this returns [`None`].
+///
+/// Positions after [`drive_end_cutoff`] (the park / standstill wait used by the
+/// close grace) are detached before the summary so charts and `end_at` stop at
+/// arrival.
 async fn close_drive(
     tx: &mut Transaction<'_, Postgres>,
     vehicle_id: i64,
@@ -1584,6 +1588,7 @@ async fn close_drive(
     efficiency: Option<f64>,
     geofence_id: Option<i64>,
 ) -> Result<Option<ClosedDrive>, AppError> {
+    detach_drive_park_tail_tx(tx, drive_id).await?;
     let rows = sqlx::query_as::<_, PositionSample>(
         "SELECT recorded_at, latitude, longitude, speed_kmh, power_kw, odometer_km, elevation_m,
                 battery_level, rated_range_km, ideal_range_km, inside_temp_c, outside_temp_c
@@ -1621,6 +1626,7 @@ async fn refresh_closed_drive(
     drive_id: i64,
     efficiency: Option<f64>,
 ) -> Result<Option<ClosedDrive>, AppError> {
+    detach_drive_park_tail_tx(tx, drive_id).await?;
     let rows = sqlx::query_as::<_, PositionSample>(
         "SELECT recorded_at, latitude, longitude, speed_kmh, power_kw, odometer_km, elevation_m,
                 battery_level, rated_range_km, ideal_range_km, inside_temp_c, outside_temp_c
@@ -1643,6 +1649,97 @@ async fn refresh_closed_drive(
         start_at: summary.start,
         end_at: summary.end,
     }))
+}
+
+/// Detaches positions after the logical trip end (grace wait after park/stop).
+pub(crate) async fn detach_drive_park_tail(pool: &PgPool, drive_id: i64) -> Result<u64, AppError> {
+    let mut tx = pool.begin().await?;
+    let detached = detach_drive_park_tail_tx(&mut tx, drive_id).await?;
+    tx.commit().await?;
+    Ok(detached)
+}
+
+async fn detach_drive_park_tail_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    drive_id: i64,
+) -> Result<u64, AppError> {
+    let rows: Vec<ClockCue> = sqlx::query_as(
+        "SELECT d.start_at, p.recorded_at, p.speed_kmh, p.shift_state
+         FROM drives d
+         LEFT JOIN LATERAL (
+             SELECT recorded_at, speed_kmh, shift_state
+             FROM positions
+             WHERE drive_id = d.id
+             ORDER BY recorded_at DESC, id DESC
+             LIMIT 400
+         ) p ON TRUE
+         WHERE d.id = $1",
+    )
+    .bind(drive_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let Some(first) = rows.first() else {
+        return Ok(0);
+    };
+    let cues: Vec<PositionCue> = rows
+        .iter()
+        .filter_map(|row| {
+            row.recorded_at.map(|at| PositionCue {
+                at,
+                speed_kmh: row.speed_kmh,
+                shift_state: row.shift_state.clone(),
+            })
+        })
+        .collect();
+    if cues.is_empty() {
+        return Ok(0);
+    }
+    let cutoff = drive_end_cutoff(&cues, first.start_at);
+    let result = sqlx::query(
+        "UPDATE positions SET drive_id = NULL
+         WHERE drive_id = $1 AND recorded_at > $2",
+    )
+    .bind(drive_id)
+    .bind(cutoff)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Trims grace-wait tails on closed drives recorded since the drive-grace change.
+///
+/// Idempotent: drives that already end at the park/stop cutoff are left alone.
+pub(crate) async fn repair_drive_park_tails(pool: &PgPool) -> Result<u64, AppError> {
+    let ids: Vec<(i64, Option<DateTime<Utc>>, Option<f64>)> = sqlx::query_as(
+        "SELECT d.id, d.end_at, v.efficiency_kwh_per_km
+         FROM drives d
+         JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE d.end_at IS NOT NULL
+           AND d.deleted_at IS NULL
+           AND d.end_at >= TIMESTAMPTZ '2026-11-19 00:00:00+00'
+         ORDER BY d.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut fixed = 0_u64;
+    for (drive_id, previous_end, efficiency) in ids {
+        let mut tx = pool.begin().await?;
+        let Some(closed) = refresh_closed_drive(&mut tx, drive_id, efficiency).await? else {
+            tx.rollback().await?;
+            continue;
+        };
+        if previous_end.is_some_and(|end| end > closed.end_at) {
+            fixed += 1;
+            tracing::info!(
+                drive_id,
+                from = %previous_end.unwrap(),
+                to = %closed.end_at,
+                "trimmed drive park-grace tail"
+            );
+        }
+        tx.commit().await?;
+    }
+    Ok(fixed)
 }
 
 fn remember_closed(slot: &mut Option<ClosedDrive>, closed: ClosedDrive) {
