@@ -68,6 +68,13 @@ docker compose -f server/docker-compose.yml run --rm tesla-logger \
 
 Positions are copied in pages of 5000 rows. Each page orders by `positions.id` and compares the cursor as `integer`, so Postgres uses the primary key. The page commits a cursor, so stopping and rerunning resumes, including a cursor saved by an older build. Only one page is kept in memory. The log line `teslamate import progress` reports rows/s and percent complete about every 5 seconds. Charge samples are multi-row inserts too, so a few hundred thousand of them stay in the same order of time as the drives (a few thousand), not the positions.
 
+`repair-drive-ends` recomputes `end_at` for closed drives whose attached tail still contains an exact 0 km/h sample. The end becomes that newest 0 km/h sample, and attached positions strictly after it are detached. A tail with no 0 km/h sample, or a 0 km/h sample followed by movement, is left unchanged. Rows with a null `drive_id` are never attached. The command is not part of startup. The default is a dry-run that prints `mode`, `closed`, `changed`, `unchanged`, and `drive_id` lines only. `--apply` writes, one transaction per drive. Running it again after a successful apply reports `changed=0`.
+
+```bash
+docker compose -f server/docker-compose.yml run --rm tesla-logger repair-drive-ends
+docker compose -f server/docker-compose.yml run --rm tesla-logger repair-drive-ends --apply
+```
+
 Images are published to `ghcr.io/jcollonville/tesla-logger` on `main` and on version tags. The workflow builds the runner architecture (amd64). The Dockerfile itself is not architecture-specific.
 
 ## API

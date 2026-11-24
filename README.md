@@ -387,6 +387,13 @@ The image build is `server/Dockerfile` (Rust 1.99.1, then a Debian slim runtime)
 
 Import from an existing TeslaMate database (read-only role) is documented in `server/README.md`. `import-tesla-mate` is an alias of `import-teslamate`.
 
+Recompute stored ends of closed drives that still have a trailing exact 0 km/h sample. The command is not run by `serve`. Without `--apply` it only prints counts and drive ids (no coordinates, VIN, or secrets). A drive whose tail has no 0 km/h sample is left unchanged. Positions that already have a null `drive_id` are not attached again. Each drive is one transaction, and a second `--apply` changes nothing.
+
+```bash
+cargo run -p tesla-logger -- repair-drive-ends
+cargo run -p tesla-logger -- repair-drive-ends --apply
+```
+
 ### Check the setup
 
 These checks assume the listener is on port 4000, as in the example file and Compose.

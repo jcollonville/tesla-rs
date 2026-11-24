@@ -814,6 +814,42 @@ pub(crate) fn drive_end_cutoff(cues: &[PositionCue], drive_start: DateTime<Utc>)
     newest.at
 }
 
+/// New `end_at` for one closed drive, or `None` when the row must stay as stored.
+///
+/// `cues` are newest first and include only positions still attached to the drive.
+/// A trailing exact 0 km/h sample sets the end to that instant. No such sample,
+/// or a 0 km/h sample followed by movement, leaves the drive unchanged. An end
+/// that already matches that instant, with nothing attached after it, is unchanged.
+pub(crate) fn plan_drive_end_repair(
+    cues: &[PositionCue],
+    drive_start: DateTime<Utc>,
+    end_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if !tail_has_exact_zero(cues) {
+        return None;
+    }
+    let cutoff = drive_end_cutoff(cues, drive_start);
+    let attached_after = cues.iter().any(|cue| cue.at > cutoff);
+    if end_at == cutoff && !attached_after {
+        None
+    } else {
+        Some(cutoff)
+    }
+}
+
+/// Exact 0 km/h before any later movement. Missing speed does not count.
+fn tail_has_exact_zero(cues: &[PositionCue]) -> bool {
+    for cue in cues {
+        if speed_is_exact_zero(cue.speed_kmh) {
+            return true;
+        }
+        if position_is_later_movement(cue) {
+            return false;
+        }
+    }
+    false
+}
+
 /// Prefers in-memory evidence when it is newer than the rows already stored.
 ///
 /// A hybrid poll can prove the car is still driving without writing a position.
@@ -1908,6 +1944,53 @@ mod tests {
         let last = cue(at(4), Some(0.0), Some("P"));
         let cues = vec![last.clone(), middle, first, moving];
         assert_eq!(super::drive_end_cutoff(&cues, start), last.at);
+    }
+
+    #[test]
+    fn plan_drive_end_repair_moves_the_end_to_the_last_trailing_zero() {
+        let start = at(0);
+        let moving = cue(at(1), Some(40.0), Some("D"));
+        let zero = cue(at(2), Some(0.0), Some("P"));
+        let after = cue(at(3), None, None);
+        let cues = vec![after.clone(), zero.clone(), moving];
+        assert_eq!(
+            super::plan_drive_end_repair(&cues, start, after.at),
+            Some(zero.at)
+        );
+    }
+
+    #[test]
+    fn plan_drive_end_repair_leaves_a_tail_without_zero_speed() {
+        let start = at(0);
+        let moving = cue(at(1), Some(40.0), Some("D"));
+        let newest = cue(at(2), Some(30.0), Some("D"));
+        let cues = vec![newest.clone(), moving];
+        assert_eq!(super::plan_drive_end_repair(&cues, start, newest.at), None);
+    }
+
+    #[test]
+    fn plan_drive_end_repair_does_not_cut_a_zero_followed_by_movement() {
+        let start = at(0);
+        let moving = cue(at(1), Some(40.0), Some("D"));
+        let zero = cue(at(2), Some(0.0), Some("P"));
+        let again = cue(at(3), Some(35.0), Some("D"));
+        let cues = vec![again.clone(), zero, moving];
+        assert_eq!(super::plan_drive_end_repair(&cues, start, again.at), None);
+    }
+
+    #[test]
+    fn plan_drive_end_repair_uses_the_newest_of_several_trailing_zeros() {
+        let start = at(0);
+        let moving = cue(at(1), Some(40.0), Some("D"));
+        let first = cue(at(2), Some(0.0), Some("P"));
+        let middle = cue(at(3), Some(0.0), None);
+        let last = cue(at(4), Some(0.0), Some("P"));
+        let cues = vec![last.clone(), middle, first.clone(), moving];
+        assert_eq!(
+            super::plan_drive_end_repair(&cues, start, first.at),
+            Some(last.at)
+        );
+        assert_eq!(super::plan_drive_end_repair(&cues, start, last.at), None);
     }
 
     #[test]
