@@ -61,8 +61,8 @@ pub(crate) struct Config {
     /// How long a drive stays open after the last driving evidence when the link drops.
     /// Closure detection only. It does not move `end_at`.
     pub drive_end_grace: Duration,
-    /// How long a confirmed park (shift P, speed about 0) stays open before close.
-    /// Closure detection only. It does not move `end_at`.
+    /// How long speed must stay at exact 0 km/h before a drive closes.
+    /// Closure only. The stored end is the first 0 km/h sample of that run.
     pub drive_park_grace: Duration,
     /// `local` (default), `oidc`, or `proxy`. Proxy requires an IP allowlist.
     pub auth_mode: String,
@@ -303,7 +303,7 @@ impl Config {
             self.drive_end_grace.as_secs().to_string(),
         );
         push(
-            "Délai stationnement (s)",
+            "Délai à 0 km/h (s)",
             "DRIVE_PARK_GRACE_SECS",
             self.drive_park_grace.as_secs().to_string(),
         );
@@ -753,7 +753,7 @@ mod tests {
             std::time::Duration::from_secs(300)
         );
         assert_eq!(config.drive_end_grace, std::time::Duration::from_secs(300));
-        assert_eq!(config.drive_park_grace, std::time::Duration::from_secs(90));
+        assert_eq!(config.drive_park_grace, std::time::Duration::from_secs(300));
         assert_eq!(
             config.drive_fallback_poll,
             std::time::Duration::from_secs(120)

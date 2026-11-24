@@ -859,7 +859,7 @@ async fn polling_sequence_opens_and_closes_one_drive() {
         .await
         .unwrap();
     let mut parked_long_enough = Observation::at(
-        Utc.with_ymd_and_hms(2024, 6, 1, 12, 27, 0).unwrap(),
+        Utc.with_ymd_and_hms(2024, 6, 1, 12, 30, 0).unwrap(),
         Presence::Asleep,
     );
     parked_long_enough.shift_state = Some("P".to_owned());
@@ -1030,7 +1030,7 @@ async fn stream_points_follow_one_drive_and_yield_to_a_poll() {
         vin,
         identity(),
         &crate::persist::StreamFix {
-            at: base + chrono::Duration::seconds(20 + 91),
+            at: base + chrono::Duration::seconds(20 + 300),
             shift_state: Some("P".to_owned()),
             speed_kmh: Some(0.0),
             power_kw: Some(0.0),
@@ -1176,7 +1176,7 @@ async fn short_drives_are_deleted_for_poll_and_stream() {
         &archive,
         poll_vin,
         car(poll_vin),
-        Observation::at(base + chrono::Duration::minutes(22), Presence::Asleep),
+        Observation::at(base + chrono::Duration::minutes(25), Presence::Asleep),
         false,
         false,
     )
@@ -1220,7 +1220,7 @@ async fn short_drives_are_deleted_for_poll_and_stream() {
         &archive,
         poll_vin,
         car(poll_vin),
-        Observation::at(base + chrono::Duration::minutes(42), Presence::Asleep),
+        Observation::at(base + chrono::Duration::minutes(45), Presence::Asleep),
         false,
         false,
     )
@@ -1252,7 +1252,7 @@ async fn short_drives_are_deleted_for_poll_and_stream() {
         &archive,
         poll_vin,
         car(poll_vin),
-        Observation::at(base + chrono::Duration::minutes(62), Presence::Asleep),
+        Observation::at(base + chrono::Duration::minutes(65), Presence::Asleep),
         false,
         false,
     )
@@ -1296,7 +1296,7 @@ async fn short_drives_are_deleted_for_poll_and_stream() {
         &archive,
         poll_vin,
         car(poll_vin),
-        Observation::at(base + chrono::Duration::minutes(82), Presence::Asleep),
+        Observation::at(base + chrono::Duration::minutes(85), Presence::Asleep),
         false,
         false,
     )
@@ -1365,6 +1365,26 @@ async fn short_drives_are_deleted_for_poll_and_stream() {
     .await
     .unwrap();
     assert_eq!(closed_drives(&db.pool, stream_vin).await.0, 0);
+    assert_eq!(
+        open_drive_count(&db.pool, stream_vin).await,
+        1,
+        "five minutes at 0 km/h have not elapsed"
+    );
+    apply_stream_for_vin(
+        &archive,
+        stream_vin,
+        car(stream_vin),
+        &stream_fix(
+            t0 + chrono::Duration::seconds(305),
+            Some("P"),
+            Some(10.0),
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed_drives(&db.pool, stream_vin).await.0, 0);
     assert!(detached_positions(&db.pool, stream_vin).await >= 1);
 
     apply_stream_for_vin(
@@ -1400,7 +1420,7 @@ async fn short_drives_are_deleted_for_poll_and_stream() {
         stream_vin,
         car(stream_vin),
         &stream_fix(
-            t0 + chrono::Duration::seconds(510),
+            t0 + chrono::Duration::seconds(710),
             Some("P"),
             Some(20.0),
             Some(49.2),
@@ -1444,7 +1464,7 @@ async fn short_drives_are_deleted_for_poll_and_stream() {
         stream_vin,
         car(stream_vin),
         &stream_fix(
-            t0 + chrono::Duration::seconds(910),
+            t0 + chrono::Duration::seconds(1_110),
             Some("P"),
             Some(30.009),
             Some(48.21),
@@ -1488,7 +1508,7 @@ async fn short_drives_are_deleted_for_poll_and_stream() {
         stream_vin,
         car(stream_vin),
         &stream_fix(
-            t0 + chrono::Duration::seconds(1_310),
+            t0 + chrono::Duration::seconds(1_510),
             Some("P"),
             Some(40.01),
             Some(48.31),
@@ -1817,7 +1837,7 @@ async fn late_stream_samples_do_not_open_a_second_drive() {
         &archive,
         vin,
         car(vin),
-        Observation::at(base + chrono::Duration::minutes(12), Presence::Asleep),
+        Observation::at(base + chrono::Duration::minutes(15), Presence::Asleep),
         false,
         false,
     )
@@ -2008,7 +2028,7 @@ async fn parked_stop_stays_two_drives() {
         vin,
         car(vin),
         shifted(
-            base + chrono::Duration::seconds(61 + 204),
+            base + chrono::Duration::seconds(61 + 300),
             "P",
             Some(11.0),
             10.01,
@@ -2023,7 +2043,6 @@ async fn parked_stop_stays_two_drives() {
     assert_eq!(closed, 0, "park grace elapsed");
     assert_eq!(closed_drives(&db.pool, vin).await.0, 1);
     let park_at = base + chrono::Duration::seconds(61);
-    let last_zero = base + chrono::Duration::seconds(61 + 204);
     let end: (chrono::DateTime<Utc>,) = sqlx::query_as(
         "SELECT d.end_at FROM drives d
          JOIN vehicles v ON v.id = d.vehicle_id
@@ -2034,8 +2053,8 @@ async fn parked_stop_stays_two_drives() {
     .await
     .unwrap();
     assert_eq!(
-        end.0, last_zero,
-        "closed drive ends at the last 0 km/h sample, not the first park"
+        end.0, park_at,
+        "closed drive ends at the first 0 km/h sample of the final run"
     );
     let kept: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM positions p
@@ -2048,28 +2067,27 @@ async fn parked_stop_stays_two_drives() {
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(kept.0, 1, "the earlier 0 km/h sample stays on the drive");
-    let attached: (i64,) = sqlx::query_as(
+    assert_eq!(kept.0, 1, "the first 0 km/h sample stays on the drive");
+    let detached: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM positions p
-         JOIN drives d ON d.id = p.drive_id
-         JOIN vehicles v ON v.id = d.vehicle_id
-         WHERE v.vin = $1 AND p.recorded_at > $2",
+         JOIN vehicles v ON v.id = p.vehicle_id
+         WHERE v.vin = $1 AND p.recorded_at > $2 AND p.drive_id IS NULL",
     )
     .bind(vin)
-    .bind(last_zero)
+    .bind(park_at)
     .fetch_one(&db.pool)
     .await
     .unwrap();
     assert_eq!(
-        attached.0, 0,
-        "nothing after the last 0 km/h sample stays attached"
+        detached.0, 1,
+        "later zero-run samples are detached, not deleted"
     );
     apply_for_vin(
         &archive,
         vin,
         car(vin),
         shifted(
-            base + chrono::Duration::seconds(61 + 210),
+            base + chrono::Duration::seconds(61 + 310),
             "D",
             Some(11.0),
             10.01,
@@ -3515,7 +3533,7 @@ async fn repair_drive_ends_is_a_dry_run_until_apply_and_stays_idempotent() {
     assert_eq!(
         drive_end(&db.pool, trim).await,
         base + chrono::Duration::minutes(1),
-        "end moves to the last exact 0 km/h sample"
+        "end moves to the first exact 0 km/h sample"
     );
     assert_eq!(
         attached_at(&db.pool, trim, base + chrono::Duration::minutes(2)).await,
@@ -3527,7 +3545,7 @@ async fn repair_drive_ends_is_a_dry_run_until_apply_and_stays_idempotent() {
     );
     assert_eq!(
         drive_end(&db.pool, zeros).await,
-        zeros_at + chrono::Duration::minutes(3)
+        zeros_at + chrono::Duration::minutes(1)
     );
     assert_eq!(
         attached_at(&db.pool, zeros, zeros_at + chrono::Duration::minutes(1)).await,
@@ -3535,7 +3553,7 @@ async fn repair_drive_ends_is_a_dry_run_until_apply_and_stays_idempotent() {
     );
     assert_eq!(
         attached_at(&db.pool, zeros, zeros_at + chrono::Duration::minutes(3)).await,
-        1
+        0
     );
     assert_eq!(
         drive_end(&db.pool, no_zero).await,

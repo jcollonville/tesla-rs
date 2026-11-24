@@ -145,7 +145,7 @@ pub(crate) const REGISTRY: &[SettingSpec] = &[
     SettingSpec {
         key: "DRIVE_PARK_GRACE_SECS",
         group: SettingGroup::Polling,
-        label: "Délai stationnement",
+        label: "Délai à 0 km/h",
         kind: ValueKind::U64 {
             min: crate::state::DRIVE_PARK_GRACE_MIN_SECS,
             max: crate::state::DRIVE_PARK_GRACE_MAX_SECS,

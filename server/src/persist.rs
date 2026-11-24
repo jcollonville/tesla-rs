@@ -568,7 +568,7 @@ pub(crate) async fn apply_observation(
                 },
             },
         };
-        match plan_drive_close(motion, obs.at, clock, grace) {
+        match plan_drive_close(motion, obs.at, clock, grace, obs.speed_kmh) {
             ClosePlan::Continue { clock } | ClosePlan::Wait { clock, .. } => {
                 runtime.drive_clock = Some(clock);
             }
@@ -802,7 +802,7 @@ pub(crate) async fn apply_stream_samples(
                 last_driving_at: obs.at,
                 park_since: None,
             });
-            match plan_drive_close(decision.motion, obs.at, clock, grace) {
+            match plan_drive_close(decision.motion, obs.at, clock, grace, obs.speed_kmh) {
                 ClosePlan::Continue { clock } | ClosePlan::Wait { clock, .. } => {
                     drive_clock = Some(clock);
                     if matches!(decision.motion, DriveMotion::Driving | DriveMotion::Hold) {
@@ -1370,7 +1370,7 @@ pub(crate) async fn close_drive_if_due(
     } else {
         DriveMotion::Gap
     };
-    let plan = plan_drive_close(motion, now, clock, grace);
+    let plan = plan_drive_close(motion, now, clock, grace, None);
     let ClosePlan::Close { .. } = plan else {
         runtime.drive_clock = Some(clock);
         tx.commit().await?;
@@ -1739,7 +1739,7 @@ pub(crate) fn format_drive_end_repair(report: &DriveEndRepairReport) -> String {
     text
 }
 
-/// Recomputes `end_at` for closed drives that still have a trailing 0 km/h sample.
+/// Recomputes `end_at` to the first exact 0 km/h sample of the final zero run.
 ///
 /// One transaction per drive. Dry-run (`apply` false) is read-only and writes nothing.
 /// Positions with a null `drive_id` are never attached. A second apply is a no-op.
