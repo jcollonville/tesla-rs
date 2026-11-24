@@ -129,18 +129,95 @@ export function ago(iso, nowIso, strings, sep = NNBSP) {
   return `${strings.agoPrefix} ${Math.trunc(hours / 24)}${sep}${strings.day}`;
 }
 
-export function place(address, geofence) {
-  const street = String(address || "").trim();
-  const fence = String(geofence || "").trim();
-  if (fence && street && fence !== street) return { name: fence, detail: street };
-  if (fence) return { name: fence, detail: null };
-  if (street) {
-    const split = street.indexOf(",");
-    if (split < 0) return { name: street, detail: null };
-    const head = street.slice(0, split).trim();
-    const tail = street.slice(split + 1).trim();
-    return { name: head, detail: tail || null };
+const HOUSE_SUFFIXES = ["quater", "bis", "ter"];
+
+function isDigit(ch) {
+  return ch >= "0" && ch <= "9";
+}
+
+function isLetter(ch) {
+  return (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z");
+}
+
+function boundary(text, index) {
+  const next = text[index];
+  return next == null || next === " " || next === "-" || next === "/";
+}
+
+// End index of one house-number token (`12`, `12 bis`, `12a`), or -1.
+function eatHouseToken(text, start) {
+  let index = start;
+  if (index >= text.length || !isDigit(text[index])) return -1;
+  while (index < text.length && isDigit(text[index])) index += 1;
+  const spaced = text[index] === " " ? index + 1 : index;
+  const tail = text.slice(spaced).toLowerCase();
+  for (const word of HOUSE_SUFFIXES) {
+    if (!tail.startsWith(word)) continue;
+    const end = spaced + word.length;
+    if (boundary(text, end)) return end;
   }
+  if (spaced < text.length && isLetter(text[spaced]) && boundary(text, spaced + 1)) {
+    return spaced + 1;
+  }
+  return index;
+}
+
+function isHouseNumber(part) {
+  const text = part.trim();
+  if (!text) return false;
+  let end = eatHouseToken(text, 0);
+  if (end < 0) return false;
+  if (end === text.length) return true;
+  if (text[end] !== "-" && text[end] !== "/") return false;
+  end += 1;
+  if (text[end] === " ") end += 1;
+  return eatHouseToken(text, end) === text.length;
+}
+
+function addressParts(address) {
+  return String(address || "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+// `12, rue Example` becomes `12 rue Example`. A bare number stays its own segment.
+function joinHouseNumbers(parts) {
+  const joined = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const next = parts[index + 1];
+    if (next && isHouseNumber(parts[index]) && !isHouseNumber(next)) {
+      joined.push(`${parts[index]} ${next}`);
+      index += 1;
+    } else {
+      joined.push(parts[index]);
+    }
+  }
+  return joined;
+}
+
+function formatAddress(address) {
+  return joinHouseNumbers(addressParts(address)).join(", ");
+}
+
+// Title skips a leading house number. The detail keeps that number on the street.
+function labelAddress(address) {
+  const parts = addressParts(address);
+  if (!parts.length) return null;
+  const joined = joinHouseNumbers(parts);
+  const leadingNumber = isHouseNumber(parts[0]) && parts[1] && !isHouseNumber(parts[1]);
+  const name = leadingNumber ? parts[1] : joined[0];
+  const detailParts = joined[0] === name ? joined.slice(1) : joined;
+  const detail = detailParts.join(", ");
+  return { name, detail: detail || null };
+}
+
+export function place(address, geofence) {
+  const raw = String(address || "").trim();
+  const fence = String(geofence || "").trim();
+  if (fence && raw && fence !== raw) return { name: fence, detail: formatAddress(raw) };
+  if (fence) return { name: fence, detail: null };
+  if (raw) return labelAddress(raw);
   return null;
 }
 
