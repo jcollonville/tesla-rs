@@ -14,7 +14,8 @@ use crate::state::{
     Activity, ClosePlan, ClosedDrive, DriveClock, DriveGrace, DriveMotion, DriveSummary, GapFacts,
     Observation, PositionCue, Presence, Sample, Tracker, Transition, clock_from_tail,
     drive_end_cutoff, gate_stream_sample, keep_closed_drive, merge_clock, observation_motion,
-    plan_drive_close, should_reopen_drive, soc_level, summarize_charge, summarize_drive,
+    plan_drive_close, plan_drive_end_repair, should_reopen_drive, soc_level, summarize_charge,
+    summarize_drive,
 };
 
 /// Identity fields learned from a vehicle list response.
@@ -1706,6 +1707,173 @@ async fn detach_drive_park_tail_tx(
     Ok(result.rows_affected())
 }
 
+/// What [`repair_drive_ends`] would change, or did change.
+///
+/// `changed` holds drive ids only. The report has no coordinates, VIN, or secrets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DriveEndRepairReport {
+    /// `true` when `--apply` wrote rows.
+    pub applied: bool,
+    /// Closed drives that were examined. Open and deleted drives are not included.
+    pub closed: u64,
+    /// Examined drives whose end stayed as stored.
+    pub unchanged: u64,
+    /// Drive ids whose end would move, or did move, to the last trailing 0 km/h sample.
+    pub changed: Vec<i64>,
+}
+
+/// Text for stdout. Counts and drive ids only.
+pub(crate) fn format_drive_end_repair(report: &DriveEndRepairReport) -> String {
+    use std::fmt::Write;
+
+    let mode = if report.applied { "apply" } else { "dry-run" };
+    let mut text = format!(
+        "mode={mode}\nclosed={}\nchanged={}\nunchanged={}\n",
+        report.closed,
+        report.changed.len(),
+        report.unchanged
+    );
+    for id in &report.changed {
+        let _ = writeln!(text, "drive_id={id}");
+    }
+    text
+}
+
+/// Recomputes `end_at` for closed drives that still have a trailing 0 km/h sample.
+///
+/// One transaction per drive. Dry-run (`apply` false) is read-only and writes nothing.
+/// Positions with a null `drive_id` are never attached. A second apply is a no-op.
+/// This is not called at startup.
+pub(crate) async fn repair_drive_ends(
+    pool: &PgPool,
+    apply: bool,
+) -> Result<DriveEndRepairReport, AppError> {
+    let ids: Vec<(i64,)> = sqlx::query_as(
+        "SELECT id FROM drives
+         WHERE end_at IS NOT NULL AND deleted_at IS NULL
+         ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut changed = Vec::new();
+    let mut unchanged = 0_u64;
+    for (drive_id,) in ids {
+        let mut tx = pool.begin().await?;
+        if !apply {
+            sqlx::query("SET TRANSACTION READ ONLY")
+                .execute(&mut *tx)
+                .await?;
+        }
+        let Some((end_at, efficiency)) = lock_closed_drive(&mut tx, drive_id, apply).await? else {
+            tx.rollback().await?;
+            unchanged += 1;
+            continue;
+        };
+        let Some((start_at, cues)) = attached_tail(&mut tx, drive_id).await? else {
+            tx.rollback().await?;
+            unchanged += 1;
+            continue;
+        };
+        if plan_drive_end_repair(&cues, start_at, end_at).is_none() {
+            tx.rollback().await?;
+            unchanged += 1;
+            continue;
+        }
+        if !apply {
+            tx.rollback().await?;
+            changed.push(drive_id);
+            continue;
+        }
+        let Some(_closed) = refresh_closed_drive(&mut tx, drive_id, efficiency).await? else {
+            tx.rollback().await?;
+            unchanged += 1;
+            continue;
+        };
+        tx.commit().await?;
+        changed.push(drive_id);
+    }
+    let closed = u64::try_from(changed.len()).unwrap_or(u64::MAX) + unchanged;
+    Ok(DriveEndRepairReport {
+        applied: apply,
+        closed,
+        unchanged,
+        changed,
+    })
+}
+
+/// Connects and runs [`repair_drive_ends`]. The URL is not logged.
+pub(crate) async fn repair_drive_ends_at(
+    database_url: &str,
+    apply: bool,
+) -> Result<DriveEndRepairReport, AppError> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(database_url)
+        .await?;
+    let report = repair_drive_ends(&pool, apply).await?;
+    pool.close().await;
+    Ok(report)
+}
+
+async fn lock_closed_drive(
+    tx: &mut Transaction<'_, Postgres>,
+    drive_id: i64,
+    apply: bool,
+) -> Result<Option<(DateTime<Utc>, Option<f64>)>, AppError> {
+    let sql = if apply {
+        "SELECT d.end_at, v.efficiency_kwh_per_km
+         FROM drives d
+         JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE d.id = $1 AND d.end_at IS NOT NULL AND d.deleted_at IS NULL
+         FOR UPDATE OF d"
+    } else {
+        "SELECT d.end_at, v.efficiency_kwh_per_km
+         FROM drives d
+         JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE d.id = $1 AND d.end_at IS NOT NULL AND d.deleted_at IS NULL"
+    };
+    let row: Option<(Option<DateTime<Utc>>, Option<f64>)> = sqlx::query_as(sql)
+        .bind(drive_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(row.and_then(|(end_at, efficiency)| end_at.map(|end_at| (end_at, efficiency))))
+}
+
+async fn attached_tail(
+    tx: &mut Transaction<'_, Postgres>,
+    drive_id: i64,
+) -> Result<Option<(DateTime<Utc>, Vec<PositionCue>)>, AppError> {
+    let rows: Vec<ClockCue> = sqlx::query_as(
+        "SELECT d.start_at, p.recorded_at, p.speed_kmh, p.shift_state
+         FROM drives d
+         LEFT JOIN LATERAL (
+             SELECT recorded_at, speed_kmh, shift_state
+             FROM positions
+             WHERE drive_id = d.id
+             ORDER BY recorded_at DESC, id DESC
+             LIMIT 400
+         ) p ON TRUE
+         WHERE d.id = $1",
+    )
+    .bind(drive_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    let cues = rows
+        .iter()
+        .filter_map(|row| {
+            row.recorded_at.map(|at| PositionCue {
+                at,
+                speed_kmh: row.speed_kmh,
+                shift_state: row.shift_state.clone(),
+            })
+        })
+        .collect();
+    Ok(Some((first.start_at, cues)))
+}
+
 fn remember_closed(slot: &mut Option<ClosedDrive>, closed: ClosedDrive) {
     let replace = slot.is_none_or(|current| closed.end_at >= current.end_at);
     if replace {
@@ -2254,9 +2422,27 @@ pub(crate) fn resting_observation(at: DateTime<Utc>, presence: Presence) -> Obse
 
 #[cfg(test)]
 mod tests {
-    use super::LiveEvent;
+    use super::{DriveEndRepairReport, LiveEvent, format_drive_end_repair};
     use crate::state::{Observation, Presence};
     use crate::status::{at_secs, merge_stream};
+
+    #[test]
+    fn drive_end_repair_report_lists_counts_and_ids_only() {
+        let report = DriveEndRepairReport {
+            applied: false,
+            closed: 4,
+            unchanged: 2,
+            changed: vec![7, 11],
+        };
+        let text = format_drive_end_repair(&report);
+        assert_eq!(
+            text,
+            "mode=dry-run\nclosed=4\nchanged=2\nunchanged=2\ndrive_id=7\ndrive_id=11\n"
+        );
+        assert!(!text.contains("vin"));
+        assert!(!text.contains("latitude"));
+        assert!(!text.contains("postgres"));
+    }
 
     fn frame(
         obs: &Observation,

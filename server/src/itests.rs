@@ -3262,6 +3262,392 @@ async fn authed(state: &crate::app::AppState, method: &str, uri: &str, token: &s
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+#[tokio::test]
+async fn repair_drive_ends_is_a_dry_run_until_apply_and_stays_idempotent() {
+    let Some(db) = TestDb::migrated("repairends").await else {
+        return;
+    };
+    let vehicle: (i64,) = sqlx::query_as(
+        "INSERT INTO vehicles (vin, name) VALUES ('repair-fixture', 'Fixture') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let vehicle_id = vehicle.0;
+    let base = Utc.with_ymd_and_hms(2024, 3, 4, 12, 0, 0).unwrap();
+
+    let trim = insert_closed_drive(
+        &db.pool,
+        vehicle_id,
+        base,
+        base + chrono::Duration::minutes(2),
+    )
+    .await;
+    insert_fix(
+        &db.pool,
+        vehicle_id,
+        Some(trim),
+        base,
+        Some(40.0),
+        1.0,
+        Some("D"),
+    )
+    .await;
+    insert_fix(
+        &db.pool,
+        vehicle_id,
+        Some(trim),
+        base + chrono::Duration::minutes(1),
+        Some(0.0),
+        1.2,
+        Some("P"),
+    )
+    .await;
+    insert_fix(
+        &db.pool,
+        vehicle_id,
+        Some(trim),
+        base + chrono::Duration::minutes(2),
+        None,
+        1.2,
+        None,
+    )
+    .await;
+
+    let no_zero_at = base + chrono::Duration::hours(1);
+    let no_zero = insert_closed_drive(
+        &db.pool,
+        vehicle_id,
+        no_zero_at,
+        no_zero_at + chrono::Duration::minutes(1),
+    )
+    .await;
+    insert_fix(
+        &db.pool,
+        vehicle_id,
+        Some(no_zero),
+        no_zero_at,
+        Some(20.0),
+        2.0,
+        Some("D"),
+    )
+    .await;
+    insert_fix(
+        &db.pool,
+        vehicle_id,
+        Some(no_zero),
+        no_zero_at + chrono::Duration::minutes(1),
+        Some(25.0),
+        2.3,
+        Some("D"),
+    )
+    .await;
+
+    let middle_at = base + chrono::Duration::hours(2);
+    let middle = insert_closed_drive(
+        &db.pool,
+        vehicle_id,
+        middle_at,
+        middle_at + chrono::Duration::minutes(2),
+    )
+    .await;
+    insert_fix(
+        &db.pool,
+        vehicle_id,
+        Some(middle),
+        middle_at,
+        Some(40.0),
+        3.0,
+        Some("D"),
+    )
+    .await;
+    insert_fix(
+        &db.pool,
+        vehicle_id,
+        Some(middle),
+        middle_at + chrono::Duration::minutes(1),
+        Some(0.0),
+        3.1,
+        Some("P"),
+    )
+    .await;
+    insert_fix(
+        &db.pool,
+        vehicle_id,
+        Some(middle),
+        middle_at + chrono::Duration::minutes(2),
+        Some(30.0),
+        3.4,
+        Some("D"),
+    )
+    .await;
+
+    let zeros_at = base + chrono::Duration::hours(3);
+    let zeros = insert_closed_drive(
+        &db.pool,
+        vehicle_id,
+        zeros_at,
+        zeros_at + chrono::Duration::minutes(1),
+    )
+    .await;
+    insert_fix(
+        &db.pool,
+        vehicle_id,
+        Some(zeros),
+        zeros_at,
+        Some(40.0),
+        4.0,
+        Some("D"),
+    )
+    .await;
+    for minute in 1..=3 {
+        insert_fix(
+            &db.pool,
+            vehicle_id,
+            Some(zeros),
+            zeros_at + chrono::Duration::minutes(minute),
+            Some(0.0),
+            4.2,
+            Some("P"),
+        )
+        .await;
+    }
+
+    let detached_at = base + chrono::Duration::hours(4);
+    let detached = insert_closed_drive(
+        &db.pool,
+        vehicle_id,
+        detached_at,
+        detached_at + chrono::Duration::minutes(1),
+    )
+    .await;
+    insert_fix(
+        &db.pool,
+        vehicle_id,
+        Some(detached),
+        detached_at,
+        Some(40.0),
+        5.0,
+        Some("D"),
+    )
+    .await;
+    insert_fix(
+        &db.pool,
+        vehicle_id,
+        Some(detached),
+        detached_at + chrono::Duration::minutes(1),
+        Some(0.0),
+        5.2,
+        Some("P"),
+    )
+    .await;
+    insert_fix(
+        &db.pool,
+        vehicle_id,
+        None,
+        detached_at + chrono::Duration::minutes(2),
+        Some(0.0),
+        5.2,
+        Some("P"),
+    )
+    .await;
+
+    let deleted_at = base + chrono::Duration::hours(5);
+    let deleted = insert_closed_drive(
+        &db.pool,
+        vehicle_id,
+        deleted_at,
+        deleted_at + chrono::Duration::minutes(2),
+    )
+    .await;
+    sqlx::query("UPDATE drives SET deleted_at = $2 WHERE id = $1")
+        .bind(deleted)
+        .bind(base)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let open_at = base + chrono::Duration::hours(6);
+    let open: (i64,) = sqlx::query_as(
+        "INSERT INTO drives (vehicle_id, start_at, source) VALUES ($1, $2, 'poll') RETURNING id",
+    )
+    .bind(vehicle_id)
+    .bind(open_at)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    insert_fix(
+        &db.pool,
+        vehicle_id,
+        Some(open.0),
+        open_at,
+        Some(15.0),
+        6.0,
+        Some("D"),
+    )
+    .await;
+
+    let dry = crate::persist::repair_drive_ends(&db.pool, false)
+        .await
+        .unwrap();
+    assert!(!dry.applied);
+    assert_eq!(dry.closed, 5);
+    assert_eq!(dry.unchanged, 3);
+    assert_eq!(dry.changed, vec![trim, zeros]);
+    let printed = crate::persist::format_drive_end_repair(&dry);
+    assert!(!printed.contains("repair-fixture"));
+    assert!(!printed.contains("vin"));
+    assert!(!printed.contains("latitude"));
+    assert_eq!(
+        drive_end(&db.pool, trim).await,
+        base + chrono::Duration::minutes(2)
+    );
+    assert_eq!(
+        drive_end(&db.pool, zeros).await,
+        zeros_at + chrono::Duration::minutes(1)
+    );
+
+    let applied = crate::persist::repair_drive_ends(&db.pool, true)
+        .await
+        .unwrap();
+    assert!(applied.applied);
+    assert_eq!(applied.changed, vec![trim, zeros]);
+    assert_eq!(
+        drive_end(&db.pool, trim).await,
+        base + chrono::Duration::minutes(1),
+        "end moves to the last exact 0 km/h sample"
+    );
+    assert_eq!(
+        attached_at(&db.pool, trim, base + chrono::Duration::minutes(2)).await,
+        0
+    );
+    assert_eq!(
+        attached_at(&db.pool, trim, base + chrono::Duration::minutes(1)).await,
+        1
+    );
+    assert_eq!(
+        drive_end(&db.pool, zeros).await,
+        zeros_at + chrono::Duration::minutes(3)
+    );
+    assert_eq!(
+        attached_at(&db.pool, zeros, zeros_at + chrono::Duration::minutes(1)).await,
+        1
+    );
+    assert_eq!(
+        attached_at(&db.pool, zeros, zeros_at + chrono::Duration::minutes(3)).await,
+        1
+    );
+    assert_eq!(
+        drive_end(&db.pool, no_zero).await,
+        no_zero_at + chrono::Duration::minutes(1)
+    );
+    assert_eq!(
+        drive_end(&db.pool, middle).await,
+        middle_at + chrono::Duration::minutes(2)
+    );
+    assert_eq!(
+        attached_at(&db.pool, middle, middle_at + chrono::Duration::minutes(1)).await,
+        1
+    );
+    assert_eq!(
+        drive_end(&db.pool, detached).await,
+        detached_at + chrono::Duration::minutes(1)
+    );
+    let still_null: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM positions WHERE vehicle_id = $1 AND recorded_at = $2 AND drive_id IS NULL",
+    )
+    .bind(vehicle_id)
+    .bind(detached_at + chrono::Duration::minutes(2))
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        still_null.0, 1,
+        "a position with no drive id stays detached"
+    );
+    assert_eq!(
+        drive_end(&db.pool, deleted).await,
+        deleted_at + chrono::Duration::minutes(2)
+    );
+    let open_end: (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT end_at FROM drives WHERE id = $1")
+            .bind(open.0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(open_end.0, None);
+
+    let again = crate::persist::repair_drive_ends(&db.pool, true)
+        .await
+        .unwrap();
+    assert!(again.changed.is_empty(), "a second apply changes nothing");
+    assert_eq!(again.unchanged, 5);
+}
+
+async fn insert_closed_drive(
+    pool: &sqlx::PgPool,
+    vehicle_id: i64,
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO drives (vehicle_id, start_at, end_at, source)
+         VALUES ($1, $2, $3, 'poll') RETURNING id",
+    )
+    .bind(vehicle_id)
+    .bind(start)
+    .bind(end)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}
+
+async fn insert_fix(
+    pool: &sqlx::PgPool,
+    vehicle_id: i64,
+    drive_id: Option<i64>,
+    at: chrono::DateTime<Utc>,
+    speed_kmh: Option<f64>,
+    odometer_km: f64,
+    shift_state: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO positions (
+            vehicle_id, recorded_at, speed_kmh, odometer_km, shift_state, drive_id, source
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'poll')",
+    )
+    .bind(vehicle_id)
+    .bind(at)
+    .bind(speed_kmh)
+    .bind(odometer_km)
+    .bind(shift_state)
+    .bind(drive_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn drive_end(pool: &sqlx::PgPool, drive_id: i64) -> chrono::DateTime<Utc> {
+    let row: (chrono::DateTime<Utc>,) = sqlx::query_as("SELECT end_at FROM drives WHERE id = $1")
+        .bind(drive_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
+async fn attached_at(pool: &sqlx::PgPool, drive_id: i64, at: chrono::DateTime<Utc>) -> i64 {
+    let row: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM positions WHERE drive_id = $1 AND recorded_at = $2")
+            .bind(drive_id)
+            .bind(at)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    row.0
+}
+
 async fn authed_status(state: &crate::app::AppState, uri: &str, token: Option<&str>) -> String {
     let mut builder = axum::http::Request::builder().uri(uri);
     if let Some(token) = token {

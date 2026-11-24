@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Jean Collonvillé
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Process entry points for `serve`, `import-teslamate`, and `healthcheck`.
+//! Process entry points for `serve`, `import-teslamate`, `repair-drive-ends`, and `healthcheck`.
 
 use std::time::Duration;
 
@@ -39,6 +39,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 stats.positions
             );
         }
+        Command::RepairDriveEnds { apply } => {
+            let url = Config::database_url()?;
+            let report = crate::persist::repair_drive_ends_at(&url, apply).await?;
+            print!("{}", crate::persist::format_drive_end_repair(&report));
+        }
         Command::Healthcheck { url } => healthcheck(&url).await?,
     }
     Ok(())
@@ -69,6 +74,15 @@ enum Command {
         /// Positions are read 5000 rows at a time.
         #[arg(long, default_value_t = 1000)]
         batch_size: i64,
+    },
+    /// Recompute closed-drive ends from the last exact 0 km/h sample.
+    ///
+    /// Prints a dry-run unless `--apply` is set. Never run by `serve`.
+    #[command(name = "repair-drive-ends")]
+    RepairDriveEnds {
+        /// Write the new ends. Without this flag the command only prints the plan.
+        #[arg(long)]
+        apply: bool,
     },
     /// GET a URL and exit 0 when the status is successful.
     Healthcheck {
@@ -139,9 +153,27 @@ mod tests {
                     assert_eq!(source, "postgres://localhost/teslamate");
                     assert_eq!(batch_size, 1000);
                 }
-                Command::Serve | Command::Healthcheck { .. } => {
+                Command::Serve | Command::Healthcheck { .. } | Command::RepairDriveEnds { .. } => {
                     panic!("{name} parsed as a different command");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn repair_drive_ends_defaults_to_a_dry_run() {
+        let dry = Cli::try_parse_from(["tesla-logger", "repair-drive-ends"]).unwrap();
+        match dry.command.unwrap() {
+            Command::RepairDriveEnds { apply } => assert!(!apply),
+            Command::Serve | Command::ImportTeslaMate { .. } | Command::Healthcheck { .. } => {
+                panic!("dry-run parsed as a different command");
+            }
+        }
+        let write = Cli::try_parse_from(["tesla-logger", "repair-drive-ends", "--apply"]).unwrap();
+        match write.command.unwrap() {
+            Command::RepairDriveEnds { apply } => assert!(apply),
+            Command::Serve | Command::ImportTeslaMate { .. } | Command::Healthcheck { .. } => {
+                panic!("apply parsed as a different command");
             }
         }
     }
