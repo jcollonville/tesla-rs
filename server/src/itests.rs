@@ -2023,6 +2023,7 @@ async fn parked_stop_stays_two_drives() {
     assert_eq!(closed, 0, "park grace elapsed");
     assert_eq!(closed_drives(&db.pool, vin).await.0, 1);
     let park_at = base + chrono::Duration::seconds(61);
+    let last_zero = base + chrono::Duration::seconds(61 + 204);
     let end: (chrono::DateTime<Utc>,) = sqlx::query_as(
         "SELECT d.end_at FROM drives d
          JOIN vehicles v ON v.id = d.vehicle_id
@@ -2033,9 +2034,21 @@ async fn parked_stop_stays_two_drives() {
     .await
     .unwrap();
     assert_eq!(
-        end.0, park_at,
-        "closed drive must end at first park, not after the grace wait"
+        end.0, last_zero,
+        "closed drive ends at the last 0 km/h sample, not the first park"
     );
+    let kept: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM positions p
+         JOIN drives d ON d.id = p.drive_id
+         JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE v.vin = $1 AND p.recorded_at = $2",
+    )
+    .bind(vin)
+    .bind(park_at)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(kept.0, 1, "the earlier 0 km/h sample stays on the drive");
     let attached: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM positions p
          JOIN drives d ON d.id = p.drive_id
@@ -2043,11 +2056,14 @@ async fn parked_stop_stays_two_drives() {
          WHERE v.vin = $1 AND p.recorded_at > $2",
     )
     .bind(vin)
-    .bind(park_at)
+    .bind(last_zero)
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(attached.0, 0, "grace-wait positions must be detached");
+    assert_eq!(
+        attached.0, 0,
+        "nothing after the last 0 km/h sample stays attached"
+    );
     apply_for_vin(
         &archive,
         vin,
@@ -2066,78 +2082,6 @@ async fn parked_stop_stays_two_drives() {
     .unwrap();
     assert_eq!(open_drive_count(&db.pool, vin).await, 1);
     assert_eq!(closed_drives(&db.pool, vin).await.0, 1);
-}
-
-#[tokio::test]
-async fn repair_trims_park_grace_tail_on_closed_drives() {
-    let Some(db) = TestDb::migrated("repairpark").await else {
-        return;
-    };
-    let vehicle: (i64,) = sqlx::query_as(
-        "INSERT INTO vehicles (vin, name) VALUES ('5YJ3E1EA7KF000079', 'Repair') RETURNING id",
-    )
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    let start = Utc.with_ymd_and_hms(2026, 11, 20, 8, 45, 0).unwrap();
-    let park = start + chrono::Duration::minutes(15);
-    let waited = park + chrono::Duration::minutes(5);
-    let drive: (i64,) = sqlx::query_as(
-        "INSERT INTO drives (
-            vehicle_id, start_at, end_at, start_odometer_km, end_odometer_km,
-            distance_km, duration_s, source
-         ) VALUES ($1, $2, $3, 10.0, 10.5, 0.5, 1200, 'poll')
-         RETURNING id",
-    )
-    .bind(vehicle.0)
-    .bind(start)
-    .bind(waited)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO positions (
-            vehicle_id, recorded_at, latitude, longitude, speed_kmh, odometer_km, shift_state, drive_id, source
-         ) VALUES
-           ($1, $2, 48.85, 2.35, 40, 10.0, 'D', $5, 'poll'),
-           ($1, $3, 48.86, 2.36, 0, 10.5, 'P', $5, 'poll'),
-           ($1, $4, 48.86, 2.36, 0, 10.5, 'P', $5, 'poll')",
-    )
-    .bind(vehicle.0)
-    .bind(start)
-    .bind(park)
-    .bind(waited)
-    .bind(drive.0)
-    .execute(&db.pool)
-    .await
-    .unwrap();
-    let fixed = crate::persist::repair_drive_park_tails(&db.pool)
-        .await
-        .unwrap();
-    assert_eq!(fixed, 1);
-    let end: (chrono::DateTime<Utc>, i32) =
-        sqlx::query_as("SELECT end_at, duration_s FROM drives WHERE id = $1")
-            .bind(drive.0)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-    assert_eq!(end.0, park);
-    assert_eq!(end.1, 15 * 60);
-    let attached: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM positions WHERE drive_id = $1 AND recorded_at > $2")
-            .bind(drive.0)
-            .bind(park)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-    assert_eq!(attached.0, 0);
-    assert_eq!(
-        crate::persist::repair_drive_park_tails(&db.pool)
-            .await
-            .unwrap(),
-        0,
-        "repair must be idempotent"
-    );
 }
 
 #[tokio::test]

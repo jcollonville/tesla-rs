@@ -550,8 +550,9 @@ pub(crate) enum ClosePlan {
     },
     /// Grace elapsed, or charging started.
     Close {
-        /// Clock at the close. [`drive_end_cutoff`] picks the row `end_at` from
-        /// the position tail so the grace wait is not stored as part of the trip.
+        /// Clock at the close. [`drive_end_cutoff`] picks `end_at` from the
+        /// position tail: the last exact 0 km/h sample, or the newest sample
+        /// when that tail has none. The grace wait stays on the trip.
         clock: DriveClock,
     },
 }
@@ -636,7 +637,8 @@ pub(crate) fn stream_motion(
 ///
 /// Charging closes immediately. A confirmed park uses the park grace, measured
 /// from the first park sample. A signal gap uses the end grace, measured from
-/// the last driving evidence. Row `end_at` is chosen later by [`drive_end_cutoff`].
+/// the last driving evidence. Those windows only decide when the drive closes.
+/// Row `end_at` is chosen later by [`drive_end_cutoff`].
 pub(crate) fn plan_drive_close(
     motion: DriveMotion,
     at: DateTime<Utc>,
@@ -764,49 +766,52 @@ fn position_is_park(cue: &PositionCue) -> bool {
     normalized_shift(cue.shift_state.as_deref()) == Some("P") && speed_is_standstill(cue.speed_kmh)
 }
 
-/// Trailing stop that should not stay on the closed drive after the grace wait.
-///
-/// Confirmed park (`P` + standstill) counts, and so does an explicit near-zero
-/// speed without a driving shift. Missing speed alone does not: incomplete polls
-/// must not invent a park run.
-fn position_is_trailing_stop(cue: &PositionCue) -> bool {
-    if position_is_park(cue) {
-        return true;
-    }
-    if position_is_driving(cue) {
+/// Exact 0 km/h. The 1 km/h standstill band used for park detection does not apply.
+fn speed_is_exact_zero(speed: Option<f64>) -> bool {
+    let Some(speed) = speed else {
         return false;
-    }
-    matches!(
-        cue.speed_kmh,
-        Some(speed) if speed.is_finite() && speed <= STANDSTILL_KMH
-    )
+    };
+    speed.is_finite() && speed.abs() <= f64::EPSILON
 }
 
-/// Trip end used when closing or repairing a drive.
+/// Newer than a candidate stop, and not itself an exact 0 km/h sample.
 ///
-/// The grace wait keeps the drive open after arrival so a short gap does not
-/// split the trip. Samples collected during that wait still have `drive_id` set;
-/// this cutoff is the first sample of the trailing standstill or park run so
-/// those wait minutes are detached and left out of `end_at` / charts.
+/// Any other finite speed counts, including a creep below 1 km/h. A driving
+/// shift with no speed counts too, so a missing reading cannot hide a later roll.
+fn position_is_later_movement(cue: &PositionCue) -> bool {
+    if speed_is_exact_zero(cue.speed_kmh) {
+        return false;
+    }
+    match cue.speed_kmh {
+        Some(speed) if speed.is_finite() => true,
+        _ => matches!(
+            normalized_shift(cue.shift_state.as_deref()),
+            Some("D" | "R" | "N")
+        ),
+    }
+}
+
+/// Trip end used when a drive closes.
 ///
-/// When the newest sample is not a stop (still moving, or speed unknown), the
-/// cutoff is that newest time so incomplete rows are not trimmed away.
+/// `cues` are newest first. The cutoff is the newest sample whose speed is
+/// exactly 0 km/h, provided nothing newer shows movement. Positions after that
+/// instant are detached. A 0 km/h sample followed by movement is left in place.
+/// When the tail has no exact 0 km/h sample, the cutoff is the newest sample
+/// and the recorded end stays as it is. [`DriveGrace`] is not consulted: it
+/// only decides when the drive is closed.
 pub(crate) fn drive_end_cutoff(cues: &[PositionCue], drive_start: DateTime<Utc>) -> DateTime<Utc> {
     let Some(newest) = cues.first() else {
         return drive_start;
     };
-    if !position_is_trailing_stop(newest) {
-        return newest.at;
-    }
-    let mut since = newest.at;
     for cue in cues {
-        if position_is_trailing_stop(cue) {
-            since = cue.at;
-            continue;
+        if speed_is_exact_zero(cue.speed_kmh) {
+            return cue.at;
         }
-        break;
+        if position_is_later_movement(cue) {
+            return newest.at;
+        }
     }
-    since
+    newest.at
 }
 
 /// Prefers in-memory evidence when it is newer than the rows already stored.
@@ -1848,74 +1853,77 @@ mod tests {
         assert!(!super::split_candidate(&jump, 300));
     }
 
+    fn cue(
+        at: chrono::DateTime<Utc>,
+        speed_kmh: Option<f64>,
+        shift_state: Option<&str>,
+    ) -> super::PositionCue {
+        super::PositionCue {
+            at,
+            speed_kmh,
+            shift_state: shift_state.map(str::to_owned),
+        }
+    }
+
     #[test]
-    fn drive_end_cutoff_drops_the_park_grace_tail() {
+    fn drive_end_cutoff_trims_to_the_last_zero_speed_sample() {
+        let start = at(0);
+        let moving = cue(at(1), Some(40.0), Some("D"));
+        let zero = cue(at(2), Some(0.0), Some("P"));
+        let after = cue(at(3), None, None);
+        let cues = vec![after, zero.clone(), moving];
+        assert_eq!(super::drive_end_cutoff(&cues, start), zero.at);
+    }
+
+    #[test]
+    fn drive_end_cutoff_keeps_the_end_when_the_tail_has_no_zero_speed() {
+        let start = at(0);
+        let moving = cue(at(1), Some(40.0), Some("D"));
+        let parked = cue(at(2), None, Some("P"));
+        let newest = cue(at(3), None, Some("P"));
+        let cues = vec![newest.clone(), parked, moving];
+        assert_eq!(
+            super::drive_end_cutoff(&cues, start),
+            newest.at,
+            "missing speed is not a 0 km/h sample"
+        );
+    }
+
+    #[test]
+    fn drive_end_cutoff_does_not_cut_at_a_zero_followed_by_movement() {
+        let start = at(0);
+        let moving = cue(at(1), Some(40.0), Some("D"));
+        let zero = cue(at(2), Some(0.0), Some("P"));
+        let again = cue(at(3), Some(35.0), Some("D"));
+        let cues = vec![again.clone(), zero, moving];
+        assert_eq!(super::drive_end_cutoff(&cues, start), again.at);
+    }
+
+    #[test]
+    fn drive_end_cutoff_uses_the_newest_of_several_trailing_zeros() {
+        let start = at(0);
+        let moving = cue(at(1), Some(40.0), Some("D"));
+        let first = cue(at(2), Some(0.0), Some("P"));
+        let middle = cue(at(3), Some(0.0), None);
+        let last = cue(at(4), Some(0.0), Some("P"));
+        let cues = vec![last.clone(), middle, first, moving];
+        assert_eq!(super::drive_end_cutoff(&cues, start), last.at);
+    }
+
+    #[test]
+    fn drive_end_cutoff_keeps_a_moving_or_unknown_tail() {
         let drive_start = at(0);
-        let driving = super::PositionCue {
-            at: at(1),
-            speed_kmh: Some(40.0),
-            shift_state: Some("D".to_owned()),
-        };
-        let park = super::PositionCue {
-            at: at(2),
-            speed_kmh: Some(0.0),
-            shift_state: Some("P".to_owned()),
-        };
-        let waited = super::PositionCue {
-            at: at(2) + Duration::seconds(90),
-            speed_kmh: Some(0.0),
-            shift_state: Some("P".to_owned()),
-        };
-        let cues = vec![waited, park.clone(), driving];
-        assert_eq!(super::drive_end_cutoff(&cues, drive_start), park.at);
-
-        let zero = super::PositionCue {
-            at: at(3),
-            speed_kmh: Some(0.0),
-            shift_state: None,
-        };
-        let later = super::PositionCue {
-            at: at(3) + Duration::seconds(300),
-            speed_kmh: Some(0.0),
-            shift_state: None,
-        };
-        let gap_tail = vec![
-            later,
-            zero.clone(),
-            super::PositionCue {
-                at: at(2),
-                speed_kmh: Some(25.0),
-                shift_state: None,
-            },
-        ];
-        assert_eq!(super::drive_end_cutoff(&gap_tail, drive_start), zero.at);
-
-        let moving_only = vec![super::PositionCue {
-            at: at(4),
-            speed_kmh: Some(30.0),
-            shift_state: Some("D".to_owned()),
-        }];
+        let moving_only = vec![cue(at(4), Some(30.0), Some("D"))];
         assert_eq!(
             super::drive_end_cutoff(&moving_only, drive_start),
             moving_only[0].at
         );
 
-        let unknown_speed = vec![
-            super::PositionCue {
-                at: at(5),
-                speed_kmh: None,
-                shift_state: None,
-            },
-            super::PositionCue {
-                at: at(4),
-                speed_kmh: None,
-                shift_state: None,
-            },
-        ];
+        let unknown_speed = vec![cue(at(5), None, None), cue(at(4), None, None)];
         assert_eq!(
             super::drive_end_cutoff(&unknown_speed, drive_start),
             unknown_speed[0].at,
-            "missing speed must not invent a park tail"
+            "missing speed must not invent a zero-speed tail"
         );
     }
 

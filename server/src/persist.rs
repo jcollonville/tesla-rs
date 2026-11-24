@@ -1577,9 +1577,9 @@ struct PairRow {
 /// `drive_id` set to NULL before the delete. Callers must not read the row
 /// when this returns [`None`].
 ///
-/// Positions after [`drive_end_cutoff`] (the park / standstill wait used by the
-/// close grace) are detached before the summary so charts and `end_at` stop at
-/// arrival.
+/// Positions after [`drive_end_cutoff`] (the last exact 0 km/h sample in the
+/// tail, or the newest sample when that tail has none) are detached before the
+/// summary. Grace only decides when this close runs.
 async fn close_drive(
     tx: &mut Transaction<'_, Postgres>,
     vehicle_id: i64,
@@ -1651,7 +1651,7 @@ async fn refresh_closed_drive(
     }))
 }
 
-/// Detaches positions after the logical trip end (grace wait after park/stop).
+/// Detaches positions recorded after the closed trip's logical end.
 pub(crate) async fn detach_drive_park_tail(pool: &PgPool, drive_id: i64) -> Result<u64, AppError> {
     let mut tx = pool.begin().await?;
     let detached = detach_drive_park_tail_tx(&mut tx, drive_id).await?;
@@ -1704,42 +1704,6 @@ async fn detach_drive_park_tail_tx(
     .execute(&mut **tx)
     .await?;
     Ok(result.rows_affected())
-}
-
-/// Trims grace-wait tails on closed drives recorded since the drive-grace change.
-///
-/// Idempotent: drives that already end at the park/stop cutoff are left alone.
-pub(crate) async fn repair_drive_park_tails(pool: &PgPool) -> Result<u64, AppError> {
-    let ids: Vec<(i64, Option<DateTime<Utc>>, Option<f64>)> = sqlx::query_as(
-        "SELECT d.id, d.end_at, v.efficiency_kwh_per_km
-         FROM drives d
-         JOIN vehicles v ON v.id = d.vehicle_id
-         WHERE d.end_at IS NOT NULL
-           AND d.deleted_at IS NULL
-           AND d.end_at >= TIMESTAMPTZ '2026-11-19 00:00:00+00'
-         ORDER BY d.id",
-    )
-    .fetch_all(pool)
-    .await?;
-    let mut fixed = 0_u64;
-    for (drive_id, previous_end, efficiency) in ids {
-        let mut tx = pool.begin().await?;
-        let Some(closed) = refresh_closed_drive(&mut tx, drive_id, efficiency).await? else {
-            tx.rollback().await?;
-            continue;
-        };
-        if previous_end.is_some_and(|end| end > closed.end_at) {
-            fixed += 1;
-            tracing::info!(
-                drive_id,
-                from = %previous_end.unwrap(),
-                to = %closed.end_at,
-                "trimmed drive park-grace tail"
-            );
-        }
-        tx.commit().await?;
-    }
-    Ok(fixed)
 }
 
 fn remember_closed(slot: &mut Option<ClosedDrive>, closed: ClosedDrive) {
