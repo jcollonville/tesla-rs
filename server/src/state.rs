@@ -235,22 +235,34 @@ fn finite_soc(value: Option<f64>) -> Option<f64> {
 
 /// Whether a charge cable is connected.
 ///
-/// Latch `Engaged` or `Blocking` wins, then a real `conn_charge_cable`, then
-/// `charging_state`. `Disconnected` means unplugged. An explicit `Disengaged`
-/// latch with no other signal is unplugged. Missing inputs stay unknown.
+/// A real `conn_charge_cable` means plugged in. `charging_state` of
+/// `Disconnected` (also `none` or `null`) means unplugged, whatever the latch
+/// says. Any other charging state means plugged in, except `Unknown`, which is
+/// not a connection decision. With no decision from the charging state, latch
+/// `Engaged` or `Blocking` means plugged in unless the port door is closed and
+/// charger power is 0: that latch is holding the door, not a cable. An explicit
+/// `Disengaged` latch with no other signal is unplugged. Missing inputs stay
+/// unknown.
 pub(crate) fn derive_plugged_in(
     charge_port_latch: Option<&str>,
     charging_state: Option<&str>,
     conn_charge_cable: Option<&str>,
+    charge_port_door_open: Option<bool>,
+    charger_power_kw: Option<f64>,
 ) -> Option<bool> {
-    if latch_is(charge_port_latch, &["engaged", "blocking"]) {
-        return Some(true);
-    }
     if cable_is_connected(conn_charge_cable) {
         return Some(true);
     }
-    if let Some(state) = nonempty(charging_state) {
-        return Some(!is_disconnected(state));
+    if let Some(state) = nonempty(charging_state)
+        && let Some(plugged) = charge_connection(state)
+    {
+        return Some(plugged);
+    }
+    if latch_is(charge_port_latch, &["engaged", "blocking"]) {
+        return Some(!door_is_latched_shut(
+            charge_port_door_open,
+            charger_power_kw,
+        ));
     }
     if latch_is(charge_port_latch, &["disengaged"]) {
         return Some(false);
@@ -263,6 +275,8 @@ pub(crate) fn refresh_plugged_in(obs: &mut Observation) {
         obs.charge_port_latch.as_deref(),
         obs.charging_state.as_deref(),
         obs.conn_charge_cable.as_deref(),
+        obs.charge_port_door_open,
+        obs.charger_power_kw,
     );
 }
 
@@ -299,11 +313,18 @@ pub(crate) fn sanitize_charger_type(value: Option<&str>) -> Option<String> {
     Some(value.to_owned())
 }
 
-fn is_disconnected(state: &str) -> bool {
-    matches!(
-        state.to_ascii_lowercase().as_str(),
-        "disconnected" | "none" | "null"
-    )
+/// `None` when `state` does not say whether a cable is connected.
+fn charge_connection(state: &str) -> Option<bool> {
+    match state.to_ascii_lowercase().as_str() {
+        "disconnected" | "none" | "null" => Some(false),
+        "unknown" => None,
+        _ => Some(true),
+    }
+}
+
+/// Closed port and no charger power. The latch is holding the door shut.
+fn door_is_latched_shut(door_open: Option<bool>, power_kw: Option<f64>) -> bool {
+    door_open == Some(false) && power_kw.is_some_and(|power| power.is_finite() && power <= 0.0)
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
@@ -1390,6 +1411,175 @@ mod tests {
         Observation::at(at(minute), Presence::Online)
     }
 
+    fn plugged(
+        latch: Option<&str>,
+        state: Option<&str>,
+        cable: Option<&str>,
+        door_open: Option<bool>,
+        power_kw: Option<f64>,
+    ) -> Option<bool> {
+        super::derive_plugged_in(latch, state, cable, door_open, power_kw)
+    }
+
+    #[test]
+    fn disconnected_is_unplugged_whatever_the_latch_says() {
+        for latch in ["Engaged", "engaged", "Blocking", "Disengaged", ""] {
+            let latch = (!latch.is_empty()).then_some(latch);
+            assert_eq!(
+                plugged(
+                    latch,
+                    Some("Disconnected"),
+                    Some("<invalid>"),
+                    Some(false),
+                    Some(0.0)
+                ),
+                Some(false),
+                "{latch:?}"
+            );
+            assert_eq!(
+                plugged(latch, Some("disconnected"), None, Some(true), Some(11.0)),
+                Some(false),
+                "{latch:?} with the port open and power flowing"
+            );
+        }
+        assert_eq!(
+            plugged(Some("Engaged"), Some(" DISCONNECTED "), None, None, None),
+            Some(false)
+        );
+        assert_eq!(
+            plugged(Some("Engaged"), Some("none"), None, Some(true), Some(7.0)),
+            Some(false)
+        );
+        assert_eq!(
+            plugged(Some("Engaged"), Some("null"), None, None, None),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn plugged_charging_states_win_over_the_latch_and_a_closed_door() {
+        for state in ["Charging", "Starting", "Complete", "Stopped", "NoPower"] {
+            for latch in [None, Some("Engaged"), Some("Disengaged"), Some("Blocking")] {
+                assert_eq!(
+                    plugged(latch, Some(state), None, Some(false), Some(0.0)),
+                    Some(true),
+                    "{state} latch={latch:?}"
+                );
+            }
+            assert_eq!(
+                plugged(None, Some(state), Some("<invalid>"), None, None),
+                Some(true),
+                "{state}"
+            );
+        }
+        assert_eq!(
+            plugged(
+                Some("Disengaged"),
+                Some("charging"),
+                Some("<invalid>"),
+                Some(false),
+                Some(0.0)
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn missing_or_unknown_charging_state_uses_the_latch_unless_the_door_is_shut() {
+        assert_eq!(plugged(Some("Engaged"), None, None, None, None), Some(true));
+        assert_eq!(
+            plugged(Some("Blocking"), Some(""), None, Some(true), Some(0.0)),
+            Some(true)
+        );
+        assert_eq!(
+            plugged(Some("Engaged"), Some("Unknown"), None, None, None),
+            Some(true),
+            "unknown charging state falls through to the latch"
+        );
+        assert_eq!(
+            plugged(None, Some("Unknown"), None, Some(false), Some(0.0)),
+            None
+        );
+        assert_eq!(
+            plugged(Some("Engaged"), Some("Foo"), None, Some(false), Some(0.0)),
+            Some(true),
+            "any other charging state still means plugged in"
+        );
+        assert_eq!(
+            plugged(Some("Engaged"), None, None, Some(false), Some(0.0)),
+            Some(false),
+            "a closed door and no power is the door latch, not a cable"
+        );
+        assert_eq!(
+            plugged(Some("Blocking"), Some("  "), None, Some(false), Some(0.0)),
+            Some(false)
+        );
+        assert_eq!(
+            plugged(
+                Some("ENGAGED"),
+                Some("unknown"),
+                None,
+                Some(false),
+                Some(-0.0)
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            plugged(Some("Engaged"), None, None, Some(false), None),
+            Some(true),
+            "power must be known to be zero"
+        );
+        assert_eq!(
+            plugged(Some("Engaged"), None, None, None, Some(0.0)),
+            Some(true),
+            "the door must be known to be closed"
+        );
+        assert_eq!(
+            plugged(Some("Engaged"), None, None, Some(false), Some(0.4)),
+            Some(true)
+        );
+        assert_eq!(
+            plugged(Some("Engaged"), None, Some("IEC"), Some(false), Some(0.0)),
+            Some(true),
+            "a named cable is not the latch alone"
+        );
+        assert_eq!(
+            plugged(Some("Disengaged"), None, None, Some(false), Some(0.0)),
+            Some(false)
+        );
+        assert_eq!(plugged(None, None, None, Some(false), Some(0.0)), None);
+        assert_eq!(
+            plugged(
+                Some("Disengaged"),
+                Some("Disconnected"),
+                Some("SAE"),
+                Some(false),
+                Some(0.0)
+            ),
+            Some(true),
+            "a named cable still means plugged in"
+        );
+    }
+
+    #[test]
+    fn refresh_plugged_in_matches_a_disconnected_poll() {
+        let mut obs = online(0);
+        obs.charging_state = Some("Disconnected".to_owned());
+        obs.charge_port_latch = Some("Engaged".to_owned());
+        obs.charge_port_door_open = Some(false);
+        obs.charger_power_kw = Some(0.0);
+        obs.conn_charge_cable = Some("<invalid>".to_owned());
+        super::refresh_plugged_in(&mut obs);
+        assert_eq!(obs.plugged_in, Some(false));
+
+        let mut door = online(1);
+        door.charge_port_latch = Some("Engaged".to_owned());
+        door.charge_port_door_open = Some(false);
+        door.charger_power_kw = Some(0.0);
+        super::refresh_plugged_in(&mut door);
+        assert_eq!(door.plugged_in, Some(false));
+    }
+
     #[test]
     fn synthetic_drive_then_charge_then_sleep() {
         let mut tracker = Tracker::default();
@@ -1456,26 +1646,44 @@ mod tests {
         assert_eq!(summary.end_battery_level, Some(74.0));
 
         assert_eq!(
-            super::derive_plugged_in(Some("Engaged"), Some("Disconnected"), Some("<invalid>")),
-            Some(true)
-        );
-        assert_eq!(
-            super::derive_plugged_in(Some("Disengaged"), Some("Disconnected"), Some("SAE")),
-            Some(true)
-        );
-        assert_eq!(
-            super::derive_plugged_in(None, Some("Charging"), None),
-            Some(true)
-        );
-        assert_eq!(
-            super::derive_plugged_in(Some("Disengaged"), Some("Disconnected"), Some("<invalid>")),
+            super::derive_plugged_in(
+                Some("Engaged"),
+                Some("Disconnected"),
+                Some("<invalid>"),
+                Some(false),
+                Some(0.0),
+            ),
             Some(false)
         );
         assert_eq!(
-            super::derive_plugged_in(Some("Disengaged"), None, None),
+            super::derive_plugged_in(
+                Some("Disengaged"),
+                Some("Disconnected"),
+                Some("SAE"),
+                None,
+                None,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            super::derive_plugged_in(None, Some("Charging"), None, None, None),
+            Some(true)
+        );
+        assert_eq!(
+            super::derive_plugged_in(
+                Some("Disengaged"),
+                Some("Disconnected"),
+                Some("<invalid>"),
+                None,
+                None,
+            ),
             Some(false)
         );
-        assert_eq!(super::derive_plugged_in(None, None, None), None);
+        assert_eq!(
+            super::derive_plugged_in(Some("Disengaged"), None, None, None, None),
+            Some(false)
+        );
+        assert_eq!(super::derive_plugged_in(None, None, None, None, None), None);
         assert_eq!(super::soc_level(None, Some(70.0)), Some(70.0));
         assert_eq!(super::soc_level(Some(80.0), Some(79.0)), Some(80.0));
 

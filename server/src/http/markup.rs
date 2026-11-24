@@ -85,7 +85,7 @@ impl Status {
         charging_state: Option<&str>,
         plugged_in: Option<bool>,
     ) -> Self {
-        let charging = charging_state.unwrap_or("").to_ascii_lowercase();
+        let charging = charging_state.unwrap_or("").trim().to_ascii_lowercase();
         match activity.unwrap_or("") {
             "driving" => Self::Driving,
             "charging" => Self::Charging,
@@ -93,8 +93,10 @@ impl Status {
             "updating" => Self::Updating,
             "asleep" => Self::Asleep,
             "offline" => Self::Offline,
-            _ if plugged_in == Some(true)
-                || matches!(charging.as_str(), "complete" | "stopped" | "nopower") =>
+            // `Disconnected` is unplugged. A stored `plugged_in` flag must not override it.
+            _ if charging != "disconnected"
+                && (plugged_in == Some(true)
+                    || matches!(charging.as_str(), "complete" | "stopped" | "nopower")) =>
             {
                 Self::Plugged
             }
@@ -1328,9 +1330,47 @@ pub(crate) fn document(debug_script: bool, body: Markup) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview, Party, VehicleTab,
-        connection_page, fleet_page, login_page, overview_page,
+        Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview, Party, Status,
+        VehicleTab, connection_page, fleet_page, login_page, overview_page,
     };
+
+    #[test]
+    fn disconnected_never_renders_branchee() {
+        for state in ["Disconnected", "disconnected", " DISCONNECTED "] {
+            let status = Status::from(Some("online"), Some(state), Some(true));
+            assert_ne!(status, Status::Plugged, "{state}");
+            assert_ne!(status.label(), "Branchée", "{state}");
+            assert_eq!(status, Status::Parked, "{state}");
+            assert_eq!(status.label(), "Garée", "{state}");
+        }
+        let idle = Status::from(None, Some("Disconnected"), Some(true));
+        assert_ne!(idle, Status::Plugged);
+        assert_ne!(idle.label(), "Branchée");
+        assert_eq!(
+            Status::from(Some("driving"), Some("Disconnected"), Some(true)),
+            Status::Driving
+        );
+    }
+
+    #[test]
+    fn plugged_states_still_render_branchee() {
+        for state in ["Complete", "Stopped", "NoPower"] {
+            let status = Status::from(Some("online"), Some(state), Some(false));
+            assert_eq!(status, Status::Plugged, "{state}");
+            assert_eq!(status.label(), "Branchée", "{state}");
+        }
+        let flagged = Status::from(Some("online"), None, Some(true));
+        assert_eq!(flagged, Status::Plugged);
+        assert_eq!(flagged.label(), "Branchée");
+        assert_eq!(
+            Status::from(Some("online"), Some("Charging"), Some(true)),
+            Status::Charging
+        );
+        assert_eq!(
+            Status::from(Some("online"), Some("Charging"), Some(true)).label(),
+            "En charge"
+        );
+    }
 
     #[test]
     fn pages_link_same_origin_icons_and_show_the_mark_by_the_title() {
