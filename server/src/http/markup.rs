@@ -1611,7 +1611,8 @@ mod tests {
         remembered: Option<i64>,
     ) -> Vec<(&'static str, String)> {
         use super::{
-            SettingRow, TokenLine, UsersPanel, debug_page, security_page, settings_page, system_page,
+            SettingRow, TokenLine, UsersPanel, debug_page, security_page, settings_page,
+            system_page,
         };
         let page = |global| Chrome {
             vehicles: vehicles.to_vec(),

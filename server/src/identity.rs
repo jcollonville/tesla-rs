@@ -594,19 +594,15 @@ pub(crate) async fn reset_user_password(
         return Err(AppError::message("user not found"));
     }
     let hash = hash_password(password)?;
-    sqlx::query(
-        "UPDATE users SET password_hash = $2, must_change_password = true WHERE id = $1",
-    )
-    .bind(user_id)
-    .bind(hash)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
-    )
-    .bind(user_id)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE users SET password_hash = $2, must_change_password = true WHERE id = $1")
+        .bind(user_id)
+        .bind(hash)
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
     audit(
         pool,
         Some(actor),
@@ -654,7 +650,9 @@ async fn ensure_another_admin(pool: &PgPool, user_id: i64) -> Result<(), AppErro
             .fetch_one(pool)
             .await?;
     if others.0 == 0 {
-        return Err(AppError::message("the last administrator cannot be removed"));
+        return Err(AppError::message(
+            "the last administrator cannot be removed",
+        ));
     }
     Ok(())
 }
@@ -1210,52 +1208,47 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let vehicle: (i64,) =
-            sqlx::query_as("INSERT INTO vehicles (vin, name) VALUES ('5YJ30000000000002', 'Blue') RETURNING id")
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-        let user_id = super::create_user(
-            &db.pool,
-            admin.user_id,
-            "alice",
-            "temporary-pass",
-            "user",
+        let vehicle: (i64,) = sqlx::query_as(
+            "INSERT INTO vehicles (vin, name) VALUES ('5YJ30000000000002', 'Blue') RETURNING id",
         )
+        .fetch_one(&db.pool)
         .await
         .unwrap();
+        let user_id =
+            super::create_user(&db.pool, admin.user_id, "alice", "temporary-pass", "user")
+                .await
+                .unwrap();
         super::set_vehicle_access(&db.pool, admin.user_id, user_id, vehicle.0, Some("viewer"))
             .await
             .unwrap();
         let users = super::list_users(&db.pool).await.unwrap();
-        assert!(users.iter().any(|user| user.username == "alice" && user.role == "user"));
-        let access = super::list_access(&db.pool).await.unwrap();
         assert!(
-            access
+            users
                 .iter()
-                .any(|row| row.user_id == user_id && row.vehicle_id == vehicle.0 && row.role == "viewer")
+                .any(|user| user.username == "alice" && user.role == "user")
         );
+        let access = super::list_access(&db.pool).await.unwrap();
+        assert!(access.iter().any(|row| row.user_id == user_id
+            && row.vehicle_id == vehicle.0
+            && row.role == "viewer"));
         super::set_user_role(&db.pool, admin.user_id, user_id, "admin")
             .await
             .unwrap();
         let access = super::list_access(&db.pool).await.unwrap();
-        assert!(
-            access
-                .iter()
-                .any(|row| row.user_id == user_id && row.vehicle_id == vehicle.0 && row.role == "owner")
-        );
+        assert!(access.iter().any(|row| row.user_id == user_id
+            && row.vehicle_id == vehicle.0
+            && row.role == "owner"));
         super::set_user_role(&db.pool, admin.user_id, user_id, "user")
             .await
             .unwrap();
         super::reset_user_password(&db.pool, admin.user_id, user_id, "another-secret")
             .await
             .unwrap();
-        let row: (bool,) =
-            sqlx::query_as("SELECT must_change_password FROM users WHERE id = $1")
-                .bind(user_id)
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
+        let row: (bool,) = sqlx::query_as("SELECT must_change_password FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert!(row.0);
         super::delete_user(&db.pool, admin.user_id, user_id)
             .await

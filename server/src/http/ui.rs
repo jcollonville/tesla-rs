@@ -1978,7 +1978,10 @@ async fn token_rows(app: &AppState) -> Result<Vec<TokenRow>, sqlx::Error> {
         .await
 }
 
-async fn users_panel_data(app: &AppState, current_user_id: i64) -> (Vec<UserLine>, Vec<VehicleOption>) {
+async fn users_panel_data(
+    app: &AppState,
+    current_user_id: i64,
+) -> (Vec<UserLine>, Vec<VehicleOption>) {
     let users = crate::identity::list_users(&app.inner.db)
         .await
         .unwrap_or_default();
@@ -2038,9 +2041,13 @@ async fn users_panel_data(app: &AppState, current_user_id: i64) -> (Vec<UserLine
 
 fn security_notice(key: &str) -> Option<&'static str> {
     match key {
-        "user_created" => Some("Utilisateur créé. Il devra changer son mot de passe et activer le 2FA."),
+        "user_created" => {
+            Some("Utilisateur créé. Il devra changer son mot de passe et activer le 2FA.")
+        }
         "role_saved" => Some("Rôle enregistré."),
-        "password_reset" => Some("Mot de passe réinitialisé. Les sessions de ce compte ont été révoquées."),
+        "password_reset" => {
+            Some("Mot de passe réinitialisé. Les sessions de ce compte ont été révoquées.")
+        }
         "user_deleted" => Some("Utilisateur supprimé."),
         "access_saved" => Some("Accès véhicule mis à jour."),
         _ => None,
@@ -2049,8 +2056,12 @@ fn security_notice(key: &str) -> Option<&'static str> {
 
 fn security_error(key: &str) -> Option<&'static str> {
     match key {
-        "user_create" => Some("Impossible de créer l'utilisateur. Vérifiez le nom, le rôle et le mot de passe."),
-        "role" => Some("Impossible de changer le rôle (dernier administrateur ou utilisateur introuvable)."),
+        "user_create" => {
+            Some("Impossible de créer l'utilisateur. Vérifiez le nom, le rôle et le mot de passe.")
+        }
+        "role" => Some(
+            "Impossible de changer le rôle (dernier administrateur ou utilisateur introuvable).",
+        ),
         "password" => Some("Impossible de réinitialiser le mot de passe."),
         "delete" => Some("Impossible de supprimer cet utilisateur."),
         "access" => Some("Impossible de mettre à jour l'accès véhicule."),
