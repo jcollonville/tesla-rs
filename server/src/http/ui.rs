@@ -874,7 +874,7 @@ fn setting_key_for_label(label: &str) -> Option<&'static str> {
     match label {
         "Poll conduite repli (60–3600 s)" => Some("POLL_DRIVE_FALLBACK_SECS"),
         "Délai fin de trajet (s)" => Some("DRIVE_END_GRACE_SECS"),
-        "Délai stationnement (s)" => Some("DRIVE_PARK_GRACE_SECS"),
+        "Délai à 0 km/h (s)" => Some("DRIVE_PARK_GRACE_SECS"),
         "Poll charge (60–86400 s)" => Some("POLL_CHARGE_SECS"),
         "Poll à l'arrêt (s)" => Some("POLL_PARKED_SECS"),
         "Poll endormi (s)" => Some("POLL_ASLEEP_SECS"),
