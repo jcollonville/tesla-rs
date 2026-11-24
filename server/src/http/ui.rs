@@ -836,46 +836,105 @@ async fn settings(State(app): State<AppState>, headers: HeaderMap) -> Response {
     let Some(page) = signed_page(&app, &headers).await else {
         return Redirect::to("/").into_response();
     };
+    let snap = app.inner.runtime.snapshot();
     let rows = app
         .inner
         .config
         .public_settings(page.admin)
         .into_iter()
-        .map(|row| SettingRow {
-            label: row.label,
-            value: row.value,
-            source: row.source,
+        .map(|row| {
+            let key = setting_key_for_label(row.label).unwrap_or("");
+            let effective = if key.is_empty() {
+                crate::settings::EffectiveSetting {
+                    key: String::new(),
+                    label: row.label,
+                    value: row.value,
+                    source: row.source,
+                }
+            } else {
+                crate::settings::effective_row(&app.inner.config, &snap, key, row.label, row.value)
+            };
+            SettingRow {
+                label: effective.label,
+                value: effective.value,
+                source: effective.source,
+            }
         })
         .collect::<Vec<_>>();
-    let mut body = settings_page(
+    let override_form = page.admin.then(|| settings_override_form(&page.csrf));
+    let body = settings_page(
         &chrome(&page, None, None, GlobalTab::Settings, false),
         &rows,
+        override_form.as_deref(),
     );
-    if page.admin {
-        let form = maud::html! {
-            section class="card" {
-                h2 { "Remplacer un réglage" }
-                p class="muted" { "La valeur est appliquée tout de suite. Un champ vide revient à l'environnement. Les secrets restent dans l'environnement." }
-                form class="stack" method="post" action="/settings/override" {
-                    input type="hidden" name="csrf" value=(&page.csrf);
-                    label class="field" for="setting-key" {
-                        "Clé"
-                        select id="setting-key" name="key" {
-                            @for key in crate::settings::KEYS {
-                                option value=(key) { (key) }
+    html_page(body, page.cookie)
+}
+
+fn setting_key_for_label(label: &str) -> Option<&'static str> {
+    match label {
+        "Poll conduite repli (60–3600 s)" => Some("POLL_DRIVE_FALLBACK_SECS"),
+        "Délai fin de trajet (s)" => Some("DRIVE_END_GRACE_SECS"),
+        "Délai stationnement (s)" => Some("DRIVE_PARK_GRACE_SECS"),
+        "Poll charge (60–86400 s)" => Some("POLL_CHARGE_SECS"),
+        "Poll à l'arrêt (s)" => Some("POLL_PARKED_SECS"),
+        "Poll endormi (s)" => Some("POLL_ASLEEP_SECS"),
+        "Poll repli (s)" => Some("POLL_BACKOFF_SECS"),
+        "Lectures à l'arrêt" => Some("POLL_PARKED_LIVE_LIMIT"),
+        "Repli GPS (s)" => Some("POLL_GPS_FALLBACK_SECS"),
+        "Plafond vehicle_data / jour (0–100000)" => Some("FLEET_DATA_DAILY_CAP"),
+        "Plafond vehicle_data / mois (0–1000000)" => Some("FLEET_DATA_MONTHLY_CAP"),
+        "Sonde blocage Tesla (300–86400 s)" => Some("FLEET_BLOCKED_PROBE_SECS"),
+        "Fuseau" => Some("TESLA_TIMEZONE"),
+        "Prix du kWh" => Some("ENERGY_PRICE_PER_KWH"),
+        "Nominatim" => Some("NOMINATIM_ENABLED"),
+        "Nominatim URL" => Some("NOMINATIM_URL"),
+        "Nominatim intervalle (ms)" => Some("NOMINATIM_MIN_INTERVAL_MS"),
+        "MQTT" => Some("MQTT_ENABLED"),
+        "MQTT hôte" => Some("MQTT_HOST"),
+        "MQTT port" => Some("MQTT_PORT"),
+        "MQTT préfixe" => Some("MQTT_TOPIC_PREFIX"),
+        "Stream Owner" => Some("OWNER_STREAM_ENABLED"),
+        _ => None,
+    }
+}
+
+fn settings_override_form(csrf: &str) -> String {
+    maud::html! {
+        section class="card" {
+            h2 { "Modifier un réglage" }
+            p class="muted" {
+                "La valeur est appliquée tout de suite sans redémarrage. Un champ vide revient à l'environnement. Les secrets restent dans l'environnement."
+            }
+            form class="stack" method="post" action="/settings/override" {
+                input type="hidden" name="csrf" value=(csrf);
+                label class="field" for="setting-key" {
+                    "Réglage"
+                    select id="setting-key" name="key" {
+                        @for group in [
+                            crate::settings::SettingGroup::Polling,
+                            crate::settings::SettingGroup::Fleet,
+                            crate::settings::SettingGroup::Nominatim,
+                            crate::settings::SettingGroup::Mqtt,
+                            crate::settings::SettingGroup::Misc,
+                        ] {
+                            optgroup label=(group.label()) {
+                                @for entry in crate::settings::REGISTRY.iter().filter(|entry| entry.group == group) {
+                                    option value=(entry.key) { (entry.label) " — " (entry.key) }
+                                }
                             }
                         }
                     }
-                    label class="field" for="setting-value" { "Valeur" input id="setting-value" name="value"; }
-                    label class="field" for="setting-vehicle" { "Véhicule, vide pour tous" input id="setting-vehicle" name="vehicle_id"; }
-                    button type="submit" { "Enregistrer" }
                 }
+                label class="field" for="setting-value" { "Valeur" input id="setting-value" name="value"; }
+                label class="field" for="setting-vehicle" {
+                    "Véhicule (id), vide pour tous"
+                    input id="setting-vehicle" name="vehicle_id";
+                }
+                button type="submit" { "Enregistrer" }
             }
-        };
-        let extra = form.into_string();
-        body = body.replacen("</main>", &(extra + "</main>"), 1);
+        }
     }
-    html_page(body, page.cookie)
+    .into_string()
 }
 
 #[derive(Deserialize)]
@@ -896,11 +955,19 @@ async fn save_setting(
     let Some(principal) = ui_session(&app, &headers).await else {
         return Redirect::to("/").into_response();
     };
-    if !csrf_ok(&headers, &form.csrf) || !principal.is_admin() || !principal.sudo_active() {
-        return (StatusCode::FORBIDDEN, "sudo required").into_response();
+    if !csrf_ok(&headers, &form.csrf) || !principal.is_admin() {
+        return (StatusCode::FORBIDDEN, "admin required").into_response();
     }
     let vehicle = form.vehicle_id.trim().parse::<i64>().ok();
-    if let Err(err) = crate::settings::set(&app.inner.db, vehicle, &form.key, &form.value).await {
+    if let Err(err) = crate::settings::set_and_publish(
+        &app.inner.db,
+        Some(&app.inner.runtime),
+        vehicle,
+        &form.key,
+        &form.value,
+    )
+    .await
+    {
         return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
     }
     crate::identity::audit(
@@ -918,9 +985,11 @@ async fn system(State(app): State<AppState>, headers: HeaderMap) -> Response {
     let Some(page) = signed_page(&app, &headers).await else {
         return Redirect::to("/").into_response();
     };
-    let mut body = system_page(&chrome(&page, None, None, GlobalTab::System, false));
-    let extra = system_status(&app, &page.csrf, page.admin).await;
-    body = body.replacen("</main>", &(extra + "</main>"), 1);
+    let status = system_status(&app, &page.csrf, page.admin).await;
+    let body = system_page(
+        &chrome(&page, None, None, GlobalTab::System, false),
+        &status,
+    );
     html_page(body, page.cookie)
 }
 
@@ -1020,18 +1089,38 @@ async fn system_status(app: &AppState, csrf: &str, admin: bool) -> String {
         ));
     }
     text.push_str("<h2>Comptes Tesla</h2><ul class=\"list\">");
-    for (_id, label, status) in accounts {
-        let label = escape_html(&label);
-        let status = escape_html(&status);
-        text.push_str(&format!("<li><span>{label} · {status}</span></li>"));
+    for (id, label, status) in &accounts {
+        let label = escape_html(label);
+        let status = escape_html(status);
+        text.push_str(&format!("<li><span>{label} · {status}</span>"));
+        if admin {
+            let csrf = escape_html(csrf);
+            text.push_str(&format!(
+                "<form method=\"post\" action=\"/accounts/{id}/disconnect\" class=\"inline\">\
+                 <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+                 <button class=\"danger\" type=\"submit\">Déconnecter</button></form>"
+            ));
+        }
+        text.push_str("</li>");
     }
-    text.push_str("</ul><h2>Curseurs d'import</h2><ul class=\"list\">");
+    text.push_str("</ul>");
+    if admin {
+        let csrf = escape_html(csrf);
+        text.push_str(&format!(
+            "<form class=\"stack\" method=\"post\" action=\"/accounts\">\
+             <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+             <label class=\"field\">Libellé <input name=\"label\" required maxlength=\"80\"></label>\
+             <button type=\"submit\">Ajouter un compte Fleet</button>\
+             <p class=\"muted\">Nécessite sudo actif.</p></form>"
+        ));
+    }
+    text.push_str("<h2>Curseurs d'import</h2><ul class=\"list\">");
     for (source, cursor) in cursors {
         let source = escape_html(&source);
         text.push_str(&format!("<li><span>{source} · {cursor}</span></li>"));
     }
     text.push_str(
-        "</ul><p>Sauvegarde : envoi authentifié vers /system/backup (admin et sudo).</p></section>",
+        "</ul><p>Sauvegarde : <a href=\"/system/backup\">/system/backup</a> (admin et sudo).</p></section>",
     );
     text
 }
@@ -1157,7 +1246,7 @@ async fn add_account(
         .bind(label)
         .execute(&app.inner.db)
         .await;
-    Redirect::to("/settings").into_response()
+    Redirect::to("/system").into_response()
 }
 
 async fn disconnect_account(
@@ -1178,7 +1267,7 @@ async fn disconnect_account(
     .bind(id)
     .execute(&app.inner.db)
     .await;
-    Redirect::to("/settings").into_response()
+    Redirect::to("/system").into_response()
 }
 
 async fn security(State(app): State<AppState>, headers: HeaderMap) -> Response {
@@ -1539,14 +1628,28 @@ async fn revoke_token(
     Path(id): Path<i64>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    if ui_session(&app, &headers).await.is_none() || !csrf_ok(&headers, &form.csrf) {
+    let Some(session) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) {
         return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
+    }
+    if !session.is_admin() || !session.sudo_active() {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
     }
     let _ = sqlx::query(
         "UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
     )
     .bind(id)
     .execute(&app.inner.db)
+    .await;
+    crate::identity::audit(
+        &app.inner.db,
+        Some(session.user_id),
+        "token.revoke",
+        "ok",
+        &serde_json::json!({ "id": id }).to_string(),
+    )
     .await;
     Redirect::to("/security").into_response()
 }
@@ -1588,7 +1691,9 @@ fn login_page_response(app: &AppState, headers: &HeaderMap, error: Option<&str>)
 }
 
 pub(super) fn csrf_ok(headers: &HeaderMap, form: &str) -> bool {
-    cookie(headers, "tl_csrf").is_some_and(|cookie| cookie == form && !form.is_empty())
+    cookie(headers, "tl_csrf").is_some_and(|cookie| {
+        !form.is_empty() && crate::crypto::constant_time_eq(cookie.as_bytes(), form.as_bytes())
+    })
 }
 
 pub(super) fn secure_flag(app: &AppState) -> &'static str {

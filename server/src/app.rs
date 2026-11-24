@@ -35,6 +35,7 @@ pub(crate) struct AppState {
 
 pub(crate) struct Inner {
     pub config: Config,
+    pub runtime: crate::settings::RuntimeConfig,
     pub db: PgPool,
     pub session: Arc<Session<DbTokenStore>>,
     pub fleet_store: Arc<DbTokenStore>,
@@ -105,7 +106,7 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
     let mqtt_rx = shutdown_rx.clone();
     let mqtt_task = tokio::spawn(async move {
         mqtt::run(
-            &mqtt_state.inner.config,
+            mqtt_state.inner.runtime.clone(),
             mqtt_state.inner.db.clone(),
             mqtt_state.inner.events.subscribe(),
             mqtt_state.inner.debug.clone(),
@@ -165,6 +166,11 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
 
 pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, AppError> {
     let public_key_pem = read_public_key(&config.private_key_path)?;
+    if config.token_encryption_key.is_none() {
+        tracing::warn!(
+            "TESLA_TOKEN_ENCRYPTION_KEY is unset; Fleet and Owner tokens are stored in plaintext"
+        );
+    }
     let db = PgPoolOptions::new()
         .max_connections(10)
         .connect(&config.database_url)
@@ -204,20 +210,25 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
     owner_store.on_saved(std::sync::Arc::new(move |expires| {
         owner_saved.token_saved("owner", expires);
     }));
-    let geocoder = Geocoder::from_config(&config)?;
+    let boot = Arc::new(config);
+    let runtime = crate::settings::RuntimeConfig::load(db.clone(), Arc::clone(&boot)).await?;
+    let geocoder = Geocoder::from_runtime(runtime.subscribe(), &boot)?;
     let mut archive = Archive::new(db.clone(), geocoder, events.clone(), stream_kick, gps);
     archive.fleet_account_id = Some(imported.fleet_id);
     archive.owner_account_id = Some(imported.owner_id);
+    let snap = runtime.snapshot();
     archive.drive_grace = crate::state::DriveGrace::from_secs(
-        config.drive_end_grace.as_secs(),
-        config.drive_park_grace.as_secs(),
+        snap.drive_end_grace.as_secs(),
+        snap.drive_park_grace.as_secs(),
     );
+    archive.runtime = Some(runtime.clone());
     let archive = Arc::new(archive);
-    let car_renders = CarRenders::from_config(&config);
-    let basemap = Basemap::from_config(&config);
+    let car_renders = CarRenders::from_config(&boot);
+    let basemap = Basemap::from_config(&boot);
     Ok(AppState {
         inner: Arc::new(Inner {
-            config,
+            config: (*boot).clone(),
+            runtime,
             db,
             session,
             fleet_store,
@@ -382,9 +393,12 @@ async fn test_state_full(
         stream_kick,
         gps,
     ));
+    let boot = Arc::new(config);
+    let runtime = crate::settings::RuntimeConfig::from_boot(pool.clone(), Arc::clone(&boot));
     AppState {
         inner: Arc::new(Inner {
-            config,
+            config: (*boot).clone(),
+            runtime,
             db: pool,
             session,
             fleet_store,

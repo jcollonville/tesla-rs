@@ -258,13 +258,14 @@ async fn require_bearer(
     if !allowed {
         return Err(ApiError::Unauthorized);
     }
-    let vehicles = match record.user_id {
-        None => None,
-        Some(user_id) => {
+    let vehicles = match (record.user_id, record.vehicle_ids) {
+        (None, None) => None,
+        (None, Some(ids)) => Some(ids),
+        (Some(user_id), limit) => {
             let mut ids = crate::identity::accessible_vehicles(&app.inner.db, user_id)
                 .await
                 .map_err(|_| ApiError::Internal)?;
-            if let Some(limit) = record.vehicle_ids {
+            if let Some(limit) = limit {
                 ids.retain(|id| limit.contains(id));
             }
             Some(ids)
@@ -328,6 +329,17 @@ struct ApiGrant {
 
 pub(crate) fn api_user_id() -> Option<i64> {
     API_GRANT.try_with(|grant| grant.user_id).ok().flatten()
+}
+
+/// Vehicle ids the bearer token is limited to, or `None` when unrestricted.
+///
+/// Read this before a WebSocket upgrade: the task-local grant does not
+/// survive `on_upgrade`, so the socket handler needs the ids moved into it.
+pub(crate) fn api_vehicle_ids() -> Option<Vec<i64>> {
+    API_GRANT
+        .try_with(|grant| grant.vehicles.clone())
+        .ok()
+        .flatten()
 }
 
 pub(crate) fn vehicle_visible(id: i64) -> bool {

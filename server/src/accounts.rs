@@ -68,16 +68,15 @@ impl TokenPublic {
 struct StoreInner {
     pool: PgPool,
     account_id: i64,
-    key: Option<[u8; 32]>,
+    key: Option<crypto::EncryptionKey>,
     lock: Mutex<()>,
     saved: std::sync::Mutex<Option<TokenSaved>>,
 }
 
 impl Drop for StoreInner {
     fn drop(&mut self) {
-        if let Some(key) = self.key.as_mut() {
-            key.zeroize();
-        }
+        // EncryptionKey zeroizes itself on drop.
+        self.key.take();
     }
 }
 
@@ -97,7 +96,7 @@ impl DbTokenStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            Some(value) => Some(crypto::derive_key(value)?),
+            Some(value) => Some(crypto::derive_encryption_key(value)?),
             None => None,
         };
         Ok(Self {
@@ -173,7 +172,7 @@ impl TokenStore for DbTokenStore {
             return Ok(None);
         };
         let mut plaintext =
-            crypto::open_payload(&bytes, self.inner.key.as_ref()).map_err(|err| {
+            crypto::open_payload_with(&bytes, self.inner.key.as_ref()).map_err(|err| {
                 AuthError::TokenStore {
                     message: redact_line(&err, &[]),
                 }
@@ -192,7 +191,7 @@ impl TokenStore for DbTokenStore {
         let _guard = self.inner.lock.lock().await;
         let mut plaintext = crypto::tokens_to_json(tokens).map_err(store_msg)?;
         let sealed = match self.inner.key.as_ref() {
-            Some(key) => crypto::seal(key, &plaintext).map_err(store_msg)?,
+            Some(key) => crypto::seal(key.primary(), &plaintext).map_err(store_msg)?,
             None => plaintext.clone(),
         };
         plaintext.zeroize();
@@ -337,28 +336,20 @@ pub(crate) async fn clear_last_error(pool: &PgPool, account_id: i64) -> Result<(
     Ok(())
 }
 
-struct EncryptionKey(Option<[u8; 32]>);
+struct ImportKey(Option<crypto::EncryptionKey>);
 
-impl Drop for EncryptionKey {
-    fn drop(&mut self) {
-        if let Some(key) = self.0.as_mut() {
-            key.zeroize();
-        }
-    }
-}
-
-impl EncryptionKey {
-    fn as_ref(&self) -> Option<&[u8; 32]> {
+impl ImportKey {
+    fn as_ref(&self) -> Option<&crypto::EncryptionKey> {
         self.0.as_ref()
     }
 }
 
-fn encryption_key(material: Option<&str>) -> Result<EncryptionKey, AppError> {
+fn encryption_key(material: Option<&str>) -> Result<ImportKey, AppError> {
     let key = match material.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) => Some(crypto::derive_key(value)?),
+        Some(value) => Some(crypto::derive_encryption_key(value)?),
         None => None,
     };
-    Ok(EncryptionKey(key))
+    Ok(ImportKey(key))
 }
 
 #[derive(sqlx::FromRow)]
@@ -373,7 +364,7 @@ async fn import_one(
     kind: &str,
     label: &str,
     path: &Path,
-    key: Option<&[u8; 32]>,
+    key: Option<&crypto::EncryptionKey>,
 ) -> Result<i64, AppError> {
     let existing = sqlx::query_as::<_, ExistingAccount>(
         "SELECT id,
@@ -457,20 +448,23 @@ async fn record_import_error(
     Ok(())
 }
 
-fn normalize_token_bytes(bytes: &[u8], key: Option<&[u8; 32]>) -> Result<Vec<u8>, AppError> {
+fn normalize_token_bytes(
+    bytes: &[u8],
+    key: Option<&crypto::EncryptionKey>,
+) -> Result<Vec<u8>, AppError> {
     if bytes.starts_with(b"TLG1") {
-        let mut plaintext = crypto::open_payload(bytes, key).map_err(AppError::message)?;
+        let mut plaintext = crypto::open_payload_with(bytes, key).map_err(AppError::message)?;
         let parsed = crypto::tokens_from_json(&plaintext)?;
         drop(parsed);
         plaintext.zeroize();
         return Ok(bytes.to_vec());
     }
-    let mut plaintext = crypto::open_payload(bytes, key).map_err(AppError::message)?;
+    let mut plaintext = crypto::open_payload_with(bytes, key).map_err(AppError::message)?;
     let parsed = crypto::tokens_from_json(&plaintext)?;
     drop(parsed);
     let stored = match key {
         Some(key) => {
-            let sealed = crypto::seal(key, &plaintext).map_err(AppError::message)?;
+            let sealed = crypto::seal(key.primary(), &plaintext).map_err(AppError::message)?;
             plaintext.zeroize();
             sealed
         }

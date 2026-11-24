@@ -431,6 +431,175 @@ fn row_by_id(rows: &[serde_json::Value], id: i64) -> &serde_json::Value {
         .unwrap_or_else(|| panic!("missing id {id} in {rows:?}"))
 }
 
+async fn api_status(state: &crate::app::AppState, uri: &str, token: &str) -> (u16, String) {
+    let response = router(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn a_vehicle_scoped_token_sees_only_its_charges() {
+    let Some(db) = TestDb::migrated("charge-scope").await else {
+        return;
+    };
+    let state = test_state(db.pool.clone()).await;
+    let allowed_vehicle: i64 = sqlx::query_scalar(
+        "INSERT INTO vehicles (vin, name) VALUES ('5YJ300000SCOPE001', 'Mine') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let other_vehicle: i64 = sqlx::query_scalar(
+        "INSERT INTO vehicles (vin, name) VALUES ('5YJ300000SCOPE002', 'Theirs') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let allowed_charge: i64 = sqlx::query_scalar(
+        "INSERT INTO charges (vehicle_id, start_at, end_at, energy_added_kwh, source)
+         VALUES ($1, '2024-07-01T11:00:00Z', '2024-07-01T11:30:00Z', 4.0, 'poll')
+         RETURNING id",
+    )
+    .bind(allowed_vehicle)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let other_charge: i64 = sqlx::query_scalar(
+        "INSERT INTO charges (vehicle_id, start_at, end_at, energy_added_kwh, source)
+         VALUES ($1, '2024-07-02T11:00:00Z', '2024-07-02T11:30:00Z', 5.0, 'poll')
+         RETURNING id",
+    )
+    .bind(other_vehicle)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let token = "tl_scope-token";
+    sqlx::query("INSERT INTO api_tokens (name, token_hash, vehicle_ids) VALUES ('scope', $1, $2)")
+        .bind(sha256_hex(token))
+        .bind([allowed_vehicle])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = api_status(&state, "/api/v1/charges", token).await;
+    assert_eq!(status, 200, "{body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let ids: Vec<i64> = parsed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["id"].as_i64())
+        .collect();
+    assert_eq!(ids, [allowed_charge]);
+
+    let (status, _) = api_status(
+        &state,
+        &format!("/api/v1/charges?vehicle_id={other_vehicle}"),
+        token,
+    )
+    .await;
+    assert_eq!(status, 404);
+    let (status, _) = api_status(
+        &state,
+        &format!("/api/v1/charges?vehicle_id={allowed_vehicle}"),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = api_status(&state, &format!("/api/v1/charges/{other_charge}"), token).await;
+    assert_eq!(status, 404);
+    let (status, body) =
+        api_status(&state, &format!("/api/v1/charges/{allowed_charge}"), token).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"samples\""));
+}
+
+#[tokio::test]
+async fn a_vehicle_scoped_token_filters_the_websocket() {
+    use futures_util::StreamExt;
+
+    let Some(db) = TestDb::migrated("ws-scope").await else {
+        return;
+    };
+    let state = test_state(db.pool.clone()).await;
+    let allowed_vehicle: i64 = sqlx::query_scalar(
+        "INSERT INTO vehicles (vin, name) VALUES ('5YJ3000000WSCOPE1', 'Mine') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let other_vehicle: i64 = sqlx::query_scalar(
+        "INSERT INTO vehicles (vin, name) VALUES ('5YJ3000000WSCOPE2', 'Theirs') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let token = "tl_ws-scope-token";
+    sqlx::query("INSERT INTO api_tokens (name, token_hash, vehicle_ids) VALUES ('scope', $1, $2)")
+        .bind(sha256_hex(token))
+        .bind([allowed_vehicle])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let events = state.inner.events.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(state).into_make_service())
+            .await
+            .unwrap();
+    });
+    let url = format!("ws://{addr}/api/v1/ws?access_token={token}");
+    let (mut socket, response) = tokio_tungstenite::connect_async(url).await.unwrap();
+    assert_eq!(response.status().as_u16(), 101);
+
+    // Only the allowed vehicle's snapshot frame arrives.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let frame: serde_json::Value =
+        serde_json::from_str(first.into_text().unwrap().as_str()).unwrap();
+    assert_eq!(frame["vehicle_id"].as_i64(), Some(allowed_vehicle));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), socket.next())
+            .await
+            .is_err(),
+        "the other vehicle must not be announced"
+    );
+
+    // Live events for other vehicles are dropped, ours go through.
+    let mut hidden = crate::persist::LiveEvent::skeleton("5YJ3000000WSCOPE2", "online");
+    hidden.vehicle_id = other_vehicle;
+    events.send(hidden).unwrap();
+    let mut visible = crate::persist::LiveEvent::skeleton("5YJ3000000WSCOPE1", "online");
+    visible.vehicle_id = allowed_vehicle;
+    events.send(visible).unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let frame: serde_json::Value =
+        serde_json::from_str(event.into_text().unwrap().as_str()).unwrap();
+    assert_eq!(frame["vehicle_id"].as_i64(), Some(allowed_vehicle));
+
+    drop(socket);
+    server.abort();
+}
+
 #[tokio::test]
 async fn drive_and_charge_name_joins_use_primary_keys() {
     let Some(db) = TestDb::migrated("addrplan").await else {
