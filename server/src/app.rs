@@ -299,6 +299,7 @@ fn policy_from(config: &Config) -> PollPolicy {
         dynamic_budget: config.fleet_dynamic_budget,
         month_seed: config.fleet_month_seed,
         month_seed_month: config.fleet_month_seed_month,
+        now: None,
     }
 }
 

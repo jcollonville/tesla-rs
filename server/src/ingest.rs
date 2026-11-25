@@ -72,6 +72,12 @@ pub(crate) struct PollPolicy {
     pub dynamic_budget: bool,
     pub month_seed: u64,
     pub month_seed_month: Option<chrono::NaiveDate>,
+    /// Budget clock. Production leaves this unset and uses the wall clock.
+    pub now: Option<DateTime<Utc>>,
+}
+
+fn policy_now(policy: &PollPolicy) -> DateTime<Utc> {
+    policy.now.unwrap_or_else(Utc::now)
 }
 
 /// Facts the next cycle needs. Grace and Hold keep [`Activity::Driving`] without
@@ -1200,7 +1206,7 @@ async fn run_cycle(
     {
         return Ok(CycleControl::Pause(wait));
     }
-    let now_utc = Utc::now();
+    let now_utc = policy_now(policy);
     let gate = crate::budget::gate(&archive.db, budget_query(policy, now_utc)).await;
     if let Some(wait) = gate.list_wait(now_utc) {
         return Ok(CycleControl::Wait(wait));
@@ -1254,11 +1260,11 @@ async fn run_cycle(
             .find(|summary| summary.presence == Presence::Online)
             .cloned();
         if gate.cap_reached() || online.is_none() {
-            let _ = crate::budget::reschedule_probe(&archive.db, Utc::now(), policy.blocked_probe)
-                .await;
+            let _ =
+                crate::budget::reschedule_probe(&archive.db, now_utc, policy.blocked_probe).await;
         } else if let Some(summary) = online {
             let control = handle_summary(source, archive, policy, &summary, true).await?;
-            let still = crate::budget::gate(&archive.db, budget_query(policy, Utc::now()))
+            let still = crate::budget::gate(&archive.db, budget_query(policy, now_utc))
                 .await
                 .block
                 .is_some();
@@ -1450,7 +1456,7 @@ async fn handle_summary(
     )
     .await?;
     let slot = ensure_runtime(archive, &summary.vin, vehicle_id).await?;
-    let now_utc = Utc::now();
+    let now_utc = policy_now(policy);
     let (activity, telemetry_fresh, parked_live_polls, movement_recent, snap, open_drive_id) = {
         let runtime = slot.lock().await;
         (
@@ -1687,6 +1693,7 @@ mod tests {
             dynamic_budget: true,
             month_seed: 0,
             month_seed_month: None,
+            now: None,
         }
     }
 
@@ -2562,23 +2569,32 @@ mod tests {
             .respond_with(ResponseTemplate::new(403).set_body_string(EXCEEDED_LIMIT_BODY))
             .mount(&server)
             .await;
+        // Mid-month so the dynamic share does not depend on which day CI runs.
+        // A full configured day is always at or over the effective cap, because
+        // that cap is never higher than the configured one.
+        let now = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 6, 15, 12, 0, 0)
+            .single()
+            .expect("date");
+        let mut plan = policy();
+        plan.now = Some(now);
+        plan.daily_cap = 160;
+        plan.monthly_cap = 5_000;
+        plan.dynamic_budget = true;
+        plan.blocked_probe = Duration::from_secs(3_600);
         sqlx::query(
             "INSERT INTO fleet_usage (day, endpoint, status, count)
-             VALUES ($1, 'vehicle_data', 200, 150)",
+             VALUES ($1, 'vehicle_data', 200, $2)",
         )
-        .bind(chrono::Utc::now().date_naive())
+        .bind(now.date_naive())
+        .bind(i64::try_from(plan.daily_cap).unwrap_or(i64::MAX))
         .execute(&db.pool)
         .await
         .unwrap();
-        crate::budget::enter_block(
-            &db.pool,
-            chrono::Utc::now(),
-            Duration::from_secs(3_600),
-            false,
-        )
-        .await
-        .unwrap();
-        sqlx::query("UPDATE fleet_control SET next_probe_at = now() - interval '1 second'")
+        crate::budget::enter_block(&db.pool, now, plan.blocked_probe, false)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE fleet_control SET next_probe_at = $1")
+            .bind(now - chrono::Duration::seconds(1))
             .execute(&db.pool)
             .await
             .unwrap();
@@ -2588,20 +2604,17 @@ mod tests {
             .unwrap();
         let source = FleetPoll::new(client);
         let archive = fleet_archive(db.pool.clone());
-        let _ = super::run_cycle(&source, &archive, &policy(), None)
+        let _ = super::run_cycle(&source, &archive, &plan, None)
             .await
             .expect("capped probe");
         let requests = server.received_requests().await.unwrap();
         assert_eq!(count_paths(&requests, "/vehicles"), 1);
         assert_eq!(count_paths(&requests, "/vehicle_data"), 0);
-        let gate = crate::budget::gate(
-            &db.pool,
-            crate::budget::BudgetQuery::caps(160, 5_000, chrono::Utc::now()),
-        )
-        .await;
+        let gate = crate::budget::gate(&db.pool, super::budget_query(&plan, now)).await;
         let block = gate.block.expect("still blocked");
-        assert!(block.next_probe > chrono::Utc::now());
-        let _ = super::run_cycle(&source, &archive, &policy(), None)
+        assert!(block.next_probe > now);
+        assert!(gate.cap_reached());
+        let _ = super::run_cycle(&source, &archive, &plan, None)
             .await
             .expect("not due");
         assert_eq!(
