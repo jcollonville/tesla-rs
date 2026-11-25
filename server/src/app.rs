@@ -148,7 +148,8 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
         }
     });
     let listener = TcpListener::bind(listen).await?;
-    tracing::info!(%listen, "listening");
+    let data_source = state.inner.archive.data_source();
+    tracing::info!(data_source, %listen, "fleet data source");
     axum::serve(listener, http::router(state))
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
@@ -222,6 +223,36 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
         snap.drive_park_grace.as_secs(),
     );
     archive.runtime = Some(runtime.clone());
+    if boot.telemetry_configured() {
+        match boot
+            .telemetry_cert_path
+            .as_ref()
+            .map(std::fs::read_to_string)
+        {
+            Some(Ok(ca)) if !ca.trim().is_empty() => {
+                archive.telemetry = Some(crate::ingest::TelemetryTarget::new(
+                    boot.telemetry_hostname.clone(),
+                    boot.telemetry_port,
+                    ca,
+                ));
+                tracing::info!(
+                    host = %boot.telemetry_hostname,
+                    port = boot.telemetry_port,
+                    data_source = "telemetry",
+                    "fleet telemetry is the data source"
+                );
+            }
+            Some(Ok(_)) => {
+                tracing::error!("telemetry certificate is empty; staying on polling");
+            }
+            Some(Err(err)) => {
+                tracing::error!(error = %err, "telemetry certificate could not be read; staying on polling");
+            }
+            None => {}
+        }
+    } else {
+        tracing::info!(data_source = "polling", "fleet polling is the data source");
+    }
     let archive = Arc::new(archive);
     let car_renders = CarRenders::from_config(&boot);
     let basemap = Basemap::from_config(&boot);
@@ -263,6 +294,12 @@ fn policy_from(config: &Config) -> PollPolicy {
         daily_cap: config.fleet_daily_cap,
         monthly_cap: config.fleet_monthly_cap,
         blocked_probe: config.fleet_blocked_probe,
+        telemetry_fallback: config.telemetry_fallback,
+        telemetry_mode: config.telemetry_configured(),
+        dynamic_budget: config.fleet_dynamic_budget,
+        month_seed: config.fleet_month_seed,
+        month_seed_month: config.fleet_month_seed_month,
+        now: None,
     }
 }
 

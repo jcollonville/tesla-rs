@@ -100,7 +100,7 @@ pub(crate) const REGISTRY: &[SettingSpec] = &[
         group: SettingGroup::Polling,
         label: "Poll endormi",
         kind: ValueKind::U64 {
-            min: 60,
+            min: crate::budget::IDLE_MIN_SECS,
             max: 86_400,
         },
         mode: ReloadMode::Hot,
@@ -108,9 +108,9 @@ pub(crate) const REGISTRY: &[SettingSpec] = &[
     SettingSpec {
         key: "POLL_BACKOFF_SECS",
         group: SettingGroup::Polling,
-        label: "Poll repli",
+        label: "Repli au repos",
         kind: ValueKind::U64 {
-            min: 60,
+            min: crate::budget::IDLE_MIN_SECS,
             max: 86_400,
         },
         mode: ReloadMode::Hot,
@@ -170,6 +170,40 @@ pub(crate) const REGISTRY: &[SettingSpec] = &[
             min: crate::budget::MONTHLY_CAP_MIN,
             max: crate::budget::MONTHLY_CAP_MAX,
         },
+        mode: ReloadMode::Hot,
+    },
+    SettingSpec {
+        key: "POLL_TELEMETRY_FALLBACK_SECS",
+        group: SettingGroup::Polling,
+        label: "Repli télémétrie",
+        kind: ValueKind::U64 {
+            min: crate::budget::TELEMETRY_FALLBACK_MIN_SECS,
+            max: crate::budget::TELEMETRY_FALLBACK_MAX_SECS,
+        },
+        mode: ReloadMode::Hot,
+    },
+    SettingSpec {
+        key: "FLEET_DATA_DYNAMIC_BUDGET",
+        group: SettingGroup::Fleet,
+        label: "Budget journalier dynamique",
+        kind: ValueKind::Bool,
+        mode: ReloadMode::Hot,
+    },
+    SettingSpec {
+        key: "FLEET_DATA_MONTH_SEED",
+        group: SettingGroup::Fleet,
+        label: "Amorce du mois",
+        kind: ValueKind::U64 {
+            min: 0,
+            max: crate::budget::MONTH_SEED_MAX,
+        },
+        mode: ReloadMode::Hot,
+    },
+    SettingSpec {
+        key: "FLEET_DATA_MONTH_SEED_MONTH",
+        group: SettingGroup::Fleet,
+        label: "Mois de l'amorce",
+        kind: ValueKind::Text,
         mode: ReloadMode::Hot,
     },
     SettingSpec {
@@ -282,7 +316,11 @@ pub(crate) const KEYS: &[&str] = &[
     "DRIVE_PARK_GRACE_SECS",
     "FLEET_DATA_DAILY_CAP",
     "FLEET_DATA_MONTHLY_CAP",
+    "FLEET_DATA_DYNAMIC_BUDGET",
+    "FLEET_DATA_MONTH_SEED",
+    "FLEET_DATA_MONTH_SEED_MONTH",
     "FLEET_BLOCKED_PROBE_SECS",
+    "POLL_TELEMETRY_FALLBACK_SECS",
     "NOMINATIM_ENABLED",
     "NOMINATIM_URL",
     "NOMINATIM_MIN_INTERVAL_MS",
@@ -317,6 +355,10 @@ pub(crate) struct RuntimeSnapshot {
     pub daily_cap: u64,
     pub monthly_cap: u64,
     pub blocked_probe: Duration,
+    pub telemetry_fallback: Duration,
+    pub dynamic_budget: bool,
+    pub month_seed: u64,
+    pub month_seed_month: Option<chrono::NaiveDate>,
     pub nominatim_enabled: bool,
     pub nominatim_url: String,
     pub nominatim_min_interval: Duration,
@@ -348,6 +390,10 @@ impl RuntimeSnapshot {
             daily_cap: config.fleet_daily_cap,
             monthly_cap: config.fleet_monthly_cap,
             blocked_probe: config.fleet_blocked_probe,
+            telemetry_fallback: config.telemetry_fallback,
+            dynamic_budget: config.fleet_dynamic_budget,
+            month_seed: config.fleet_month_seed,
+            month_seed_month: config.fleet_month_seed_month,
             nominatim_enabled: config.nominatim_enabled,
             nominatim_url: config.nominatim_url.clone(),
             nominatim_min_interval: config.nominatim_min_interval,
@@ -390,12 +436,12 @@ impl RuntimeSnapshot {
                 }
             }
             "POLL_ASLEEP_SECS" => {
-                if let Some(secs) = parse_bounded_u64(value, 60, 86_400) {
+                if let Some(secs) = parse_bounded_u64(value, crate::budget::IDLE_MIN_SECS, 86_400) {
                     self.asleep = Duration::from_secs(secs);
                 }
             }
             "POLL_BACKOFF_SECS" => {
-                if let Some(secs) = parse_bounded_u64(value, 60, 86_400) {
+                if let Some(secs) = parse_bounded_u64(value, crate::budget::IDLE_MIN_SECS, 86_400) {
                     self.backoff = Duration::from_secs(secs);
                 }
             }
@@ -453,6 +499,28 @@ impl RuntimeSnapshot {
                 ) {
                     self.blocked_probe = Duration::from_secs(secs);
                 }
+            }
+            "POLL_TELEMETRY_FALLBACK_SECS" => {
+                if let Some(secs) = parse_bounded_u64(
+                    value,
+                    crate::budget::TELEMETRY_FALLBACK_MIN_SECS,
+                    crate::budget::TELEMETRY_FALLBACK_MAX_SECS,
+                ) {
+                    self.telemetry_fallback = Duration::from_secs(secs);
+                }
+            }
+            "FLEET_DATA_DYNAMIC_BUDGET" => {
+                if let Some(flag) = parse_bool(value) {
+                    self.dynamic_budget = flag;
+                }
+            }
+            "FLEET_DATA_MONTH_SEED" => {
+                if let Some(seed) = parse_bounded_u64(value, 0, crate::budget::MONTH_SEED_MAX) {
+                    self.month_seed = seed;
+                }
+            }
+            "FLEET_DATA_MONTH_SEED_MONTH" => {
+                self.month_seed_month = crate::budget::parse_seed_month(value);
             }
             "NOMINATIM_ENABLED" => {
                 if let Some(flag) = parse_bool(value) {

@@ -346,6 +346,26 @@ pub(super) async fn car_card(app: &AppState, id: i64) -> CarCard {
     {
         facts.push(("Logiciel", version.clone()));
     }
+    let fresh = {
+        let blocked = crate::budget::gate(&app.inner.db, super::api::budget_query(app, now))
+            .await
+            .blocks_vehicle_data();
+        !blocked || super::api::telemetry_fresh(&app.inner.archive, id).await
+    };
+    let cable =
+        crate::state::publish_charge(state.charging_state.as_deref(), state.plugged_in, fresh);
+    if cable.stale {
+        facts.push(("Charge", "Inconnue".to_owned()));
+    }
+    facts.push((
+        "Données",
+        if app.inner.archive.data_source() == "telemetry" {
+            "Télémétrie"
+        } else {
+            "Interrogation"
+        }
+        .to_owned(),
+    ));
     let seen = state.last_data_at.or(state.last_poll_at);
     let trim = state
         .marketing_name

@@ -88,7 +88,12 @@ pub(crate) async fn vehicle_state(
         .await
         .map_err(internal)?
         .unwrap_or_else(|| StateJson::offline(id));
-    annotate_charge_status(&mut row);
+    let fresh = charge_reading_fresh(&app, id).await;
+    annotate_charge_status(&mut row, fresh);
+    app.inner
+        .archive
+        .data_source()
+        .clone_into(&mut row.data_source);
     let snapshot = app.inner.stream_board.snapshot().await;
     let (status, error) = snapshot.for_vehicle(id);
     row.stream_status = status;
@@ -100,27 +105,27 @@ pub(crate) async fn vehicle_state(
 pub(crate) async fn fleet_usage(
     State(app): State<AppState>,
 ) -> Result<Json<FleetUsageJson>, ApiError> {
-    let daily = crate::settings::bounded_u64(
-        &app.inner.db,
-        "FLEET_DATA_DAILY_CAP",
-        app.inner.config.fleet_daily_cap,
-        crate::budget::DAILY_CAP_MIN,
-        crate::budget::DAILY_CAP_MAX,
-    )
-    .await;
-    let mut monthly = crate::settings::bounded_u64(
-        &app.inner.db,
-        "FLEET_DATA_MONTHLY_CAP",
-        app.inner.config.fleet_monthly_cap,
-        crate::budget::MONTHLY_CAP_MIN,
-        crate::budget::MONTHLY_CAP_MAX,
-    )
-    .await;
-    if monthly < daily {
-        monthly = daily;
+    let gate = crate::budget::gate(&app.inner.db, budget_query(&app, Utc::now())).await;
+    let mut body = FleetUsageJson::from_gate(&gate);
+    app.inner
+        .archive
+        .data_source()
+        .clone_into(&mut body.data_source);
+    Ok(Json(body))
+}
+
+pub(super) fn budget_query(app: &AppState, now: DateTime<Utc>) -> crate::budget::BudgetQuery {
+    let snap = app.inner.runtime.snapshot();
+    let daily = snap.daily_cap;
+    let monthly = snap.monthly_cap.max(daily);
+    crate::budget::BudgetQuery {
+        daily_cap: daily,
+        monthly_cap: monthly,
+        now,
+        dynamic: snap.dynamic_budget,
+        seed_calls: snap.month_seed,
+        seed_month: snap.month_seed_month,
     }
-    let gate = crate::budget::gate(&app.inner.db, daily, monthly, Utc::now()).await;
-    Ok(Json(FleetUsageJson::from_gate(&gate)))
 }
 
 #[derive(Serialize)]
@@ -138,6 +143,12 @@ pub(crate) struct FleetUsageJson {
     pub blocked_since: Option<DateTime<Utc>>,
     pub next_probe_at: Option<DateTime<Utc>>,
     pub probe_with_list: bool,
+    pub effective_daily_cap: i64,
+    pub dynamic_budget: bool,
+    pub month_seed: i64,
+    /// `polling` or `telemetry`.
+    #[serde(default)]
+    pub data_source: String,
 }
 
 impl FleetUsageJson {
@@ -157,6 +168,10 @@ impl FleetUsageJson {
             blocked_since: gate.block.map(|block| block.since),
             next_probe_at: gate.block.map(|block| block.next_probe),
             probe_with_list: gate.block.is_some_and(|block| block.probe_list),
+            effective_daily_cap: gate.effective_daily_cap,
+            dynamic_budget: gate.dynamic,
+            month_seed: gate.seed_calls,
+            data_source: "polling".to_owned(),
         }
     }
 }
@@ -412,20 +427,44 @@ pub(crate) async fn ws(
 ) -> impl IntoResponse {
     let allowed = super::api_vehicle_ids();
     let events = app.inner.events.subscribe();
-    let db = app.inner.db.clone();
-    let board = app.inner.stream_board.clone();
-    let gps = app.inner.archive.gps.clone();
-    upgrade.on_upgrade(move |socket| handle_socket(socket, db, events, board, gps, allowed))
+    let live = LiveSocket {
+        db: app.inner.db.clone(),
+        board: app.inner.stream_board.clone(),
+        gps: app.inner.archive.gps.clone(),
+        archive: std::sync::Arc::clone(&app.inner.archive),
+        data_source: app.inner.archive.data_source().to_owned(),
+        budget_blocked: crate::budget::gate(&app.inner.db, budget_query(&app, Utc::now()))
+            .await
+            .blocks_vehicle_data(),
+        allowed,
+    };
+    upgrade.on_upgrade(move |socket| handle_socket(socket, events, live))
+}
+
+struct LiveSocket {
+    db: sqlx::PgPool,
+    board: crate::owner_stream::StreamBoard,
+    gps: crate::position_mode::GpsBoard,
+    archive: std::sync::Arc<crate::ingest::Archive>,
+    data_source: String,
+    budget_blocked: bool,
+    allowed: Option<Vec<i64>>,
 }
 
 async fn handle_socket(
     mut socket: WebSocket,
-    db: sqlx::PgPool,
     mut events: tokio::sync::broadcast::Receiver<crate::persist::LiveEvent>,
-    board: crate::owner_stream::StreamBoard,
-    gps: crate::position_mode::GpsBoard,
-    allowed: Option<Vec<i64>>,
+    live: LiveSocket,
 ) {
+    let LiveSocket {
+        db,
+        board,
+        gps,
+        archive,
+        data_source,
+        budget_blocked,
+        allowed,
+    } = live;
     let snapshot = format!(
         "SELECT v.vin, v.name, v.model, v.id AS vehicle_id,
                 COALESCE(s.activity, 'offline') AS activity, {prefixed}
@@ -444,7 +483,9 @@ async fn handle_socket(
         for mut row in rows {
             let snapshot = board.snapshot().await;
             let (status, error) = snapshot.for_vehicle(row.state.vehicle_id);
-            annotate_charge_status(&mut row.state);
+            let fresh = !budget_blocked || telemetry_fresh(&archive, row.state.vehicle_id).await;
+            annotate_charge_status(&mut row.state, fresh);
+            row.state.data_source.clone_from(&data_source);
             row.state.stream_status = status;
             row.state.stream_error = error;
             row.state.position_mode = gps.mode_name(row.state.vehicle_id).await;
@@ -781,10 +822,18 @@ pub(crate) struct StateJson {
     pub scheduled_departure_time: Option<i32>,
     pub off_peak_charging_enabled: Option<bool>,
     pub off_peak_hours_end_time: Option<i32>,
-    /// `charging`, `plugged`, or `unplugged`. Not a column: filled after the query.
+    /// `charging`, `plugged`, `unplugged`, or `unknown`. Not a column.
     #[sqlx(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub charge_status: Option<String>,
+    /// True when `charge_status` is not a fresh cable reading.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub charge_status_stale: bool,
+    /// `polling` or `telemetry`.
+    #[sqlx(default)]
+    #[serde(default = "default_data_source")]
+    pub data_source: String,
     pub tpms_pressure_fl: Option<f64>,
     pub tpms_pressure_fr: Option<f64>,
     pub tpms_pressure_rl: Option<f64>,
@@ -816,10 +865,45 @@ pub(crate) struct StateJson {
     pub position_mode: String,
 }
 
-fn annotate_charge_status(state: &mut StateJson) {
-    state.charge_status =
-        crate::state::cable_status(state.charging_state.as_deref(), state.plugged_in)
-            .map(|status| status.as_str().to_owned());
+fn annotate_charge_status(state: &mut StateJson, reading_fresh: bool) {
+    let published = crate::state::publish_charge(
+        state.charging_state.as_deref(),
+        state.plugged_in,
+        reading_fresh,
+    );
+    state.charge_status = published.status.map(|status| status.as_str().to_owned());
+    state.charge_status_stale = published.stale;
+}
+
+fn default_data_source() -> String {
+    "polling".to_owned()
+}
+
+async fn charge_reading_fresh(app: &AppState, vehicle_id: i64) -> bool {
+    let blocked = crate::budget::gate(&app.inner.db, budget_query(app, Utc::now()))
+        .await
+        .blocks_vehicle_data();
+    !blocked || telemetry_fresh(&app.inner.archive, vehicle_id).await
+}
+
+pub(super) async fn telemetry_fresh(archive: &crate::ingest::Archive, vehicle_id: i64) -> bool {
+    let vin: Option<String> = sqlx::query_scalar("SELECT vin FROM vehicles WHERE id = $1")
+        .bind(vehicle_id)
+        .fetch_optional(&archive.db)
+        .await
+        .ok()
+        .flatten();
+    let Some(vin) = vin else {
+        return false;
+    };
+    let slots = archive.runtimes.lock().await;
+    let Some(slot) = slots.get(&vin) else {
+        return false;
+    };
+    let runtime = slot.lock().await;
+    runtime
+        .last_telemetry
+        .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(900))
 }
 
 fn default_stream_status() -> String {
@@ -876,6 +960,8 @@ impl StateJson {
             off_peak_charging_enabled: None,
             off_peak_hours_end_time: None,
             charge_status: None,
+            charge_status_stale: false,
+            data_source: default_data_source(),
             tpms_pressure_fl: None,
             tpms_pressure_fr: None,
             tpms_pressure_rl: None,

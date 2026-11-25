@@ -6,6 +6,15 @@
 //! [`IngestSource`] is the plug-in used by the poller. Fleet Telemetry does not
 //! poll: [`crate::telemetry`] pushes decoded records through [`apply_for_vin`],
 //! which is the same archive path. Neither path calls `wake_up`.
+//!
+//! A live `vehicle_data` call resets the car's sleep timer. Tesla's vehicle
+//! endpoint page describes that route as a live call to the vehicle, including
+//! when `endpoints` selects a subset, so the subset is still billed and can
+//! wake the car. `vehicle_data_cached` does not wake the car, but the billing
+//! page counts every response below HTTP 500 and does not list that route as
+//! free, so the idle path does not use it. Idle presence checks are
+//! `GET /api/1/vehicles` (the list) and, only immediately before a live read,
+//! `GET /api/1/vehicles/{id}`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,6 +65,19 @@ pub(crate) struct PollPolicy {
     pub monthly_cap: u64,
     /// How long to wait between probes while Tesla billing is blocked.
     pub blocked_probe: Duration,
+    /// Billable read when Fleet Telemetry is the source but has gone quiet.
+    pub telemetry_fallback: Duration,
+    /// When set, charge and parked polls do not call `vehicle_data`.
+    pub telemetry_mode: bool,
+    pub dynamic_budget: bool,
+    pub month_seed: u64,
+    pub month_seed_month: Option<chrono::NaiveDate>,
+    /// Budget clock. Production leaves this unset and uses the wall clock.
+    pub now: Option<DateTime<Utc>>,
+}
+
+fn policy_now(policy: &PollPolicy) -> DateTime<Utc> {
+    policy.now.unwrap_or_else(Utc::now)
 }
 
 /// Facts the next cycle needs. Grace and Hold keep [`Activity::Driving`] without
@@ -97,6 +119,20 @@ pub(crate) fn poll_plan(facts: &PollFacts, policy: &PollPolicy) -> PollPlan {
             wait: policy.asleep,
         };
     }
+    // Configured telemetry replaces polling. A stale stream still pays for one
+    // rare `vehicle_data` read; that read is counted by the caller.
+    if policy.telemetry_mode {
+        if facts.telemetry_fresh {
+            return PollPlan {
+                observe: false,
+                wait: policy.backoff,
+            };
+        }
+        return PollPlan {
+            observe: true,
+            wait: policy.telemetry_fallback,
+        };
+    }
     if facts.telemetry_fresh {
         return PollPlan {
             observe: false,
@@ -125,24 +161,44 @@ pub(crate) fn poll_plan(facts: &PollFacts, policy: &PollPolicy) -> PollPlan {
         };
     }
     if facts.activity == Activity::Updating {
-        return PollPlan {
-            observe: true,
-            wait: policy.parked,
-        };
+        return parked_plan(facts.parked_live_polls, policy);
     }
     parked_plan(facts.parked_live_polls, policy)
 }
 
+/// Keep the parked snapshot counter while the car stays online and idle.
+///
+/// Resetting it on the idle cycle is what made the poller take another
+/// `vehicle_data` pair after every backoff and stop the car from sleeping.
+pub(crate) fn keep_parked_snapshot_count(presence: Presence, activity: Activity) -> bool {
+    presence == Presence::Online && !matches!(activity, Activity::Driving | Activity::Charging)
+}
+
+fn budget_query(policy: &PollPolicy, now: DateTime<Utc>) -> crate::budget::BudgetQuery {
+    crate::budget::BudgetQuery {
+        daily_cap: policy.daily_cap,
+        monthly_cap: policy.monthly_cap,
+        now,
+        dynamic: policy.dynamic_budget,
+        seed_calls: policy.month_seed,
+        seed_month: policy.month_seed_month,
+    }
+}
+
 fn parked_plan(parked_live_polls: u32, policy: &PollPolicy) -> PollPlan {
+    // Space the allowed snapshot and every later presence check by the idle
+    // backoff. `POLL_PARKED_SECS` is not this gap: a short gap would call
+    // `vehicle_data` again and reset the sleep timer.
+    let wait = policy.backoff;
     if parked_live_polls < policy.parked_live_limit {
         PollPlan {
             observe: true,
-            wait: policy.parked,
+            wait,
         }
     } else {
         PollPlan {
             observe: false,
-            wait: policy.backoff,
+            wait,
         }
     }
 }
@@ -204,6 +260,18 @@ pub(crate) trait IngestSource: Send + Sync {
 
     /// Live data when the vehicle is already online, otherwise a resting presence.
     fn observe(&self, vin: &str) -> impl Future<Output = Result<ObserveResult, AppError>> + Send;
+
+    /// Push a Fleet Telemetry config. The default does nothing.
+    fn configure_telemetry(
+        &self,
+        vins: &[String],
+        host: &str,
+        port: u16,
+        ca_pem: &str,
+    ) -> impl Future<Output = Result<(), AppError>> + Send {
+        let _ = (vins, host, port, ca_pem);
+        std::future::ready(Ok(()))
+    }
 }
 
 /// List-endpoint summary.
@@ -274,6 +342,37 @@ pub(crate) struct Archive {
     pub drive_grace: crate::state::DriveGrace,
     /// Hot-reloadable settings. Absent in unit tests that construct an archive alone.
     pub runtime: Option<crate::settings::RuntimeConfig>,
+    /// Set when Fleet Telemetry should be subscribed on the cars.
+    pub telemetry: Option<TelemetryTarget>,
+}
+
+impl Archive {
+    pub(crate) fn data_source(&self) -> &'static str {
+        if self.telemetry.is_some() {
+            "telemetry"
+        } else {
+            "polling"
+        }
+    }
+}
+
+/// Where the car should send Fleet Telemetry, plus the VINs already configured.
+pub(crate) struct TelemetryTarget {
+    pub host: String,
+    pub port: u16,
+    pub ca: String,
+    pushed: Mutex<std::collections::HashSet<String>>,
+}
+
+impl TelemetryTarget {
+    pub(crate) fn new(host: String, port: u16, ca: String) -> Self {
+        Self {
+            host,
+            port,
+            ca,
+            pushed: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
 }
 
 impl Archive {
@@ -298,6 +397,7 @@ impl Archive {
             fences: crate::persist::FenceCache::default(),
             drive_grace: crate::state::DriveGrace::standard(),
             runtime: None,
+            telemetry: None,
         }
     }
 
@@ -677,6 +777,35 @@ impl<T: AccessTokenProvider> IngestSource for FleetPoll<T> {
         };
         Ok(ObserveResult::Live(observation_from_vehicle_data(data)))
     }
+
+    async fn configure_telemetry(
+        &self,
+        vins: &[String],
+        host: &str,
+        port: u16,
+        ca_pem: &str,
+    ) -> Result<(), AppError> {
+        let request = crate::telemetry::subscription(host, port, ca_pem, vins)?;
+        match self.client.create_fleet_telemetry_config(&request).await {
+            Ok(update) => {
+                tracing::info!(
+                    updated = update.updated_vehicles,
+                    "fleet telemetry config applied"
+                );
+                Ok(())
+            }
+            Err(err) => {
+                self.note_http(
+                    "POST",
+                    "/api/1/vehicles/fleet_telemetry_config",
+                    fleet_http_status(&err),
+                    Instant::now(),
+                    "telemetry config was not applied",
+                );
+                Err(fleet_error(err))
+            }
+        }
+    }
 }
 
 fn fleet_http_status(err: &FleetError) -> Option<u16> {
@@ -731,6 +860,36 @@ fn classify_fleet(err: FleetError) -> Result<ObserveResult, AppError> {
         }),
         AppError::Forbidden => Ok(ObserveResult::Backoff { counted: false }),
         other => Err(other),
+    }
+}
+
+async fn subscribe_telemetry(source: &impl IngestSource, archive: &Archive, vehicles: &[Summary]) {
+    let Some(target) = archive.telemetry.as_ref() else {
+        return;
+    };
+    let mut pending = Vec::new();
+    {
+        let pushed = target.pushed.lock().await;
+        for summary in vehicles {
+            if !pushed.contains(&summary.vin) {
+                pending.push(summary.vin.clone());
+            }
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+    let count = pending.len();
+    if let Err(err) = source
+        .configure_telemetry(&pending, &target.host, target.port, &target.ca)
+        .await
+    {
+        let message = crate::logs::redact_line(&err.to_string(), &[]);
+        tracing::warn!(error = %message, cars = count, "fleet telemetry config was not applied");
+    }
+    let mut pushed = target.pushed.lock().await;
+    for vin in pending {
+        pushed.insert(vin);
     }
 }
 
@@ -928,6 +1087,10 @@ pub(crate) async fn run_poll<T: AccessTokenProvider>(
             policy.daily_cap = snap.daily_cap;
             policy.monthly_cap = snap.monthly_cap;
             policy.blocked_probe = snap.blocked_probe;
+            policy.telemetry_fallback = snap.telemetry_fallback;
+            policy.dynamic_budget = snap.dynamic_budget;
+            policy.month_seed = snap.month_seed;
+            policy.month_seed_month = snap.month_seed_month;
         } else {
             policy.drive_fallback = crate::settings::bounded_secs(
                 &archive.db,
@@ -996,14 +1159,11 @@ pub(crate) async fn run_poll<T: AccessTokenProvider>(
             )
             .await;
         }
+        // Telemetry mode is active only after the receiver certificate was read.
+        // A missing file keeps the sleep-safe polling schedule.
+        policy.telemetry_mode = archive.telemetry.is_some();
         let control = run_cycle(source, &archive, &policy, account_id).await;
-        let gate = crate::budget::gate(
-            &archive.db,
-            policy.daily_cap,
-            policy.monthly_cap,
-            Utc::now(),
-        )
-        .await;
+        let gate = crate::budget::gate(&archive.db, budget_query(&policy, Utc::now())).await;
         source.debug.set_budget_banner(gate.debug_line());
         let wait = match control {
             Ok(CycleControl::Wait(wait) | CycleControl::Pause(wait)) => wait,
@@ -1046,9 +1206,8 @@ async fn run_cycle(
     {
         return Ok(CycleControl::Pause(wait));
     }
-    let now_utc = Utc::now();
-    let gate =
-        crate::budget::gate(&archive.db, policy.daily_cap, policy.monthly_cap, now_utc).await;
+    let now_utc = policy_now(policy);
+    let gate = crate::budget::gate(&archive.db, budget_query(policy, now_utc)).await;
     if let Some(wait) = gate.list_wait(now_utc) {
         return Ok(CycleControl::Wait(wait));
     }
@@ -1075,6 +1234,9 @@ async fn run_cycle(
     if list_probe {
         crate::budget::resume_billing(&archive.db).await?;
     }
+    if policy.telemetry_mode {
+        subscribe_telemetry(source, archive, &vehicles).await;
+    }
     if vehicles.is_empty() {
         if let Some(account_id) = account_id {
             let _ = crate::accounts::set_last_error(
@@ -1098,19 +1260,14 @@ async fn run_cycle(
             .find(|summary| summary.presence == Presence::Online)
             .cloned();
         if gate.cap_reached() || online.is_none() {
-            let _ = crate::budget::reschedule_probe(&archive.db, Utc::now(), policy.blocked_probe)
-                .await;
+            let _ =
+                crate::budget::reschedule_probe(&archive.db, now_utc, policy.blocked_probe).await;
         } else if let Some(summary) = online {
             let control = handle_summary(source, archive, policy, &summary, true).await?;
-            let still = crate::budget::gate(
-                &archive.db,
-                policy.daily_cap,
-                policy.monthly_cap,
-                Utc::now(),
-            )
-            .await
-            .block
-            .is_some();
+            let still = crate::budget::gate(&archive.db, budget_query(policy, now_utc))
+                .await
+                .block
+                .is_some();
             if still {
                 return Ok(control);
             }
@@ -1299,7 +1456,7 @@ async fn handle_summary(
     )
     .await?;
     let slot = ensure_runtime(archive, &summary.vin, vehicle_id).await?;
-    let now_utc = Utc::now();
+    let now_utc = policy_now(policy);
     let (activity, telemetry_fresh, parked_live_polls, movement_recent, snap, open_drive_id) = {
         let runtime = slot.lock().await;
         (
@@ -1343,8 +1500,7 @@ async fn handle_summary(
         plan.observe = true;
         plan.wait = policy.drive_fallback;
     }
-    let gate =
-        crate::budget::gate(&archive.db, policy.daily_cap, policy.monthly_cap, now_utc).await;
+    let gate = crate::budget::gate(&archive.db, budget_query(policy, now_utc)).await;
     let blocked = gate.cap_reached() || (gate.block.is_some() && !probe);
     let snap_choice = if blocked {
         SnapChoice::None
@@ -1466,13 +1622,17 @@ async fn skip_live(
     vehicle_id: i64,
     plan: PollPlan,
 ) -> Result<CycleControl, AppError> {
-    let preserve = summary.presence == Presence::Online && {
+    let (preserve, activity) = {
         let runtime = slot.lock().await;
-        runtime.tracker.drive_open || runtime.tracker.activity == Activity::Driving
+        (
+            summary.presence == Presence::Online
+                && (runtime.tracker.drive_open || runtime.tracker.activity == Activity::Driving),
+            runtime.tracker.activity,
+        )
     };
     {
         let mut runtime = slot.lock().await;
-        if !preserve {
+        if !keep_parked_snapshot_count(summary.presence, activity) {
             runtime.parked_live_polls = 0;
         }
         runtime.next_due = Instant::now() + plan.wait;
@@ -1519,15 +1679,21 @@ mod tests {
     fn policy() -> PollPolicy {
         PollPolicy {
             drive_fallback: Duration::from_secs(120),
-            charge: Duration::from_secs(300),
+            charge: Duration::from_secs(900),
             parked: Duration::from_secs(180),
             asleep: Duration::from_secs(300),
             backoff: Duration::from_secs(720),
             parked_live_limit: 2,
             gps_fallback: Duration::from_secs(300),
-            daily_cap: 150,
-            monthly_cap: 4_500,
+            daily_cap: 160,
+            monthly_cap: 5_000,
             blocked_probe: Duration::from_secs(3_600),
+            telemetry_fallback: Duration::from_secs(3_600),
+            telemetry_mode: false,
+            dynamic_budget: true,
+            month_seed: 0,
+            month_seed_month: None,
+            now: None,
         }
     }
 
@@ -1569,11 +1735,89 @@ mod tests {
         );
         assert!(!later.observe);
         assert_eq!(later.wait, Duration::from_secs(720));
+    }
+
+    #[test]
+    fn parked_takes_one_snapshot_then_waits_out_the_sleep_timer() {
+        // Tesla resets the vehicle sleep timer on a live `vehicle_data` call.
+        // After the configured snapshots, the next wait is the idle backoff and
+        // the plan must not ask for another live read.
+        let mut policy = policy();
+        policy.parked_live_limit = 1;
+        policy.backoff = Duration::from_secs(1_800);
+        let first = poll_plan(
+            &facts(Presence::Online, Activity::Online, 0, false, false, false),
+            &policy,
+        );
+        assert!(first.observe);
+        assert_eq!(first.wait, Duration::from_secs(1_800));
+        let idle = poll_plan(
+            &facts(Presence::Online, Activity::Online, 1, false, false, false),
+            &policy,
+        );
+        assert!(!idle.observe);
+        assert!(idle.wait >= Duration::from_secs(1_800));
         let streamed = poll_plan(
             &facts(Presence::Online, Activity::Driving, 0, true, false, true),
             &policy,
         );
         assert!(!streamed.observe);
+    }
+
+    #[test]
+    fn telemetry_mode_skips_charge_polls_until_the_stream_is_stale() {
+        let mut policy = policy();
+        policy.telemetry_mode = true;
+        policy.charge = Duration::from_secs(900);
+        policy.telemetry_fallback = Duration::from_secs(3_600);
+        let fresh = poll_plan(
+            &facts(Presence::Online, Activity::Charging, 0, true, false, false),
+            &policy,
+        );
+        assert!(!fresh.observe);
+        let stale = poll_plan(
+            &facts(Presence::Online, Activity::Charging, 0, false, false, false),
+            &policy,
+        );
+        assert!(stale.observe);
+        assert_eq!(stale.wait, Duration::from_secs(3_600));
+        let asleep = poll_plan(
+            &facts(Presence::Asleep, Activity::Asleep, 0, false, false, false),
+            &policy,
+        );
+        assert!(!asleep.observe);
+    }
+
+    #[test]
+    fn charging_without_telemetry_uses_the_charge_interval() {
+        let mut policy = policy();
+        policy.charge = Duration::from_secs(900);
+        let plan = poll_plan(
+            &facts(Presence::Online, Activity::Charging, 9, false, false, false),
+            &policy,
+        );
+        assert!(plan.observe);
+        assert_eq!(plan.wait, Duration::from_secs(900));
+    }
+
+    #[test]
+    fn idle_online_keeps_the_parked_snapshot_count() {
+        assert!(super::keep_parked_snapshot_count(
+            Presence::Online,
+            Activity::Online
+        ));
+        assert!(!super::keep_parked_snapshot_count(
+            Presence::Asleep,
+            Activity::Online
+        ));
+        assert!(!super::keep_parked_snapshot_count(
+            Presence::Online,
+            Activity::Driving
+        ));
+        assert!(!super::keep_parked_snapshot_count(
+            Presence::Online,
+            Activity::Charging
+        ));
     }
 
     #[test]
@@ -1606,7 +1850,7 @@ mod tests {
             &facts(Presence::Online, Activity::Driving, 0, false, false, false),
             &policy,
         );
-        assert_eq!(grace.wait, Duration::from_secs(180));
+        assert_eq!(grace.wait, Duration::from_secs(720));
         assert_ne!(grace.wait, Duration::from_secs(15));
         let held = poll_plan(
             &facts(Presence::Online, Activity::Driving, 2, false, true, false),
@@ -1625,7 +1869,7 @@ mod tests {
             &policy,
         );
         assert!(charging.observe);
-        assert_eq!(charging.wait, Duration::from_secs(300));
+        assert_eq!(charging.wait, Duration::from_secs(900));
     }
 
     #[test]
@@ -2295,7 +2539,11 @@ mod tests {
         let _ = super::run_cycle(&source, &archive, &policy(), None)
             .await
             .expect("probe succeeds");
-        let gate = crate::budget::gate(&db.pool, 150, 4_500, chrono::Utc::now()).await;
+        let gate = crate::budget::gate(
+            &db.pool,
+            crate::budget::BudgetQuery::caps(160, 5_000, chrono::Utc::now()),
+        )
+        .await;
         assert!(gate.block.is_none(), "a successful probe clears the block");
         let requests = server.received_requests().await.unwrap();
         assert!(
@@ -2321,23 +2569,32 @@ mod tests {
             .respond_with(ResponseTemplate::new(403).set_body_string(EXCEEDED_LIMIT_BODY))
             .mount(&server)
             .await;
+        // Mid-month so the dynamic share does not depend on which day CI runs.
+        // A full configured day is always at or over the effective cap, because
+        // that cap is never higher than the configured one.
+        let now = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 6, 15, 12, 0, 0)
+            .single()
+            .expect("date");
+        let mut plan = policy();
+        plan.now = Some(now);
+        plan.daily_cap = 160;
+        plan.monthly_cap = 5_000;
+        plan.dynamic_budget = true;
+        plan.blocked_probe = Duration::from_secs(3_600);
         sqlx::query(
             "INSERT INTO fleet_usage (day, endpoint, status, count)
-             VALUES ($1, 'vehicle_data', 200, 150)",
+             VALUES ($1, 'vehicle_data', 200, $2)",
         )
-        .bind(chrono::Utc::now().date_naive())
+        .bind(now.date_naive())
+        .bind(i64::try_from(plan.daily_cap).unwrap_or(i64::MAX))
         .execute(&db.pool)
         .await
         .unwrap();
-        crate::budget::enter_block(
-            &db.pool,
-            chrono::Utc::now(),
-            Duration::from_secs(3_600),
-            false,
-        )
-        .await
-        .unwrap();
-        sqlx::query("UPDATE fleet_control SET next_probe_at = now() - interval '1 second'")
+        crate::budget::enter_block(&db.pool, now, plan.blocked_probe, false)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE fleet_control SET next_probe_at = $1")
+            .bind(now - chrono::Duration::seconds(1))
             .execute(&db.pool)
             .await
             .unwrap();
@@ -2347,16 +2604,17 @@ mod tests {
             .unwrap();
         let source = FleetPoll::new(client);
         let archive = fleet_archive(db.pool.clone());
-        let _ = super::run_cycle(&source, &archive, &policy(), None)
+        let _ = super::run_cycle(&source, &archive, &plan, None)
             .await
             .expect("capped probe");
         let requests = server.received_requests().await.unwrap();
         assert_eq!(count_paths(&requests, "/vehicles"), 1);
         assert_eq!(count_paths(&requests, "/vehicle_data"), 0);
-        let gate = crate::budget::gate(&db.pool, 150, 4_500, chrono::Utc::now()).await;
+        let gate = crate::budget::gate(&db.pool, super::budget_query(&plan, now)).await;
         let block = gate.block.expect("still blocked");
-        assert!(block.next_probe > chrono::Utc::now());
-        let _ = super::run_cycle(&source, &archive, &policy(), None)
+        assert!(block.next_probe > now);
+        assert!(gate.cap_reached());
+        let _ = super::run_cycle(&source, &archive, &plan, None)
             .await
             .expect("not due");
         assert_eq!(

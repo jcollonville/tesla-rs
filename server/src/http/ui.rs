@@ -1019,26 +1019,11 @@ async fn system_status(app: &AppState, csrf: &str, admin: bool) -> String {
             .await
             .unwrap_or_default();
     let alert = crate::system::storage_alert(default_rows, chrono::Utc::now().year());
-    let daily = crate::settings::bounded_u64(
+    let gate = crate::budget::gate(
         &app.inner.db,
-        "FLEET_DATA_DAILY_CAP",
-        app.inner.config.fleet_daily_cap,
-        crate::budget::DAILY_CAP_MIN,
-        crate::budget::DAILY_CAP_MAX,
+        super::api::budget_query(app, chrono::Utc::now()),
     )
     .await;
-    let mut monthly = crate::settings::bounded_u64(
-        &app.inner.db,
-        "FLEET_DATA_MONTHLY_CAP",
-        app.inner.config.fleet_monthly_cap,
-        crate::budget::MONTHLY_CAP_MIN,
-        crate::budget::MONTHLY_CAP_MAX,
-    )
-    .await;
-    if monthly < daily {
-        monthly = daily;
-    }
-    let gate = crate::budget::gate(&app.inner.db, daily, monthly, chrono::Utc::now()).await;
     app.inner.debug.set_budget_banner(gate.debug_line());
     let mode = escape_html(&app.inner.config.auth_mode);
     let oidc = if app.inner.config.oidc_issuer.is_some() {
@@ -1147,9 +1132,11 @@ async fn resume_fleet(
         tracing::warn!(error = %err, "fleet billing pause was not cleared");
         return (StatusCode::BAD_GATEWAY, "resume failed").into_response();
     }
-    let daily = app.inner.config.fleet_daily_cap;
-    let monthly = app.inner.config.fleet_monthly_cap.max(daily);
-    let gate = crate::budget::gate(&app.inner.db, daily, monthly, chrono::Utc::now()).await;
+    let gate = crate::budget::gate(
+        &app.inner.db,
+        super::api::budget_query(&app, chrono::Utc::now()),
+    )
+    .await;
     app.inner.debug.set_budget_banner(gate.debug_line());
     Redirect::to("/system").into_response()
 }

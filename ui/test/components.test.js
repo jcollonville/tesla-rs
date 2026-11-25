@@ -278,6 +278,25 @@ test("bar chart draws from the console payload and has no car drawing", () => {
   assert.equal(el.classList.contains("ready"), true);
 });
 
+test("a paused cable reading is unknown and the data source is shown", () => {
+  const card = mount("tl-vehicle-card", {
+    attrs: { locale: "en" },
+    data: {
+      name: "Example",
+      activity: "online",
+      charging_state: "Disconnected",
+      plugged_in: false,
+      charge_status: "unknown",
+      charge_status_stale: true,
+      data_source: "polling",
+    },
+  });
+  const text = card.shadowRoot.textContent;
+  assert.match(text, /Unknown/);
+  assert.match(text, /Polling/);
+  assert.doesNotMatch(text, /Unplugged/);
+});
+
 test("the package source does not fetch tiles or tesla renders", () => {
   const source = [
     "car-image.js", "vehicle-card.js", "mini-map.js", "chart.js", "index.js",

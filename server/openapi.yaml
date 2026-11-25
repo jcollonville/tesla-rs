@@ -425,6 +425,20 @@ components:
             runs every POLL_DRIVE_FALLBACK_SECS (default 120, minimum 60).
             Drive-end grace and Hold use the parked cadence unless movement
             evidence is less than 60 seconds old. Asleep cars are not woken.
+            The drive fallback is a normal vehicle_data call and counts toward
+            the daily and monthly caps.
+        data_source:
+          type: string
+          enum: [polling, telemetry]
+          description: >
+            polling uses the sleep-safe Fleet API schedule. telemetry is active
+            when TELEMETRY_ENABLED is true and the receiver certificate and key
+            are set. Existing clients can ignore this field.
+        charge_status_stale:
+          type: boolean
+          description: >
+            True when vehicle_data is paused and telemetry is not fresh. A stale
+            cable reading is unknown rather than unplugged.
         charger_voltage: { type: number, nullable: true, description: Volts }
         charger_current:
           type: number
@@ -447,12 +461,13 @@ components:
         charge_status:
           type: string
           nullable: true
-          enum: [charging, plugged, unplugged]
+          enum: [charging, plugged, unplugged, unknown]
           description: >
             Cable state. charging while charging_state is Charging. plugged for
             Starting, Stopped, Complete, and NoPower, or when plugged_in is true
-            and the state is not Disconnected. unplugged for Disconnected.
-            Omitted when unknown. Driving and sleep stay on activity.
+            and the state is not Disconnected. unplugged for a fresh Disconnected
+            reading. unknown when that reading is paused or missing, so a budget
+            pause is not reported as unplugged. Driving and sleep stay on activity.
         time_to_full_charge_h: { type: number, nullable: true, description: Hours }
         scheduled_charging_start_time:
           type: integer
