@@ -23,17 +23,31 @@ pub(crate) const DRIVE_FALLBACK_DEFAULT_SECS: u64 = 120;
 pub(crate) const DRIVE_FALLBACK_MIN_SECS: u64 = 60;
 pub(crate) const DRIVE_FALLBACK_MAX_SECS: u64 = 3_600;
 
-pub(crate) const CHARGE_POLL_DEFAULT_SECS: u64 = 300;
+pub(crate) const CHARGE_POLL_DEFAULT_SECS: u64 = 900;
 pub(crate) const CHARGE_POLL_MIN_SECS: u64 = 60;
 pub(crate) const CHARGE_POLL_MAX_SECS: u64 = 86_400;
 
-pub(crate) const DAILY_CAP_DEFAULT: u64 = 150;
-pub(crate) const DAILY_CAP_MIN: u64 = 0;
-pub(crate) const DAILY_CAP_MAX: u64 = 100_000;
+/// Shortest idle gap. A shorter `vehicle_data` cadence resets Tesla's sleep timer.
+pub(crate) const IDLE_MIN_SECS: u64 = 1_800;
+pub(crate) const IDLE_DEFAULT_SECS: u64 = 1_800;
 
-pub(crate) const MONTHLY_CAP_DEFAULT: u64 = 4_500;
+/// Rare `vehicle_data` read when Fleet Telemetry is configured but silent.
+pub(crate) const TELEMETRY_FALLBACK_DEFAULT_SECS: u64 = 3_600;
+pub(crate) const TELEMETRY_FALLBACK_MIN_SECS: u64 = 1_800;
+pub(crate) const TELEMETRY_FALLBACK_MAX_SECS: u64 = 86_400;
+
+/// Default and ceiling. 160 calls is under the free credit (~166/day at $10 and 500 calls per $1).
+pub(crate) const DAILY_CAP_DEFAULT: u64 = 160;
+pub(crate) const DAILY_CAP_MIN: u64 = 0;
+pub(crate) const DAILY_CAP_MAX: u64 = 160;
+
+/// $10 credit is 5_000 `vehicle_data` calls. The dynamic daily share uses this as the month's credit.
+pub(crate) const MONTHLY_CAP_DEFAULT: u64 = 5_000;
 pub(crate) const MONTHLY_CAP_MIN: u64 = 0;
 pub(crate) const MONTHLY_CAP_MAX: u64 = 1_000_000;
+
+/// Added to the stored month total, and only while `now` is in the seed month.
+pub(crate) const MONTH_SEED_MAX: u64 = 1_000_000;
 
 pub(crate) const BLOCKED_PROBE_DEFAULT_SECS: u64 = 3_600;
 pub(crate) const BLOCKED_PROBE_MIN_SECS: u64 = 300;
@@ -98,6 +112,11 @@ pub(crate) struct Gate {
     pub today_calls: i64,
     pub month_calls: i64,
     pub daily_cap: i64,
+    /// `min(daily_cap, remaining monthly credit / days left)` when the dynamic budget is on.
+    pub effective_daily_cap: i64,
+    pub dynamic: bool,
+    /// Calls added for the seed month. Zero in every other month.
+    pub seed_calls: i64,
     pub monthly_cap: i64,
     /// Set while Tesla is rejecting calls for the billing limit.
     pub block: Option<BillingBlock>,
@@ -133,7 +152,7 @@ impl Gate {
     /// Daily or monthly cap, or unreadable counters. A billing block alone does not.
     pub(crate) fn cap_reached(&self) -> bool {
         matches!(self.pause, Some(PauseKind::Counters))
-            || self.today_calls >= self.daily_cap
+            || self.today_calls >= self.effective_daily_cap
             || self.month_calls >= self.monthly_cap
     }
 
@@ -148,6 +167,9 @@ impl Gate {
             today_calls: 0,
             month_calls: 0,
             daily_cap,
+            effective_daily_cap: daily_cap,
+            dynamic: false,
+            seed_calls: 0,
             monthly_cap,
             block: None,
             pause: Some(PauseKind::Counters),
@@ -296,14 +318,84 @@ pub(crate) async fn record(
     Ok(())
 }
 
-pub(crate) async fn gate(
-    pool: &PgPool,
-    daily_cap: u64,
-    monthly_cap: u64,
+/// Inputs for one budget decision. The seed is not stored; it is added in memory.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BudgetQuery {
+    pub daily_cap: u64,
+    pub monthly_cap: u64,
+    pub now: DateTime<Utc>,
+    pub dynamic: bool,
+    pub seed_calls: u64,
+    /// First day of the UTC month the seed belongs to.
+    pub seed_month: Option<NaiveDate>,
+}
+
+impl BudgetQuery {
+    #[cfg(test)]
+    pub(crate) fn caps(daily_cap: u64, monthly_cap: u64, now: DateTime<Utc>) -> Self {
+        Self {
+            daily_cap,
+            monthly_cap,
+            now,
+            dynamic: false,
+            seed_calls: 0,
+            seed_month: None,
+        }
+    }
+}
+
+/// `YYYY-MM` for the month a seed applies to. Anything else is ignored.
+pub(crate) fn parse_seed_month(text: &str) -> Option<NaiveDate> {
+    let text = text.trim();
+    let mut parts = text.split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    NaiveDate::from_ymd_opt(year, month, 1)
+}
+
+/// Days from `now` through the last UTC day of its month, including today.
+pub(crate) fn days_left_in_month(now: DateTime<Utc>) -> i64 {
+    let today = now.date_naive();
+    let (_, next) = utc_month(today);
+    let last = next.pred_opt().unwrap_or(today);
+    (last - today).num_days().saturating_add(1).max(1)
+}
+
+/// Floor of the remaining monthly credit split across the days left, never above `configured`.
+pub(crate) fn effective_daily_allowance(
+    configured: i64,
+    monthly_cap: i64,
+    month_calls: i64,
     now: DateTime<Utc>,
-) -> Gate {
-    let daily_cap = i64::try_from(daily_cap).unwrap_or(i64::MAX);
-    let monthly_cap = i64::try_from(monthly_cap).unwrap_or(i64::MAX);
+    dynamic: bool,
+) -> i64 {
+    let configured = configured.max(0);
+    if !dynamic {
+        return configured;
+    }
+    let remaining = monthly_cap.saturating_sub(month_calls).max(0);
+    let days = days_left_in_month(now).max(1);
+    remaining.checked_div(days).unwrap_or(0).min(configured)
+}
+
+fn seed_addition(query: &BudgetQuery) -> i64 {
+    let Some(month) = query.seed_month else {
+        return 0;
+    };
+    let today = query.now.date_naive();
+    if today.year() != month.year() || today.month() != month.month() {
+        return 0;
+    }
+    i64::try_from(query.seed_calls).unwrap_or(i64::MAX)
+}
+
+pub(crate) async fn gate(pool: &PgPool, query: BudgetQuery) -> Gate {
+    let now = query.now;
+    let daily_cap = i64::try_from(query.daily_cap).unwrap_or(i64::MAX);
+    let monthly_cap = i64::try_from(query.monthly_cap).unwrap_or(i64::MAX);
     let today = now.date_naive();
     let (start, end) = utc_month(today);
     let today_calls = match sum_between(pool, today, day_after(today)).await {
@@ -313,13 +405,15 @@ pub(crate) async fn gate(
             return Gate::counters_down(daily_cap, monthly_cap);
         }
     };
-    let month_calls = match sum_between(pool, start, end).await {
+    let stored_month = match sum_between(pool, start, end).await {
         Ok(count) => count,
         Err(err) => {
             tracing::warn!(error = %err, "fleet usage counters are unavailable");
             return Gate::counters_down(daily_cap, monthly_cap);
         }
     };
+    let seed_calls = seed_addition(&query);
+    let month_calls = stored_month.saturating_add(seed_calls);
     let control = match control_deadlines(pool).await {
         Ok(control) => control,
         Err(err) => {
@@ -335,10 +429,12 @@ pub(crate) async fn gate(
         }),
         _ => None,
     };
+    let effective_daily_cap =
+        effective_daily_allowance(daily_cap, monthly_cap, month_calls, now, query.dynamic);
     let pause = pause_kind(
         today_calls,
         month_calls,
-        daily_cap,
+        effective_daily_cap,
         monthly_cap,
         block.is_some(),
         true,
@@ -347,6 +443,9 @@ pub(crate) async fn gate(
         today_calls,
         month_calls,
         daily_cap,
+        effective_daily_cap,
+        dynamic: query.dynamic,
+        seed_calls,
         monthly_cap,
         block,
         pause,
@@ -559,6 +658,42 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_daily_share_never_exceeds_the_configured_cap() {
+        let early = at(2026, 11, 1, 0);
+        let share = super::effective_daily_allowance(160, 5_000, 0, early, true);
+        assert_eq!(share, 160, "5000/30 is above the daily cap");
+        let late = at(2026, 11, 30, 12);
+        let tight = super::effective_daily_allowance(160, 5_000, 4_900, late, true);
+        assert_eq!(super::days_left_in_month(late), 1);
+        assert_eq!(tight, 100);
+        assert_eq!(
+            super::effective_daily_allowance(160, 5_000, 4_900, late, false),
+            160
+        );
+    }
+
+    #[test]
+    fn month_seed_applies_only_to_its_month() {
+        let november = at(2026, 11, 25, 8);
+        let december = at(2026, 12, 1, 0);
+        let month = super::parse_seed_month("2026-11");
+        let mut query = super::BudgetQuery::caps(160, 5_000, november);
+        query.seed_calls = 9_000;
+        query.seed_month = month;
+        assert_eq!(super::seed_addition(&query), 9_000);
+        query.now = december;
+        assert_eq!(super::seed_addition(&query), 0);
+        assert!(super::parse_seed_month("2026-11-23").is_none());
+        assert!(super::parse_seed_month("").is_none());
+        let allowance = super::effective_daily_allowance(160, 5_000, 9_000, november, true);
+        assert_eq!(allowance, 0);
+        assert_eq!(
+            super::pause_kind(0, 9_000, allowance, 5_000, false, true),
+            Some(super::PauseKind::MonthlyCap)
+        );
+    }
+
+    #[test]
     fn error_retry_keeps_the_backoff_and_the_floor() {
         assert_eq!(error_retry(None, false), Duration::from_secs(60));
         assert_eq!(
@@ -592,12 +727,12 @@ mod tests {
             .await
             .unwrap();
 
-        let open = super::gate(&db.pool, 150, 4500, november).await;
+        let open = super::gate(&db.pool, super::BudgetQuery::caps(150, 4500, november)).await;
         assert_eq!(open.today_calls, 2, "408 is counted with 200");
         assert_eq!(open.month_calls, 2, "October does not carry into November");
         assert_eq!(open.pause, None);
 
-        let previous = super::gate(&db.pool, 150, 4500, october).await;
+        let previous = super::gate(&db.pool, super::BudgetQuery::caps(150, 4500, october)).await;
         assert_eq!(previous.today_calls, 2);
         assert_eq!(previous.month_calls, 2);
 
@@ -606,13 +741,13 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        let blocked = super::gate(&db.pool, 150, 4500, november).await;
+        let blocked = super::gate(&db.pool, super::BudgetQuery::caps(150, 4500, november)).await;
         assert_eq!(blocked.today_calls, 151);
         assert_eq!(blocked.pause, Some(PauseKind::DailyCap));
         assert!(blocked.blocks_vehicle_data());
 
         let december = at(2026, 12, 1, 0);
-        let rolled = super::gate(&db.pool, 150, 4500, december).await;
+        let rolled = super::gate(&db.pool, super::BudgetQuery::caps(150, 4500, december)).await;
         assert_eq!(rolled.today_calls, 0);
         assert_eq!(rolled.month_calls, 0);
         assert_eq!(rolled.pause, None);
@@ -628,7 +763,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next, at(2026, 11, 23, 9));
-        let paused = super::gate(&db.pool, 150, 4500, now).await;
+        let paused = super::gate(&db.pool, super::BudgetQuery::caps(150, 4500, now)).await;
         assert_eq!(paused.pause, Some(PauseKind::Billing));
         assert!(paused.blocks_vehicle_data());
         let block = paused.block.expect("blocked");
@@ -636,7 +771,7 @@ mod tests {
         assert_eq!(block.since, now);
         assert!(paused.list_wait(now).is_some());
         super::resume_billing(&db.pool).await.unwrap();
-        let resumed = super::gate(&db.pool, 150, 4500, now).await;
+        let resumed = super::gate(&db.pool, super::BudgetQuery::caps(150, 4500, now)).await;
         assert_eq!(resumed.pause, None);
         assert!(!resumed.blocks_vehicle_data());
     }

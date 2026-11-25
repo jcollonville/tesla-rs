@@ -348,6 +348,8 @@ pub(crate) enum CableStatus {
     Charging,
     Plugged,
     Unplugged,
+    /// The last cable reading is paused or missing. Not a claim that the cable is out.
+    Unknown,
 }
 
 impl CableStatus {
@@ -356,7 +358,40 @@ impl CableStatus {
             Self::Charging => "charging",
             Self::Plugged => "plugged",
             Self::Unplugged => "unplugged",
+            Self::Unknown => "unknown",
         }
+    }
+}
+
+/// Cable state published on the API.
+///
+/// A paused `vehicle_data` budget must not turn a missing reading into
+/// `unplugged`. A known charging or plugged reading is kept and marked stale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChargePublication {
+    pub status: Option<CableStatus>,
+    pub stale: bool,
+}
+
+pub(crate) fn publish_charge(
+    charging_state: Option<&str>,
+    plugged_in: Option<bool>,
+    reading_fresh: bool,
+) -> ChargePublication {
+    let known = cable_status(charging_state, plugged_in);
+    if reading_fresh {
+        return ChargePublication {
+            status: known,
+            stale: false,
+        };
+    }
+    let status = match known {
+        Some(CableStatus::Charging | CableStatus::Plugged) => known,
+        Some(CableStatus::Unplugged | CableStatus::Unknown) | None => Some(CableStatus::Unknown),
+    };
+    ChargePublication {
+        status,
+        stale: true,
     }
 }
 
@@ -1660,6 +1695,21 @@ mod tests {
         door.charger_power_kw = Some(0.0);
         super::refresh_plugged_in(&mut door);
         assert_eq!(door.plugged_in, Some(false));
+    }
+
+    #[test]
+    fn paused_cable_reading_is_unknown_instead_of_unplugged() {
+        let fresh = super::publish_charge(Some("Disconnected"), Some(false), true);
+        assert_eq!(fresh.status, Some(super::CableStatus::Unplugged));
+        assert!(!fresh.stale);
+        let paused = super::publish_charge(Some("Disconnected"), Some(false), false);
+        assert_eq!(paused.status, Some(super::CableStatus::Unknown));
+        assert!(paused.stale);
+        let still_charging = super::publish_charge(Some("Charging"), Some(true), false);
+        assert_eq!(still_charging.status, Some(super::CableStatus::Charging));
+        assert!(still_charging.stale);
+        let missing = super::publish_charge(None, None, false);
+        assert_eq!(missing.status, Some(super::CableStatus::Unknown));
     }
 
     #[test]

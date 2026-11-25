@@ -1675,7 +1675,7 @@ function Ue(t, e) {
     };
   const r = String((t == null ? void 0 : t.activity) || "").toLowerCase(), i = String((t == null ? void 0 : t.charging_state) || "").toLowerCase(), a = i === "starting" || i === "complete" || i === "stopped" || i === "nopower";
   let n = "unknown";
-  r === "driving" ? n = "driving" : i === "charging" ? n = "charging" : r === "updating" ? n = "updating" : r === "asleep" ? n = "asleep" : r === "offline" ? n = "offline" : a ? n = "plugged" : r === "charging" && i !== "disconnected" ? n = "charging" : i !== "disconnected" && (t == null ? void 0 : t.plugged_in) === !0 ? n = "plugged" : (r === "online" || r === "parked" || r === "charging") && (n = "parked");
+  r === "driving" ? n = "driving" : i === "charging" ? n = "charging" : r === "updating" ? n = "updating" : r === "asleep" ? n = "asleep" : r === "offline" ? n = "offline" : a ? n = "plugged" : r === "charging" && i !== "disconnected" ? n = "charging" : i !== "disconnected" && (t == null ? void 0 : t.plugged_in) === !0 ? n = "plugged" : (r === "online" || r === "parked" || r === "charging") && (n = "parked"), ((t == null ? void 0 : t.charge_status) === "unknown" || (t == null ? void 0 : t.charge_status_stale) === !0) && i === "disconnected" && r !== "driving" && r !== "asleep" && r !== "offline" && r !== "updating" && (n = r === "charging" ? "unknown" : "parked");
   const o = {
     driving: ["drive", e.driving],
     charging: ["charge", e.charging],
@@ -1701,7 +1701,14 @@ function Be(t, e) {
   const a = yt(e, t.inside_temp_c);
   a && i.push({ label: r ? "Intérieur" : "Inside", value: a });
   const n = yt(e, t.outside_temp_c);
-  return n && i.push({ label: r ? "Extérieur" : "Outside", value: n }), t.odometer_km != null && i.push({ label: r ? "Compteur" : "Odometer", value: e.unit(t.odometer_km, 0, e.strings.km) }), t.sentry_mode === !0 && i.push({ label: r ? "Sentinelle" : "Sentry", value: r ? "Active" : "On" }), t.software_version && i.push({ label: r ? "Logiciel" : "Software", value: String(t.software_version) }), i;
+  if (n && i.push({ label: r ? "Extérieur" : "Outside", value: n }), t.odometer_km != null && i.push({ label: r ? "Compteur" : "Odometer", value: e.unit(t.odometer_km, 0, e.strings.km) }), t.sentry_mode === !0 && i.push({ label: r ? "Sentinelle" : "Sentry", value: r ? "Active" : "On" }), t.software_version && i.push({ label: r ? "Logiciel" : "Software", value: String(t.software_version) }), (t.charge_status === "unknown" || t.charge_status_stale === !0) && i.push({ label: "Charge", value: r ? "Inconnue" : "Unknown" }), t.data_source === "telemetry" || t.data_source === "polling") {
+    const o = t.data_source === "telemetry";
+    i.push({
+      label: r ? "Données" : "Data",
+      value: o ? r ? "Télémétrie" : "Telemetry" : r ? "Interrogation" : "Polling"
+    });
+  }
+  return i;
 }
 class Ie extends A {
   constructor() {

@@ -31,6 +31,62 @@ use crate::persist::{VehicleIdentity, resting_observation};
 use crate::state::{Observation, Presence, refresh_plugged_in};
 use crate::units::{miles_to_km, speed_to_kmh};
 
+/// Signals the logger asks the car to stream when telemetry is configured.
+///
+/// Numeric fields carry a `minimum_delta` so a parked car does not publish on
+/// every sample. `DetailedChargeState` and the charge-schedule fields from the
+/// plugged-in status are included. `ChargeState` stays for older firmware.
+pub(crate) fn subscription(
+    hostname: &str,
+    port: u16,
+    ca_pem: &str,
+    vins: &[String],
+) -> Result<tesla_fleet_api::FleetTelemetryConfigRequest, AppError> {
+    use tesla_fleet_telemetry::FleetTelemetryConfig;
+    let config = FleetTelemetryConfig::builder(hostname, port, ca_pem)
+        .field_with("DetailedChargeState", pace(60, None, Some(900)))
+        .field_with("ChargeState", pace(60, None, Some(900)))
+        .field_with("Gear", pace(5, None, None))
+        .field_with("Location", pace(30, Some(25.0), None))
+        .field_with("Odometer", pace(60, Some(0.1), None))
+        .field_with("Soc", pace(60, Some(1.0), None))
+        .field_with("VehicleSpeed", pace(10, Some(1.0), None))
+        .field_with("ChargeLimitSoc", pace(300, Some(1.0), None))
+        .field_with("ScheduledChargingStartTime", pace(300, None, Some(3600)))
+        .field_with("ScheduledChargingMode", pace(300, None, Some(3600)))
+        .field_with("ScheduledDepartureTime", pace(300, None, Some(3600)))
+        .field_with("ChargePortLatch", pace(60, None, Some(900)))
+        .field_with("ChargingCableType", pace(60, None, Some(900)))
+        .field_with("ChargePortDoorOpen", pace(60, None, Some(900)))
+        .field_with("TimeToFullCharge", pace(300, Some(0.1), None))
+        .field_with("ACChargingPower", pace(60, Some(0.5), None))
+        .field_with("DCChargingPower", pace(60, Some(0.5), None))
+        .build()
+        .map_err(|err| AppError::message(err.to_string()))?;
+    let value = config
+        .to_value()
+        .map_err(|err| AppError::message(err.to_string()))?;
+    let parsed: tesla_fleet_api::TelemetryConfig = serde_json::from_value(value)
+        .map_err(|_| AppError::message("telemetry config could not be encoded"))?;
+    Ok(tesla_fleet_api::FleetTelemetryConfigRequest {
+        vins: vins.to_vec(),
+        config: parsed,
+    })
+}
+
+fn pace(
+    interval_seconds: u32,
+    minimum_delta: Option<f64>,
+    resend: Option<u32>,
+) -> tesla_fleet_telemetry::FieldConfig {
+    tesla_fleet_telemetry::FieldConfig {
+        interval_seconds,
+        minimum_delta,
+        resend_interval_seconds: resend,
+        include_fields: Vec::new(),
+    }
+}
+
 pub(crate) async fn run(
     config: &Config,
     archive: Arc<Archive>,
@@ -486,7 +542,30 @@ fn charging_mode_label(value: &DatumValue) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::fold_vehicle_data;
+    use super::{fold_vehicle_data, subscription};
+
+    #[test]
+    fn telemetry_subscription_includes_charge_gear_and_location_deltas() {
+        let request = subscription(
+            "logger.example",
+            4443,
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+            &["TEST00000000VIN01".to_owned()],
+        )
+        .unwrap();
+        let fields = &request.config.fields;
+        assert!(fields.contains_key("DetailedChargeState"));
+        assert!(fields.contains_key("ChargeState"));
+        assert!(fields.contains_key("Gear"));
+        assert!(fields.contains_key("ScheduledChargingMode"));
+        assert!(fields.contains_key("ScheduledDepartureTime"));
+        assert_eq!(fields["Location"].minimum_delta, Some(25.0));
+        assert_eq!(fields["Soc"].minimum_delta, Some(1.0));
+        assert!(fields.values().all(|field| field.interval_seconds > 0));
+        assert_eq!(request.config.hostname, "logger.example");
+        assert_ne!(request.config.ca, "");
+    }
+
     use crate::state::{Observation, Presence};
     use chrono::Utc;
     use tesla_fleet_telemetry::DecodeOptions;

@@ -62,6 +62,11 @@ export function statusFrom(data, strings) {
   else if (activity === "charging" && charging !== "disconnected") key = "charging";
   else if (charging !== "disconnected" && data?.plugged_in === true) key = "plugged";
   else if (activity === "online" || activity === "parked" || activity === "charging") key = "parked";
+  if ((data?.charge_status === "unknown" || data?.charge_status_stale === true) && charging === "disconnected") {
+    if (activity !== "driving" && activity !== "asleep" && activity !== "offline" && activity !== "updating") {
+      key = activity === "charging" ? "unknown" : "parked";
+    }
+  }
   const table = {
     driving: ["drive", strings.driving],
     charging: ["charge", strings.charging],

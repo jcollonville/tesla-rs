@@ -383,7 +383,11 @@ pub fn classify_stream_error(error_type: &str, value: &str) -> FailureClass {
 #[must_use]
 pub fn classify_transport_message(message: &str) -> FailureClass {
     let text = message.to_ascii_lowercase();
-    if text.contains("401") || text.contains("unauthorized") {
+    if text.contains("401")
+        || text.contains("unauthorized")
+        || text.contains("token")
+        || text.contains("invalid_grant")
+    {
         FailureClass::Auth
     } else if text.contains("403") || text.contains("404") || text.contains("410") {
         FailureClass::Unavailable
@@ -524,6 +528,7 @@ pub async fn pump_stream(
             }
             Message::Close(frame) => {
                 let detail = close_detail(frame);
+                let class = classify_transport_message(&detail);
                 let _ = emit(
                     &samples,
                     StreamEvent::Trace(StreamTrace::Closed {
@@ -531,7 +536,7 @@ pub async fn pump_stream(
                     }),
                 )
                 .await;
-                return live.finish(FailureClass::Transport, detail);
+                return live.finish(class, detail);
             }
             Message::Pong(_) => {
                 live.saw_frame();
@@ -953,6 +958,14 @@ mod tests {
             classify_transport_message("connection reset"),
             FailureClass::Transport
         );
+        assert_eq!(
+            classify_transport_message("close code=1000 reason=Can't validate token"),
+            FailureClass::Auth
+        );
+        assert!(plan_reconnect(FailureClass::Auth, 1).refresh_token);
+        assert!(!plan_reconnect(FailureClass::VehicleDisconnected, 2).refresh_token);
+        assert!(!plan_reconnect(FailureClass::Transport, 3).refresh_token);
+        assert!(plan_reconnect(FailureClass::Transport, 1).after >= Duration::from_secs(2));
 
         let first = plan_reconnect(FailureClass::Timeout, 1);
         assert_eq!(first.after, Duration::from_secs(10));

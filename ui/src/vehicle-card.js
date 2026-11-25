@@ -30,6 +30,16 @@ function factsFrom(data, fmt) {
   }
   if (data.sentry_mode === true) facts.push({ label: fr ? "Sentinelle" : "Sentry", value: fr ? "Active" : "On" });
   if (data.software_version) facts.push({ label: fr ? "Logiciel" : "Software", value: String(data.software_version) });
+  if (data.charge_status === "unknown" || data.charge_status_stale === true) {
+    facts.push({ label: "Charge", value: fr ? "Inconnue" : "Unknown" });
+  }
+  if (data.data_source === "telemetry" || data.data_source === "polling") {
+    const telemetry = data.data_source === "telemetry";
+    facts.push({
+      label: fr ? "Données" : "Data",
+      value: telemetry ? (fr ? "Télémétrie" : "Telemetry") : (fr ? "Interrogation" : "Polling"),
+    });
+  }
   return facts;
 }
 

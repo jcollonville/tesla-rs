@@ -6,6 +6,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use chrono::Datelike;
+
 use secrecy::SecretString;
 use tesla_auth::Region;
 use url::Url;
@@ -52,6 +54,14 @@ pub(crate) struct Config {
     pub telemetry_bind: SocketAddr,
     pub telemetry_cert_path: Option<PathBuf>,
     pub telemetry_key_path: Option<PathBuf>,
+    /// Hostname the car dials. Defaults to `TESLA_DOMAIN`.
+    pub telemetry_hostname: String,
+    pub telemetry_port: u16,
+    pub telemetry_fallback: Duration,
+    pub fleet_dynamic_budget: bool,
+    pub fleet_month_seed: u64,
+    /// Set when the seed should count. Empty in the environment means the UTC month at startup.
+    pub fleet_month_seed_month: Option<chrono::NaiveDate>,
     pub owner_stream_enabled: bool,
     pub owner_token_store_path: PathBuf,
     /// IANA zone for stats buckets. `TESLA_TIMEZONE`, default `Europe/Paris`.
@@ -112,6 +122,22 @@ impl std::fmt::Debug for Config {
 impl Config {
     pub(crate) fn load() -> Result<Self, AppError> {
         Self::from_map(&environment())
+    }
+
+    /// Receiver cert and key are both set, and telemetry is turned on.
+    pub(crate) fn telemetry_configured(&self) -> bool {
+        self.telemetry_enabled
+            && self.telemetry_cert_path.is_some()
+            && self.telemetry_key_path.is_some()
+    }
+
+    /// `telemetry` when the receiver is configured, otherwise `polling`.
+    pub(crate) fn data_source(&self) -> &'static str {
+        if self.telemetry_configured() {
+            "telemetry"
+        } else {
+            "polling"
+        }
     }
 
     pub(crate) fn database_url() -> Result<String, AppError> {
@@ -184,6 +210,32 @@ impl Config {
             crate::budget::MONTHLY_CAP_MIN,
             crate::budget::MONTHLY_CAP_MAX,
         )?;
+        let fleet_dynamic_budget = optional_bool(map, "FLEET_DATA_DYNAMIC_BUDGET")?.unwrap_or(true);
+        let fleet_month_seed = bounded_count(
+            map,
+            "FLEET_DATA_MONTH_SEED",
+            0,
+            0,
+            crate::budget::MONTH_SEED_MAX,
+        )?;
+        let fleet_month_seed_month = if let Some(text) =
+            optional(map, "FLEET_DATA_MONTH_SEED_MONTH")
+        {
+            Some(
+                crate::budget::parse_seed_month(&text).ok_or_else(|| {
+                    AppError::message("FLEET_DATA_MONTH_SEED_MONTH must be YYYY-MM")
+                })?,
+            )
+        } else if fleet_month_seed > 0 {
+            let today = chrono::Utc::now().date_naive();
+            tracing::warn!(
+                month = today.format("%Y-%m").to_string(),
+                "FLEET_DATA_MONTH_SEED applies only to this UTC month; set FLEET_DATA_MONTH_SEED_MONTH so a restart does not move it"
+            );
+            Some(chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today))
+        } else {
+            None
+        };
         if fleet_monthly_cap < fleet_daily_cap {
             return Err(AppError::message(
                 "FLEET_DATA_MONTHLY_CAP must be at least FLEET_DATA_DAILY_CAP",
@@ -223,10 +275,22 @@ impl Config {
                 crate::budget::CHARGE_POLL_MIN_SECS,
                 crate::budget::CHARGE_POLL_MAX_SECS,
             )?),
-            parked_poll: Duration::from_secs(optional_u64(map, "POLL_PARKED_SECS", 180)?),
-            asleep_poll: Duration::from_secs(optional_u64(map, "POLL_ASLEEP_SECS", 300)?),
-            backoff_poll: Duration::from_secs(optional_u64(map, "POLL_BACKOFF_SECS", 720)?),
-            parked_live_limit: u32::try_from(optional_u64(map, "POLL_PARKED_LIVE_LIMIT", 2)?)
+            parked_poll: Duration::from_secs(optional_u64(map, "POLL_PARKED_SECS", 1_800)?),
+            asleep_poll: Duration::from_secs(bounded_secs(
+                map,
+                "POLL_ASLEEP_SECS",
+                crate::budget::IDLE_DEFAULT_SECS,
+                crate::budget::IDLE_MIN_SECS,
+                86_400,
+            )?),
+            backoff_poll: Duration::from_secs(bounded_secs(
+                map,
+                "POLL_BACKOFF_SECS",
+                crate::budget::IDLE_DEFAULT_SECS,
+                crate::budget::IDLE_MIN_SECS,
+                86_400,
+            )?),
+            parked_live_limit: u32::try_from(optional_u64(map, "POLL_PARKED_LIVE_LIMIT", 1)?)
                 .map_err(|_| AppError::message("POLL_PARKED_LIVE_LIMIT is too large"))?,
             gps_fallback_poll: Duration::from_secs(optional_u64(
                 map,
@@ -236,6 +300,9 @@ impl Config {
             fleet_daily_cap,
             fleet_monthly_cap,
             fleet_blocked_probe,
+            fleet_dynamic_budget,
+            fleet_month_seed,
+            fleet_month_seed_month,
             nominatim_enabled,
             nominatim_url: optional(map, "NOMINATIM_URL")
                 .unwrap_or_else(|| "https://nominatim.openstreetmap.org".to_owned()),
@@ -257,6 +324,21 @@ impl Config {
             telemetry_bind,
             telemetry_cert_path: optional(map, "TELEMETRY_CERT_PATH").map(PathBuf::from),
             telemetry_key_path: optional(map, "TELEMETRY_KEY_PATH").map(PathBuf::from),
+            telemetry_hostname: optional(map, "TELEMETRY_HOSTNAME")
+                .unwrap_or_else(|| domain.clone()),
+            telemetry_port: u16::try_from(optional_u64(
+                map,
+                "TELEMETRY_PORT",
+                u64::from(telemetry_bind.port()),
+            )?)
+            .map_err(|_| AppError::message("TELEMETRY_PORT is not a port"))?,
+            telemetry_fallback: Duration::from_secs(bounded_secs(
+                map,
+                "POLL_TELEMETRY_FALLBACK_SECS",
+                crate::budget::TELEMETRY_FALLBACK_DEFAULT_SECS,
+                crate::budget::TELEMETRY_FALLBACK_MIN_SECS,
+                crate::budget::TELEMETRY_FALLBACK_MAX_SECS,
+            )?),
             owner_stream_enabled,
             owner_token_store_path,
             timezone: timezone_name(map)?,
@@ -338,7 +420,7 @@ impl Config {
             self.gps_fallback_poll.as_secs().to_string(),
         );
         push(
-            "Plafond vehicle_data / jour (0–100000)",
+            "Plafond vehicle_data / jour (0–160)",
             "FLEET_DATA_DAILY_CAP",
             self.fleet_daily_cap.to_string(),
         );
@@ -393,9 +475,19 @@ impl Config {
             self.mqtt_prefix.clone(),
         );
         push(
+            "Source de données",
+            "TELEMETRY_ENABLED",
+            self.data_source().to_owned(),
+        );
+        push(
             "Télémétrie",
             "TELEMETRY_ENABLED",
             self.telemetry_enabled.to_string(),
+        );
+        push(
+            "Budget dynamique",
+            "FLEET_DATA_DYNAMIC_BUDGET",
+            self.fleet_dynamic_budget.to_string(),
         );
         push(
             "Télémétrie écoute",
@@ -758,9 +850,13 @@ mod tests {
             config.drive_fallback_poll,
             std::time::Duration::from_secs(120)
         );
-        assert_eq!(config.charge_poll, std::time::Duration::from_secs(300));
-        assert_eq!(config.fleet_daily_cap, 150);
-        assert_eq!(config.fleet_monthly_cap, 4500);
+        assert_eq!(config.charge_poll, std::time::Duration::from_secs(900));
+        assert_eq!(config.fleet_daily_cap, 160);
+        assert_eq!(config.fleet_monthly_cap, 5000);
+        assert!(config.fleet_dynamic_budget);
+        assert_eq!(config.parked_live_limit, 1);
+        assert_eq!(config.data_source(), "polling");
+        assert_eq!(config.backoff_poll, std::time::Duration::from_secs(1_800));
         assert_eq!(
             config.fleet_blocked_probe,
             std::time::Duration::from_secs(3600)

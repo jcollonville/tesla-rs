@@ -230,14 +230,18 @@ Optional:
 | `TESLA_OWNER_TOKEN_STORE_PATH` | `owner-tokens.json` next to `TESLA_TOKEN_STORE_PATH` | Owner API token file. Same encryption key |
 | `OWNER_STREAM_ENABLED` | `true` | `true`/`false`, `1`/`0`, `yes`/`no`, or `on`/`off`. `false` keeps a saved Owner token and does not connect |
 | `POLL_DRIVE_FALLBACK_SECS` | `120` | `vehicle_data` interval while driving if the Owner stream is down or the last `data:update` is older than 90 seconds. 60–3600. The old 15 second drive cadence is not used |
-| `POLL_CHARGE_SECS` | `300` | Poll interval while charging. 60–86400 |
-| `POLL_PARKED_SECS` | `180` | Poll interval while parked, and during drive-end grace or Hold when movement evidence is 60 seconds old or older |
-| `POLL_ASLEEP_SECS` | `300` | Poll interval while asleep |
-| `POLL_BACKOFF_SECS` | `720` | Poll interval after a backoff |
-| `POLL_PARKED_LIVE_LIMIT` | `2` | Live `vehicle_data` reads while parked |
-| `POLL_GPS_FALLBACK_SECS` | `300` | Minimum gap between `source=poll` drive positions while the Owner stream is down or stale. The `vehicle_data` call itself follows `POLL_DRIVE_FALLBACK_SECS` |
-| `FLEET_DATA_DAILY_CAP` | `150` | UTC-day cap on `vehicle_data` calls, including HTTP 408 and other 4xx. 0–100000. At the cap, `vehicle_data` stops; the vehicle list and the Owner stream continue |
-| `FLEET_DATA_MONTHLY_CAP` | `4500` | UTC-month cap. 0–1000000, and at least `FLEET_DATA_DAILY_CAP`. Estimated cost is calls / 500 USD, before the $10 monthly credit |
+| `POLL_CHARGE_SECS` | `900` | Poll interval while charging, and only in polling mode. 60–86400. Telemetry mode does not poll `vehicle_data` on this interval |
+| `POLL_PARKED_SECS` | `1800` | Kept for compatibility. Parked `vehicle_data` is not scheduled from this value |
+| `POLL_ASLEEP_SECS` | `1800` | How often to read asleep/offline presence from the vehicle list. 1800–86400. The list does not wake the car |
+| `POLL_BACKOFF_SECS` | `1800` | Idle gap after a parked `vehicle_data` snapshot, and between later presence checks. 1800–86400. A live `vehicle_data` call resets Tesla's sleep timer, so this stays at least 30 minutes |
+| `POLL_PARKED_LIVE_LIMIT` | `1` | Live `vehicle_data` snapshots after the car is parked, or after it comes back online. Further cycles only list the vehicle |
+| `POLL_GPS_FALLBACK_SECS` | `300` | Minimum gap between `source=poll` drive positions while the Owner stream is down or stale. The `vehicle_data` call itself follows `POLL_DRIVE_FALLBACK_SECS` and counts toward the caps |
+| `POLL_TELEMETRY_FALLBACK_SECS` | `3600` | One `vehicle_data` read when telemetry mode is on but no fresh record has arrived, and only while the car is online. 1800–86400 |
+| `FLEET_DATA_DAILY_CAP` | `160` | UTC-day cap on `vehicle_data`, including HTTP 408 and other 4xx. 0–160. At the cap, `vehicle_data` stops; the vehicle list and the Owner stream continue. `charge_status` becomes `unknown` instead of `unplugged` |
+| `FLEET_DATA_MONTHLY_CAP` | `5000` | UTC-month cap. 0–1000000, and at least `FLEET_DATA_DAILY_CAP`. 5000 calls is the $10 credit at 500 calls per dollar |
+| `FLEET_DATA_DYNAMIC_BUDGET` | `true` | When true, the effective daily cap is the remaining monthly credit divided by the days left in the UTC month, and never above `FLEET_DATA_DAILY_CAP` |
+| `FLEET_DATA_MONTH_SEED` | `0` | Calls added to the stored month total. Use this for usage from before `fleet_usage` existed. It is added to the rows already stored, so count only the missing calls |
+| `FLEET_DATA_MONTH_SEED_MONTH` | unset | `YYYY-MM`. The seed counts only in that UTC month. If the seed is non-zero and this is unset, the process uses the UTC month at startup and logs that choice |
 | `FLEET_BLOCKED_PROBE_SECS` | `3600` | While Tesla returns 402 or 403 `EXCEEDED_LIMIT`, one probe this often. 300–86400. Success resumes polling |
 | `DRIVE_END_GRACE_SECS` | `300` | Close a drive this long after the last driving evidence when the tail has no exact 0 km/h sample (signal gap, asleep, offline, incomplete poll). 30–1800. Must be at least `DRIVE_PARK_GRACE_SECS`. Does not trim `end_at` |
 | `DRIVE_PARK_GRACE_SECS` | `300` | Close a drive after this long at exact 0 km/h. 15–900. Closure only: `end_at` is the first 0 km/h sample of that final run, not this many seconds earlier. A missing speed does not start the run. Existing values still load |
@@ -252,9 +256,11 @@ Optional:
 | `MQTT_USERNAME` | unset | Sent only when `MQTT_PASSWORD` is set too |
 | `MQTT_PASSWORD` | unset | Sent only when `MQTT_USERNAME` is set too |
 | `MQTT_TOPIC_PREFIX` | `tesla_logger` | Topic prefix |
-| `TELEMETRY_ENABLED` | `false` | Mutual-TLS Fleet Telemetry receiver inside the logger |
+| `TELEMETRY_ENABLED` | `false` | Mutual-TLS Fleet Telemetry receiver inside the logger. With the certificate and key set, this becomes the data source and polling stops except for the stale fallback |
 | `TELEMETRY_BIND` | `0.0.0.0:4443` | Telemetry listen socket |
-| `TELEMETRY_CERT_PATH` | unset | PEM certificate chain. Required for telemetry to start |
+| `TELEMETRY_HOSTNAME` | `TESLA_DOMAIN` | Hostname the car dials. No scheme and no port |
+| `TELEMETRY_PORT` | bind port | Port advertised in the fleet telemetry config. Defaults to the port in `TELEMETRY_BIND` |
+| `TELEMETRY_CERT_PATH` | unset | PEM certificate chain. Required for telemetry to start. The same PEM is the `ca` the car uses to authenticate the server |
 | `TELEMETRY_KEY_PATH` | unset | PEM private key. Required for telemetry to start |
 | `RUST_LOG` | `info,sqlx=warn,hyper=warn,h2=warn,rumqttc=warn,reqwest=warn` | stderr filter. Leave `sqlx` off `trace`; query logs can include bound values |
 | `TESLA_TIMEZONE` | `Europe/Paris` | IANA zone for `/api/v1/vehicles/{id}/stats/series` bucket boundaries. ISO weeks start on Monday |
@@ -312,7 +318,15 @@ Migrations are compiled into the binary (`server/migrations/`) and run when the 
 TESLA_LOGGER_ENV_FILE=server/.env cargo run -p tesla-logger
 ```
 
-That is the `serve` command. `cargo run -p tesla-logger -- serve` is the same. The process logs `listening` with the socket address. Stop it with Ctrl-C.
+That is the `serve` command. `cargo run -p tesla-logger -- serve` is the same. The process logs `fleet data source` with `data_source=polling` or `data_source=telemetry`, and the socket address. Stop it with Ctrl-C.
+
+#### Fleet Telemetry (optional)
+
+Leave `TELEMETRY_ENABLED=false` to stay on the sleep-safe polling schedule. Polling never calls `wake_up`. After the car parks it takes at most `POLL_PARKED_LIVE_LIMIT` (default 1) `vehicle_data` snapshots, then only `GET /api/1/vehicles`, at `POLL_BACKOFF_SECS` (default 30 minutes). A live `vehicle_data` call resets Tesla's sleep timer. The `endpoints` query is still that live call, so it is billed and can wake the car. Tesla documents `vehicle_data_cached` as a non-waking cache, and does not list it as free, so the idle path does not use it.
+
+To switch to telemetry, set `TELEMETRY_ENABLED=true`, `TELEMETRY_CERT_PATH`, and `TELEMETRY_KEY_PATH`. Put the certificate's hostname in `TELEMETRY_HOSTNAME` (default `TESLA_DOMAIN`) and publish `TELEMETRY_PORT` (default the bind port) so the car can reach the receiver. On startup the logger posts a fleet telemetry config for the account vehicles: charge state (`DetailedChargeState` and `ChargeState`), the charge schedule fields, gear, location, speed, odometer, and state of charge, with `minimum_delta` on the numeric signals. While records are fresh, `vehicle_data` is not polled, including during a charge. If the stream goes quiet and the car is online, one `vehicle_data` read runs every `POLL_TELEMETRY_FALLBACK_SECS` (default 1 hour) and counts toward the caps. The state API field `data_source` is `telemetry` in this mode and `polling` otherwise.
+
+Plugged and charging status comes from `vehicle_data` `charge_state` in polling mode and from `DetailedChargeState` (with `ChargeState` as a fallback) in telemetry mode. If `vehicle_data` is paused and telemetry is not fresh, `charge_status` is `unknown` and `charge_status_stale` is true.
 
 A missing required variable exits with `error: missing environment variable <NAME>`. That message includes the name. The examples do not.
 
