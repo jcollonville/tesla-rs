@@ -149,10 +149,12 @@ async fn security_headers(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
-    headers.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("same-origin"),
-    );
+    if !headers.contains_key(header::REFERRER_POLICY) {
+        headers.insert(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("same-origin"),
+        );
+    }
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     if let Ok(csp) = HeaderValue::from_str(&format!(
         "default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; worker-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; frame-ancestors 'none'"
