@@ -27,6 +27,16 @@ use crate::owner_stream::{self, StreamBoard};
 use crate::persist::LiveEvent;
 use crate::telemetry;
 
+/// One Fleet authorization-code login waiting for Tesla's redirect.
+///
+/// `session_hash` is the SHA-256 of the logger session id, the same value stored
+/// in `sessions.id_hash`. The raw session id and the PKCE verifier stay out of logs.
+pub(crate) struct PendingLogin {
+    pub(crate) authorization: PendingAuthorization,
+    pub(crate) session_hash: String,
+    pub(crate) created: Instant,
+}
+
 /// Process-wide handles. Cheap to clone.
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -42,7 +52,10 @@ pub(crate) struct Inner {
     pub owner_store: Arc<DbTokenStore>,
     pub fleet_account_id: i64,
     pub owner_account_id: i64,
-    pub pending: Mutex<HashMap<String, PendingAuthorization>>,
+    /// In-progress Fleet OAuth logins, keyed by the unguessable `state`.
+    ///
+    /// Each entry is bound to the logger session that called `/auth/login`.
+    pub pending: Mutex<HashMap<String, PendingLogin>>,
     pub public_key_pem: String,
     pub events: broadcast::Sender<LiveEvent>,
     pub revealed: Mutex<HashMap<String, String>>,
@@ -334,13 +347,25 @@ pub(crate) async fn test_state(pool: PgPool) -> AppState {
 
 #[cfg(test)]
 pub(crate) async fn test_state_with(pool: PgPool, energy_price_per_kwh: Option<f64>) -> AppState {
-    test_state_full(pool, energy_price_per_kwh, None).await
+    test_state_full(pool, energy_price_per_kwh, None, None).await
 }
 
 /// Test state whose car renders come from `renders`, normally a mock server.
 #[cfg(test)]
 pub(crate) async fn test_state_renders(pool: PgPool, renders: CarRenders) -> AppState {
-    test_state_full(pool, None, Some(renders)).await
+    test_state_full(pool, None, Some(renders), None).await
+}
+
+/// Points the Fleet token endpoint at a local mock and stores tokens on `fleet_account_id`.
+#[cfg(test)]
+pub(crate) struct OauthDouble {
+    pub token_endpoint: url::Url,
+    pub fleet_account_id: i64,
+}
+
+#[cfg(test)]
+pub(crate) async fn test_state_oauth(pool: PgPool, oauth: OauthDouble) -> AppState {
+    test_state_full(pool, None, None, Some(oauth)).await
 }
 
 #[cfg(test)]
@@ -349,6 +374,7 @@ async fn test_state_full(
     pool: PgPool,
     energy_price_per_kwh: Option<f64>,
     renders: Option<CarRenders>,
+    oauth: Option<OauthDouble>,
 ) -> AppState {
     use std::collections::BTreeMap;
 
@@ -399,20 +425,36 @@ async fn test_state_full(
     }
     let config = Config::from_map(&map).unwrap();
     let public_key_pem = read_public_key(&config.private_key_path).unwrap();
+    let fleet_account_id = oauth.as_ref().map_or(0, |oauth| oauth.fleet_account_id);
     let fleet_store = Arc::new(
-        DbTokenStore::open(pool.clone(), 0, config.token_encryption_key.as_deref()).unwrap(),
+        DbTokenStore::open(
+            pool.clone(),
+            fleet_account_id,
+            config.token_encryption_key.as_deref(),
+        )
+        .unwrap(),
     );
     let owner_store = Arc::new(
         DbTokenStore::open(pool.clone(), 0, config.token_encryption_key.as_deref()).unwrap(),
     );
-    let auth = AuthClient::new(ClientConfig {
+    let client_config = ClientConfig {
         client_id: config.client_id.clone(),
         client_secret: config.client_secret.clone(),
         redirect_uri: config.redirect_uri.clone(),
         region: config.region,
         scopes: Scope::third_party_vehicle(),
-    })
-    .unwrap();
+    };
+    let auth = match oauth {
+        Some(oauth) => {
+            let mut endpoints = tesla_auth::Endpoints::for_region(config.region).unwrap();
+            endpoints.token = oauth.token_endpoint;
+            AuthClient::builder(client_config, endpoints)
+                .unwrap()
+                .build()
+                .unwrap()
+        }
+        None => AuthClient::new(client_config).unwrap(),
+    };
     let session = Arc::new(Session::new(auth, (*fleet_store).clone()));
     let (events, _) = broadcast::channel(16);
     let (stream_kick, _) = broadcast::channel(8);
@@ -440,7 +482,7 @@ async fn test_state_full(
             session,
             fleet_store,
             owner_store,
-            fleet_account_id: 0,
+            fleet_account_id,
             owner_account_id: 0,
             pending: Mutex::new(HashMap::new()),
             public_key_pem,

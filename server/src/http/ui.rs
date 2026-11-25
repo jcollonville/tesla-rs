@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{Form, Path, Query, State};
@@ -10,7 +11,8 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use serde::Deserialize;
-use tesla_auth::{CallbackParams, TokenStore};
+use tesla_auth::{CallbackParams, ExposeSecret, TokenStore};
+use zeroize::Zeroize;
 
 use super::markup::{
     AccessLine, AuditLine, Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview,
@@ -20,7 +22,7 @@ use super::markup::{
 };
 use super::{cookie, ui_session};
 use crate::accounts::{self, TokenPublic};
-use crate::app::AppState;
+use crate::app::{AppState, PendingLogin};
 use crate::crypto::{public_key_fingerprint, random_token, sha256_hex};
 
 pub(crate) fn routes() -> Router<AppState> {
@@ -70,6 +72,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/logs/events", get(logs_events))
         .route("/auth/login", get(oauth_start))
         .route("/auth/callback", get(oauth_callback))
+        .route("/auth/callback/complete", get(oauth_complete))
         .route("/auth/disconnect", post(disconnect))
         .route("/auth/refresh", post(fleet_refresh))
         .route("/auth/owner", get(owner_redirect))
@@ -1429,10 +1432,15 @@ async fn logout(
     response
 }
 
+const OAUTH_PENDING_TTL: Duration = Duration::from_secs(10 * 60);
+const OAUTH_PENDING_LIMIT: usize = 32;
+const OAUTH_STATE_MAX: usize = 256;
+const OAUTH_CODE_MAX: usize = 2_048;
+
 async fn oauth_start(State(app): State<AppState>, headers: HeaderMap) -> Response {
-    if ui_session(&app, &headers).await.is_none() {
+    let Some(principal) = ui_session(&app, &headers).await else {
         return Redirect::to("/").into_response();
-    }
+    };
     let pending = match app
         .inner
         .session
@@ -1443,40 +1451,196 @@ async fn oauth_start(State(app): State<AppState>, headers: HeaderMap) -> Respons
             ..tesla_auth::AuthorizeOptions::default()
         }) {
         Ok(pending) => pending,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    let url = pending.url().to_string();
-    app.inner
-        .pending
-        .lock()
-        .await
-        .insert(pending.state().to_owned(), pending);
-    Redirect::to(&url).into_response()
-}
-
-async fn oauth_callback(State(app): State<AppState>, request: axum::extract::Request) -> Response {
-    let headers = request.headers().clone();
-    if ui_session(&app, &headers).await.is_none() {
-        return (StatusCode::UNAUTHORIZED, "sign in to the logger first").into_response();
-    }
-    let query = request.uri().query().unwrap_or("");
-    let params = CallbackParams::from_query(query);
-    let Some(state) = params.state.clone() else {
-        return (StatusCode::BAD_REQUEST, "missing oauth state").into_response();
-    };
-    let Some(pending) = app.inner.pending.lock().await.remove(&state) else {
-        return (StatusCode::BAD_REQUEST, "unknown oauth state").into_response();
-    };
-    match app.inner.session.complete_login(&pending, params).await {
-        Ok(_) => Redirect::to("/connection").into_response(),
         Err(err) => {
             tracing::warn!(
                 error = %crate::logs::redact_line(&err.to_string(), &[]),
-                "tesla login failed"
+                "tesla login could not start"
             );
-            (StatusCode::BAD_GATEWAY, "Tesla sign-in failed").into_response()
+            return oauth_text(StatusCode::BAD_REQUEST, "Tesla sign-in could not start");
+        }
+    };
+    let url = pending.url().to_string();
+    let state = pending.state().to_owned();
+    let mut guard = app.inner.pending.lock().await;
+    purge_expired(&mut guard);
+    if guard.len() >= OAUTH_PENDING_LIMIT {
+        return oauth_text(StatusCode::SERVICE_UNAVAILABLE, "too many sign-in attempts");
+    }
+    guard.insert(
+        state,
+        PendingLogin {
+            authorization: pending,
+            session_hash: sha256_hex(&principal.raw_id),
+            created: Instant::now(),
+        },
+    );
+    drop(guard);
+    Redirect::to(&url).into_response()
+}
+
+/// Cross-site return from `auth.tesla.com`. The browser does not send the
+/// `SameSite=Strict` session cookie on this navigation, so the login is finished
+/// by a same-origin hop that does.
+async fn oauth_callback(request: axum::extract::Request) -> Response {
+    let query = request.uri().query().unwrap_or("");
+    let Some(target) = hop_target(query) else {
+        return oauth_text(StatusCode::BAD_REQUEST, "missing oauth state");
+    };
+    let target = escape_attr(&target);
+    let html = format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><meta http-equiv=\"refresh\" content=\"0; url={target}\"><title>Continue</title></head><body><p><a href=\"{target}\">Continue</a></p></body></html>"
+    );
+    let mut response = (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )],
+        html,
+    )
+        .into_response();
+    stamp_oauth(&mut response);
+    response
+}
+
+async fn oauth_complete(State(app): State<AppState>, request: axum::extract::Request) -> Response {
+    let headers = request.headers().clone();
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return oauth_text(StatusCode::UNAUTHORIZED, "sign in to the logger first");
+    };
+    let query = request.uri().query().unwrap_or("");
+    let params = CallbackParams::from_query(query);
+    let Some(state) = params.state.clone() else {
+        return oauth_text(StatusCode::BAD_REQUEST, "missing oauth state");
+    };
+    if state.is_empty() || state.len() > OAUTH_STATE_MAX {
+        return oauth_text(StatusCode::BAD_REQUEST, "missing oauth state");
+    }
+    let session_hash = sha256_hex(&principal.raw_id);
+    let pending = {
+        let mut guard = app.inner.pending.lock().await;
+        let Some(entry) = guard.get(&state) else {
+            return oauth_text(StatusCode::BAD_REQUEST, "unknown oauth state");
+        };
+        if !crate::crypto::constant_time_eq(entry.session_hash.as_bytes(), session_hash.as_bytes())
+        {
+            return oauth_text(StatusCode::FORBIDDEN, "sign-in does not match this session");
+        }
+        if Instant::now().saturating_duration_since(entry.created) > OAUTH_PENDING_TTL {
+            guard.remove(&state);
+            return oauth_text(StatusCode::BAD_REQUEST, "oauth state expired");
+        }
+        guard.remove(&state)
+    };
+    let Some(pending) = pending else {
+        return oauth_text(StatusCode::BAD_REQUEST, "unknown oauth state");
+    };
+    finish_login(&app, pending, params, &state).await
+}
+
+async fn finish_login(
+    app: &AppState,
+    pending: PendingLogin,
+    params: CallbackParams,
+    state: &str,
+) -> Response {
+    let mut code = params
+        .code()
+        .map(|value| value.expose_secret().to_owned())
+        .unwrap_or_default();
+    let result = app
+        .inner
+        .session
+        .complete_login(&pending.authorization, params)
+        .await;
+    let response = match result {
+        Ok(_) => {
+            let mut response = Redirect::to("/connection").into_response();
+            stamp_oauth(&mut response);
+            response
+        }
+        Err(err) => {
+            let mut secrets = Vec::new();
+            if code.len() >= 4 {
+                secrets.push(code.clone());
+            }
+            if state.len() >= 4 {
+                secrets.push(state.to_owned());
+            }
+            let rendered = crate::logs::redact_line(&err.to_string(), &secrets);
+            for secret in &mut secrets {
+                secret.zeroize();
+            }
+            tracing::warn!(error = %rendered, "tesla login failed");
+            oauth_text(StatusCode::BAD_GATEWAY, "Tesla sign-in failed")
+        }
+    };
+    code.zeroize();
+    response
+}
+
+fn hop_target(query: &str) -> Option<String> {
+    let params = CallbackParams::from_query(query);
+    let state = params.state.as_deref()?;
+    if !oauth_token_ok(state, OAUTH_STATE_MAX) {
+        return None;
+    }
+    if let Some(code) = params.code()
+        && !oauth_token_ok(code.expose_secret(), OAUTH_CODE_MAX)
+    {
+        return None;
+    }
+    let mut serializer =
+        url::form_urlencoded::Serializer::new(String::from("/auth/callback/complete?"));
+    if let Some(code) = params.code() {
+        serializer.append_pair("code", code.expose_secret());
+    }
+    serializer.append_pair("state", state);
+    if let Some(error) = params.error.as_deref()
+        && oauth_token_ok(error, 128)
+    {
+        serializer.append_pair("error", error);
+    }
+    if let Some(description) = params.error_description.as_deref() {
+        let description: String = description.chars().take(200).collect();
+        if !description.is_empty() && !description.chars().any(|ch| ch.is_control()) {
+            serializer.append_pair("error_description", &description);
         }
     }
+    Some(serializer.finish())
+}
+
+fn oauth_token_ok(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+}
+
+fn purge_expired(pending: &mut HashMap<String, PendingLogin>) {
+    let now = Instant::now();
+    pending.retain(|_, entry| now.saturating_duration_since(entry.created) <= OAUTH_PENDING_TTL);
+}
+
+fn stamp_oauth(response: &mut Response) {
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+}
+
+fn oauth_text(status: StatusCode, message: &'static str) -> Response {
+    let mut response = (status, message).into_response();
+    stamp_oauth(&mut response);
+    response
+}
+
+fn escape_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 async fn disconnect(
@@ -2062,4 +2226,404 @@ async fn ui_js() -> Response {
         include_str!("../../../ui/dist/tesla-logger-ui.js"),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use super::super::router;
+    use crate::app::{AppState, OauthDouble, test_state, test_state_oauth};
+
+    async fn body_string(response: axum::response::Response) -> String {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn set_cookie(headers: &axum::http::HeaderMap, name: &str) -> String {
+        headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|value| {
+                let text = value.to_str().ok()?;
+                let pair = text.split(';').next()?;
+                let (key, value) = pair.split_once('=')?;
+                (key.trim() == name).then(|| value.trim().to_owned())
+            })
+            .unwrap_or_else(|| panic!("missing {name}"))
+    }
+
+    async fn lazy_app() -> AppState {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        test_state(pool).await
+    }
+
+    async fn get(app: &AppState, uri: &str, session: Option<&str>) -> axum::response::Response {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(session) = session {
+            builder = builder.header(header::COOKIE, format!("__Host-tl_session={session}"));
+        }
+        router(app.clone())
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn assert_unlogged(response: &axum::response::Response) {
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            response.headers().get(header::REFERRER_POLICY).unwrap(),
+            "no-referrer"
+        );
+    }
+
+    async fn ready_session(app: &AppState, username: &str) -> String {
+        if username != "admin" {
+            sqlx::query(
+                "INSERT INTO users (username, password_hash, role, must_change_password, totp_enabled)
+                 SELECT $1, password_hash, 'user', false, false FROM users WHERE username = 'admin'",
+            )
+            .bind(username)
+            .execute(&app.inner.db)
+            .await
+            .unwrap();
+        }
+        let login = get(app, "/", None).await;
+        let csrf = set_cookie(login.headers(), "tl_csrf");
+        let form = if username == "admin" {
+            format!("password=test-password&csrf={csrf}")
+        } else {
+            format!("username={username}&password=test-password&csrf={csrf}")
+        };
+        let posted = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(header::COOKIE, format!("tl_csrf={csrf}"))
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let posted_status = posted.status();
+        let session_header = posted
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let session = set_cookie(posted.headers(), "__Host-tl_session");
+        assert!(
+            posted_status.is_redirection(),
+            "{}",
+            body_string(posted).await
+        );
+        let session_header = session_header.expect("session cookie");
+        assert!(
+            session_header.contains("SameSite=Strict"),
+            "{session_header}"
+        );
+        sqlx::query(
+            "UPDATE users SET must_change_password = false, totp_enabled = true WHERE username = $1",
+        )
+        .bind(username)
+        .execute(&app.inner.db)
+        .await
+        .unwrap();
+        session
+    }
+
+    async fn start_oauth(app: &AppState, session: &str) -> String {
+        let response = get(app, "/auth/login", Some(session)).await;
+        let status = response.status();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        assert!(status.is_redirection(), "{}", body_string(response).await);
+        let location = location.expect("location");
+        assert!(
+            location.starts_with("https://auth.tesla.com/"),
+            "{location}"
+        );
+        url::Url::parse(&location)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned())
+            .unwrap()
+    }
+
+    async fn oauth_app(
+        prefix: &str,
+    ) -> Option<(crate::test_util::TestDb, AppState, wiremock::MockServer)> {
+        let db = crate::test_util::TestDb::migrated(prefix).await?;
+        let server = wiremock::MockServer::start().await;
+        let account_id: i64 = sqlx::query_scalar(
+            "INSERT INTO tesla_accounts (label, kind) VALUES ('fleet', 'fleet') RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let token_endpoint = format!("{}/oauth2/v3/token", server.uri()).parse().unwrap();
+        let app = test_state_oauth(
+            db.pool.clone(),
+            OauthDouble {
+                token_endpoint,
+                fleet_account_id: account_id,
+            },
+        )
+        .await;
+        Some((db, app, server))
+    }
+
+    #[tokio::test]
+    async fn callback_without_cookie_returns_same_origin_hop() {
+        let app = lazy_app().await;
+        let state = "state-value";
+        let response = get(
+            &app,
+            &format!("/auth/callback?code=code%3Cscript&state={state}&next=https://evil.example"),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_unlogged(&response);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(content_type.starts_with("text/html"), "{content_type}");
+        let body = body_string(response).await;
+        assert!(body.contains("http-equiv=\"refresh\""), "{body}");
+        assert!(body.contains("/auth/callback/complete?"), "{body}");
+        assert!(body.contains("state=state-value"), "{body}");
+        assert!(
+            body.contains("%3Cscript") || body.contains("%3cscript"),
+            "{body}"
+        );
+        assert!(!body.contains("<script"), "{body}");
+        assert!(!body.contains("https://evil.example"), "{body}");
+        assert!(!body.contains("sign in to the logger first"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn completion_without_session_is_rejected_and_does_not_echo_secrets() {
+        let app = lazy_app().await;
+        let code = "super-secret-code";
+        let state = "super-secret-state";
+        let response = get(
+            &app,
+            &format!("/auth/callback/complete?code={code}&state={state}"),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_unlogged(&response);
+        let body = body_string(response).await;
+        assert!(!body.contains(code), "{body}");
+        assert!(!body.contains(state), "{body}");
+    }
+
+    #[tokio::test]
+    async fn completion_with_unknown_state_is_rejected() {
+        let Some(db) = crate::test_util::TestDb::migrated("oauth-unknown").await else {
+            return;
+        };
+        let app = test_state(db.pool.clone()).await;
+        let session = ready_session(&app, "admin").await;
+        let code = "unused-code";
+        let state = "missing-state-value";
+        let response = get(
+            &app,
+            &format!("/auth/callback/complete?code={code}&state={state}"),
+            Some(&session),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_unlogged(&response);
+        let body = body_string(response).await;
+        assert!(body.contains("unknown"), "{body}");
+        assert!(!body.contains(code), "{body}");
+        assert!(!body.contains(state), "{body}");
+    }
+
+    #[tokio::test]
+    async fn completion_with_a_different_session_is_rejected() {
+        let Some((_db, app, server)) = oauth_app("oauth-other").await else {
+            return;
+        };
+        let owner = ready_session(&app, "admin").await;
+        let other = ready_session(&app, "other").await;
+        let state = start_oauth(&app, &owner).await;
+        let code = "auth-code-value";
+        let response = get(
+            &app,
+            &format!("/auth/callback/complete?code={code}&state={state}"),
+            Some(&other),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_unlogged(&response);
+        let body = body_string(response).await;
+        assert!(!body.contains(code), "{body}");
+        assert!(!body.contains(&state), "{body}");
+        assert!(app.inner.pending.lock().await.contains_key(&state));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_happy_path_redirects_to_connection_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some((_db, app, server)) = oauth_app("oauth-happy").await else {
+            return;
+        };
+        Mock::given(method("POST"))
+            .and(path("/oauth2/v3/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-secret",
+                "refresh_token": "refresh-secret",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        let session = ready_session(&app, "admin").await;
+        let state = start_oauth(&app, &session).await;
+        let code = "auth-code-value";
+        let hop = get(
+            &app,
+            &format!("/auth/callback?code={code}&state={state}"),
+            None,
+        )
+        .await;
+        assert_eq!(hop.status(), StatusCode::OK);
+        assert_unlogged(&hop);
+        let hop_body = body_string(hop).await;
+        assert!(hop_body.contains("/auth/callback/complete?"), "{hop_body}");
+        assert!(app.inner.pending.lock().await.contains_key(&state));
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        let done = get(
+            &app,
+            &format!("/auth/callback/complete?code={code}&state={state}"),
+            Some(&session),
+        )
+        .await;
+        let done_status = done.status();
+        let location = done
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        assert_unlogged(&done);
+        assert!(done_status.is_redirection(), "{}", body_string(done).await);
+        assert_eq!(location.as_deref(), Some("/connection"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let stored: String =
+            sqlx::query_scalar("SELECT status FROM tesla_accounts WHERE kind = 'fleet'")
+                .fetch_one(&app.inner.db)
+                .await
+                .unwrap();
+        assert_eq!(stored, "connected");
+
+        let reused = get(
+            &app,
+            &format!("/auth/callback/complete?code={code}&state={state}"),
+            Some(&session),
+        )
+        .await;
+        assert_eq!(reused.status(), StatusCode::BAD_REQUEST);
+        assert_unlogged(&reused);
+        let body = body_string(reused).await;
+        assert!(body.contains("unknown"), "{body}");
+        assert!(!body.contains(code), "{body}");
+        assert!(!body.contains(&state), "{body}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn completion_with_expired_state_is_rejected() {
+        let Some((_db, app, server)) = oauth_app("oauth-expired").await else {
+            return;
+        };
+        let session = ready_session(&app, "admin").await;
+        let state = start_oauth(&app, &session).await;
+        {
+            let mut pending = app.inner.pending.lock().await;
+            let entry = pending.get_mut(&state).expect("pending login");
+            entry.created = Instant::now()
+                .checked_sub(super::OAUTH_PENDING_TTL + Duration::from_secs(1))
+                .expect("ttl");
+        }
+        let code = "auth-code-value";
+        let response = get(
+            &app,
+            &format!("/auth/callback/complete?code={code}&state={state}"),
+            Some(&session),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_unlogged(&response);
+        let body = body_string(response).await;
+        assert!(body.contains("expired"), "{body}");
+        assert!(!body.contains(code), "{body}");
+        assert!(!body.contains(&state), "{body}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(!app.inner.pending.lock().await.contains_key(&state));
+    }
+
+    #[tokio::test]
+    async fn pending_oauth_logins_are_bounded() {
+        let Some(db) = crate::test_util::TestDb::migrated("oauth-bound").await else {
+            return;
+        };
+        let app = test_state(db.pool.clone()).await;
+        let session = ready_session(&app, "admin").await;
+        let mut blocked_at = None;
+        for n in 1..=40 {
+            let response = get(&app, "/auth/login", Some(&session)).await;
+            if response.status().is_redirection() {
+                continue;
+            }
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = body_string(response).await;
+            assert!(!body.contains("client_secret"), "{body}");
+            blocked_at = Some(n);
+            break;
+        }
+        assert_eq!(
+            blocked_at,
+            Some(33),
+            "32 pending logins fit; the next is refused"
+        );
+        let expired = {
+            let mut pending = app.inner.pending.lock().await;
+            let state = pending.keys().next().expect("pending").clone();
+            let entry = pending.get_mut(&state).expect("entry");
+            entry.created = Instant::now()
+                .checked_sub(super::OAUTH_PENDING_TTL + Duration::from_secs(1))
+                .expect("ttl");
+            state
+        };
+        let response = get(&app, "/auth/login", Some(&session)).await;
+        assert!(response.status().is_redirection());
+        assert!(!app.inner.pending.lock().await.contains_key(&expired));
+    }
 }
