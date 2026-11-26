@@ -36,6 +36,8 @@ use crate::units::{miles_to_km, speed_to_kmh};
 /// Numeric fields carry a `minimum_delta` so a parked car does not publish on
 /// every sample. `DetailedChargeState` and the charge-schedule fields from the
 /// plugged-in status are included. `ChargeState` stays for older firmware.
+/// `Odometer` and `Soc` are re-sent every five minutes: the car only publishes a
+/// change, so a reconnect or a logger restart would otherwise leave them empty.
 pub(crate) fn subscription(
     hostname: &str,
     port: u16,
@@ -49,8 +51,8 @@ pub(crate) fn subscription(
         .field_with("ChargeState", pace(60, None, Some(900)))
         .field_with("Gear", pace(5, None, None))
         .field_with("Location", pace(30, Some(25.0), None))
-        .field_with("Odometer", pace(60, Some(0.1), None))
-        .field_with("Soc", pace(60, Some(1.0), None))
+        .field_with("Odometer", pace(60, Some(0.1), Some(300)))
+        .field_with("Soc", pace(60, Some(1.0), Some(300)))
         .field_with("VehicleSpeed", pace(10, Some(1.0), None))
         .field_with("ChargeLimitSoc", pace(300, Some(1.0), None))
         .field_with("ScheduledChargingStartTime", pace(300, None, Some(3600)))
@@ -631,6 +633,9 @@ mod tests {
         assert!(fields.contains_key("ScheduledDepartureTime"));
         assert_eq!(fields["Location"].minimum_delta, Some(25.0));
         assert_eq!(fields["Soc"].minimum_delta, Some(1.0));
+        // Re-sent so a reconnect or a logger restart gets them back without a change.
+        assert_eq!(fields["Odometer"].resend_interval_seconds, Some(300));
+        assert_eq!(fields["Soc"].resend_interval_seconds, Some(300));
         assert!(fields.values().all(|field| field.interval_seconds > 0));
         assert_eq!(request.config.hostname, "logger.example");
         assert!(request.config.ca.contains("MIIB"));
@@ -852,5 +857,373 @@ mod tests {
         );
         assert_eq!(obs.scheduled_charging_mode.as_deref(), Some("DepartBy"));
         assert_eq!(obs.scheduled_departure_time, Some(7 * 60 + 30));
+    }
+}
+
+/// Replays Fleet Telemetry records through [`handle_record`] the way the receiver
+/// loop does: sparse payloads that only carry fields whose value changed.
+#[cfg(test)]
+mod replay_tests {
+    use std::collections::HashMap;
+
+    use chrono::{DateTime, Duration, Utc};
+    use prost::Message;
+    use tesla_fleet_telemetry::proto::vehicle_connectivity::{
+        ConnectivityEvent, VehicleConnectivity,
+    };
+    use tesla_fleet_telemetry::proto::vehicle_data::{
+        Datum, Field, LocationValue, Payload, ShiftState, Value, value::Value as Raw,
+    };
+    use tesla_fleet_telemetry::{DecodeOptions, Decoded, IncomingRecord};
+
+    use super::{Folded, handle_record};
+    use crate::ingest::Archive;
+    use crate::persist::{StreamFix, VehicleIdentity};
+    use crate::test_util::TestDb;
+
+    const VIN: &str = "TEST00000000VIN02";
+    const SOCKET: &str = "test-socket-1";
+
+    enum Signal {
+        Gear(ShiftState),
+        Speed(f64),
+        Location(f64, f64),
+        OdometerMiles(f64),
+    }
+
+    fn archive(pool: sqlx::PgPool) -> Archive {
+        let (events, _) = tokio::sync::broadcast::channel(64);
+        let (kick, _) = tokio::sync::broadcast::channel(8);
+        Archive::new(
+            pool,
+            crate::geocode::Geocoder::disabled(),
+            events,
+            kick,
+            crate::position_mode::GpsBoard::default(),
+        )
+    }
+
+    fn identity() -> VehicleIdentity<'static> {
+        VehicleIdentity {
+            vin: VIN,
+            tesla_id: Some(31),
+            legacy_vehicle_id: Some(41),
+            name: Some("Replay"),
+        }
+    }
+
+    fn stamp(at: DateTime<Utc>) -> prost_types::Timestamp {
+        prost_types::Timestamp {
+            seconds: at.timestamp(),
+            nanos: i32::try_from(at.timestamp_subsec_nanos()).unwrap(),
+        }
+    }
+
+    fn options() -> DecodeOptions {
+        DecodeOptions {
+            vin_override: Some(VIN.to_owned()),
+            device_client_version: None,
+        }
+    }
+
+    fn record(
+        at: DateTime<Utc>,
+        topic: &str,
+        payload: Vec<u8>,
+        decoded: Decoded,
+    ) -> IncomingRecord {
+        IncomingRecord {
+            topic: topic.to_owned(),
+            txid: Vec::new(),
+            message_id: Vec::new(),
+            sender_id: String::new(),
+            device_type: String::new(),
+            device_id: VIN.to_owned(),
+            cert_device_type: String::new(),
+            cert_device_id: VIN.to_owned(),
+            created_at: u32::try_from(at.timestamp()).unwrap(),
+            delivered_at_epoch_ms: 0,
+            received_at_epoch_ms: 0,
+            device_client_version: String::new(),
+            network_interface: String::new(),
+            connection_id: SOCKET.to_owned(),
+            payload,
+            decoded,
+        }
+    }
+
+    fn vehicle_data(at: DateTime<Utc>, signals: &[Signal]) -> IncomingRecord {
+        let data = signals
+            .iter()
+            .map(|signal| {
+                let (key, value) = match signal {
+                    Signal::Gear(shift) => (Field::Gear, Raw::ShiftStateValue(*shift as i32)),
+                    Signal::Speed(kmh) => (Field::VehicleSpeed, Raw::DoubleValue(*kmh)),
+                    Signal::Location(latitude, longitude) => (
+                        Field::Location,
+                        Raw::LocationValue(LocationValue {
+                            latitude: *latitude,
+                            longitude: *longitude,
+                        }),
+                    ),
+                    Signal::OdometerMiles(miles) => (Field::Odometer, Raw::DoubleValue(*miles)),
+                };
+                Datum {
+                    key: key as i32,
+                    value: Some(Value { value: Some(value) }),
+                }
+            })
+            .collect();
+        let bytes = Payload {
+            data,
+            created_at: Some(stamp(at)),
+            vin: VIN.to_owned(),
+            is_resend: false,
+        }
+        .encode_to_vec();
+        let decoded = tesla_fleet_telemetry::decode_vehicle_data(&bytes, &options()).unwrap();
+        record(at, "V", bytes, Decoded::VehicleData(decoded))
+    }
+
+    fn connected(at: DateTime<Utc>) -> IncomingRecord {
+        let bytes = VehicleConnectivity {
+            vin: VIN.to_owned(),
+            connection_id: SOCKET.to_owned(),
+            status: ConnectivityEvent::Connected as i32,
+            created_at: Some(stamp(at)),
+            network_interface: String::new(),
+        }
+        .encode_to_vec();
+        let decoded = tesla_fleet_telemetry::decode_connectivity(&bytes, &options()).unwrap();
+        record(at, "connectivity", bytes, Decoded::Connectivity(decoded))
+    }
+
+    struct Replay {
+        archive: Archive,
+        folded: HashMap<String, Folded>,
+    }
+
+    impl Replay {
+        fn new(pool: sqlx::PgPool) -> Self {
+            Self {
+                archive: archive(pool),
+                folded: HashMap::new(),
+            }
+        }
+
+        async fn send(&mut self, record: IncomingRecord) {
+            handle_record(&self.archive, &mut self.folded, record)
+                .await
+                .unwrap();
+        }
+
+        async fn stream(
+            &self,
+            at: DateTime<Utc>,
+            shift: Option<&str>,
+            kmh: f64,
+            km: f64,
+            lat: f64,
+        ) {
+            let fix = StreamFix {
+                at,
+                shift_state: shift.map(str::to_owned),
+                speed_kmh: Some(kmh),
+                power_kw: Some(5.0),
+                odometer_km: Some(km),
+                battery_level: Some(80.0),
+                latitude: Some(lat),
+                longitude: Some(20.0),
+                elevation_m: None,
+                heading_deg: None,
+                rated_range_km: None,
+                est_range_km: None,
+            };
+            crate::ingest::apply_stream_for_vin(&self.archive, VIN, identity(), &fix)
+                .await
+                .unwrap();
+        }
+
+        /// Telemetry-only drive: D, ten minutes at about 40 km/h, 0 km/h, then P.
+        /// Returns the instant of the P message.
+        async fn telemetry_drive(&mut self, start: DateTime<Utc>, odometer: bool) -> DateTime<Utc> {
+            let at = |secs: i64| start + Duration::seconds(secs);
+            self.send(connected(at(0))).await;
+            self.send(vehicle_data(
+                at(0),
+                &[
+                    Signal::Gear(ShiftState::D),
+                    Signal::Speed(8.0),
+                    Signal::Location(10.0, 20.0),
+                ],
+            ))
+            .await;
+            let mut latitude = 10.0;
+            let mut miles = 600.0;
+            for step in 1..=60_i64 {
+                let mut signals = vec![Signal::Speed(if step % 2 == 0 { 40.0 } else { 45.0 })];
+                if step % 3 == 0 {
+                    latitude += 0.003;
+                    miles += 0.12;
+                    signals.push(Signal::Location(latitude, 20.0));
+                    if odometer {
+                        signals.push(Signal::OdometerMiles(miles));
+                    }
+                }
+                self.send(vehicle_data(at(step * 10), &signals)).await;
+            }
+            self.send(vehicle_data(at(605), &[Signal::Speed(0.0)]))
+                .await;
+            self.send(vehicle_data(at(608), &[Signal::Gear(ShiftState::P)]))
+                .await;
+            at(608)
+        }
+    }
+
+    async fn drive_counts(pool: &sqlx::PgPool) -> (i64, i64) {
+        sqlx::query_as(
+            "SELECT COUNT(*) FILTER (WHERE end_at IS NULL), COUNT(*) FILTER (WHERE end_at IS NOT NULL)
+             FROM drives",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn telemetry_opener_without_odometer_keeps_the_stream_drive() {
+        let Some(db) = TestDb::migrated("tdrop").await else {
+            return;
+        };
+        let mut replay = Replay::new(db.pool.clone());
+        let start = Utc::now();
+        let at = |secs: i64| start + Duration::seconds(secs);
+        // A logger restart empties the fold. The car only re-sends what changed:
+        // the gear, speed and location, not the odometer.
+        replay.send(connected(at(0))).await;
+        replay
+            .send(vehicle_data(
+                at(0),
+                &[
+                    Signal::Gear(ShiftState::D),
+                    Signal::Speed(8.0),
+                    Signal::Location(10.0, 20.0),
+                ],
+            ))
+            .await;
+        let mut km = 1000.0;
+        let mut latitude = 10.0;
+        for secs in 1..=600 {
+            km += 0.011;
+            latitude += 0.0001;
+            let shift = (secs % 60 == 0).then_some("D");
+            replay.stream(at(secs), shift, 40.0, km, latitude).await;
+        }
+        for secs in 601..=680 {
+            replay.stream(at(secs), Some("P"), 0.0, km, latitude).await;
+        }
+        assert_eq!(
+            drive_counts(&db.pool).await,
+            (0, 1),
+            "the real drive is kept"
+        );
+        let distance: (Option<f64>,) = sqlx::query_as("SELECT distance_km FROM drives")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert!(distance.0.is_some_and(|km| km > 6.0), "{distance:?}");
+    }
+
+    #[tokio::test]
+    async fn telemetry_only_confirmed_park_closes_after_the_p_window() {
+        let Some(db) = TestDb::migrated("tpark").await else {
+            return;
+        };
+        let mut replay = Replay::new(db.pool.clone());
+        let park = replay.telemetry_drive(Utc::now(), true).await;
+        crate::ingest::expire_drives(&replay.archive, park + Duration::seconds(75))
+            .await
+            .unwrap();
+        assert_eq!(drive_counts(&db.pool).await, (0, 1), "closed 60 s after P");
+        let end: (DateTime<Utc>,) = sqlx::query_as("SELECT end_at FROM drives")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            (end.0 - park).num_milliseconds().abs() <= 1,
+            "end is the P message"
+        );
+    }
+
+    #[tokio::test]
+    async fn telemetry_without_odometer_reuses_the_last_known_odometer() {
+        let Some(db) = TestDb::migrated("todo").await else {
+            return;
+        };
+        let mut replay = Replay::new(db.pool.clone());
+        let start = Utc::now();
+        let mut polled = crate::state::Observation::at(start, crate::state::Presence::Online);
+        polled.shift_state = Some("P".to_owned());
+        polled.speed_kmh = Some(0.0);
+        polled.odometer_km = Some(1000.0);
+        polled.latitude = Some(10.0);
+        polled.longitude = Some(20.0);
+        crate::ingest::apply_for_vin(&replay.archive, VIN, identity(), polled, true, false)
+            .await
+            .unwrap();
+        replay.send(connected(start)).await;
+        replay
+            .send(vehicle_data(
+                start + Duration::seconds(5),
+                &[
+                    Signal::Gear(ShiftState::D),
+                    Signal::Speed(8.0),
+                    Signal::Location(10.001, 20.0),
+                ],
+            ))
+            .await;
+        let opener: (Option<f64>,) = sqlx::query_as(
+            "SELECT odometer_km FROM positions WHERE source = 'telemetry' ORDER BY recorded_at LIMIT 1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(opener.0, Some(1000.0));
+    }
+
+    #[tokio::test]
+    async fn a_moving_drive_without_any_odometer_is_kept() {
+        let Some(db) = TestDb::migrated("tnoodo").await else {
+            return;
+        };
+        let mut replay = Replay::new(db.pool.clone());
+        let park = replay.telemetry_drive(Utc::now(), false).await;
+        crate::ingest::expire_drives(&replay.archive, park + Duration::seconds(75))
+            .await
+            .unwrap();
+        assert_eq!(
+            drive_counts(&db.pool).await,
+            (0, 1),
+            "40 km/h for ten minutes is a drive"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_telemetry_cannot_open_a_drive_but_keeps_its_positions() {
+        let Some(db) = TestDb::migrated("tstale").await else {
+            return;
+        };
+        let mut replay = Replay::new(db.pool.clone());
+        // Every message is processed more than 30 s after the car stamped it.
+        replay
+            .telemetry_drive(Utc::now() - Duration::seconds(608 + 40), true)
+            .await;
+        assert_eq!(drive_counts(&db.pool).await, (0, 0));
+        let kept: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM positions WHERE source = 'telemetry'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(kept.0 > 0, "late samples are stored, not dropped");
     }
 }

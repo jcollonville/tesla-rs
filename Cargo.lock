@@ -3182,6 +3182,8 @@ dependencies = [
  "http-body-util",
  "maud",
  "p256",
+ "prost",
+ "prost-types",
  "qrcode",
  "reqwest",
  "rumqttc",

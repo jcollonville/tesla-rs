@@ -702,6 +702,17 @@ async fn write_observation(
         if from_telemetry {
             runtime.last_telemetry = Some(Instant::now());
         }
+        let filled;
+        let obs = match known_odometer(from_telemetry, obs, runtime.published.as_ref()) {
+            Some(km) => {
+                filled = Observation {
+                    odometer_km: Some(km),
+                    ..obs.clone()
+                };
+                &filled
+            }
+            None => obs,
+        };
         let store_position = store_position
             && !(from_telemetry
                 && crate::state::telemetry_point_repeats(runtime.published.as_ref(), obs));
@@ -721,6 +732,24 @@ async fn write_observation(
     };
     crate::persist::settle_addresses(&archive.db, &archive.geocoder, jobs).await;
     Ok(())
+}
+
+/// Last known odometer for a telemetry observation that does not carry one.
+///
+/// The car only publishes a changed odometer, so the first messages after a
+/// reconnect or a restart have none. Poll and stream values are merged into
+/// `published`, which holds the latest reading.
+fn known_odometer(
+    from_telemetry: bool,
+    obs: &Observation,
+    published: Option<&Observation>,
+) -> Option<f64> {
+    if !from_telemetry || obs.odometer_km.is_some() {
+        return None;
+    }
+    published
+        .and_then(|last| last.odometer_km)
+        .filter(|km| km.is_finite())
 }
 
 async fn write_stream(

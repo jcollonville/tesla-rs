@@ -1198,11 +1198,17 @@ pub(crate) fn merge_clock(stored: DriveClock, memory: Option<DriveClock>) -> Dri
         return stored;
     };
     if memory.last_driving_at > stored.last_driving_at {
+        // Telemetry speed-only messages are not stored as positions, so memory is
+        // often newer. A stop that began after that evidence still counts.
+        let stop = memory
+            .park_since
+            .filter(|since| *since >= memory.last_driving_at)
+            .zip(memory.stop_kind);
         return DriveClock {
             last_driving_at: memory.last_driving_at,
             last_message_at: memory.last_message_at.max(stored.last_message_at),
-            park_since: None,
-            stop_kind: None,
+            park_since: stop.map(|(since, _)| since),
+            stop_kind: stop.map(|(_, kind)| kind),
         };
     }
     if stored.park_since.is_none()
@@ -1540,17 +1546,15 @@ pub(crate) const MIN_CLOSED_DRIVE_KM: f64 = 0.01;
 /// Whether closing this drive should update the row.
 ///
 /// TeslaMate keeps a drive only when it has at least two positions and the
-/// odometer of the last position minus the odometer of the first (ordered by
-/// date) is at least [`MIN_CLOSED_DRIVE_KM`]. A missing odometer makes that
-/// distance NULL. GPS distance is not consulted.
+/// last known odometer minus the first known odometer (ordered by date) is at
+/// least [`MIN_CLOSED_DRIVE_KM`]. Positions without an odometer are skipped: a
+/// telemetry message that opens a drive may not carry one. No odometer at all
+/// makes that distance NULL. GPS distance is not consulted.
 pub(crate) fn keep_closed_drive(samples: &[Sample]) -> bool {
-    let Some((first, last)) = samples.first().zip(samples.last()) else {
+    let Some(start) = first_finite(samples.iter().filter_map(|sample| sample.odometer_km)) else {
         return false;
     };
-    let Some(start) = first.odometer_km.filter(|km| km.is_finite()) else {
-        return false;
-    };
-    let Some(end) = last.odometer_km.filter(|km| km.is_finite()) else {
+    let Some(end) = last_finite(samples.iter().filter_map(|sample| sample.odometer_km)) else {
         return false;
     };
     if samples.len() < 2 {
@@ -1560,6 +1564,28 @@ pub(crate) fn keep_closed_drive(samples: &[Sample]) -> bool {
     // delta to the nearest millimetre so a stored 0.01 km still meets the check.
     let delta_km = ((end - start) * 1_000_000.0).round() / 1_000_000.0;
     delta_km >= MIN_CLOSED_DRIVE_KM
+}
+
+/// Odometer travel in a drive window that proves the car really moved.
+pub(crate) const MOVEMENT_GUARD_KM: f64 = 0.1;
+
+/// Speed that proves movement when no position in the window has an odometer.
+pub(crate) const MOVEMENT_GUARD_KMH: f64 = 5.0;
+
+/// Positions above [`MOVEMENT_GUARD_KMH`] needed when there is no odometer.
+/// One fast sample alone can be noise or a single sparse poll.
+pub(crate) const MOVEMENT_GUARD_SAMPLES: i64 = 2;
+
+/// Whether a drive window shows real movement, so the drive must not be discarded.
+///
+/// The odometer wins when the window has one: a short odometer delta stays a
+/// non-drive even if one sample reported a speed. Without any odometer, at
+/// least [`MOVEMENT_GUARD_SAMPLES`] positions above [`MOVEMENT_GUARD_KMH`] count.
+pub(crate) fn window_shows_movement(odometer_delta_km: Option<f64>, moving_samples: i64) -> bool {
+    match odometer_delta_km.filter(|km| km.is_finite()) {
+        Some(km) => km >= MOVEMENT_GUARD_KM,
+        None => moving_samples >= MOVEMENT_GUARD_SAMPLES,
+    }
 }
 
 pub(crate) fn summarize_drive(
@@ -1825,11 +1851,11 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use super::{
-        Activity, ClosedDrive, Observation, Presence, Sample, Tracker, Transition,
-        drive_end_cutoff, gate_stream_sample, keep_closed_drive, plan_drive_close, reduce,
-        sanitize_charger_type, should_reopen_drive, should_store_stream_position,
-        stream_collides_with_poll, stream_drive_decision, stream_motion, summarize_charge,
-        summarize_drive,
+        Activity, ClosedDrive, DriveClock, Observation, Presence, Sample, StopKind, Tracker,
+        Transition, drive_end_cutoff, gate_stream_sample, keep_closed_drive, merge_clock,
+        plan_drive_close, reduce, sanitize_charger_type, should_reopen_drive,
+        should_store_stream_position, stream_collides_with_poll, stream_drive_decision,
+        stream_motion, summarize_charge, summarize_drive, window_shows_movement,
     };
 
     fn odometer_sample(minute: i64, odometer_km: Option<f64>, latitude: f64) -> Sample {
@@ -2970,5 +2996,54 @@ mod tests {
             odometer_sample(1, Some(110.0), 49.0),
         ];
         assert!(!keep_closed_drive(&samples));
+    }
+
+    #[test]
+    fn a_leading_sample_without_odometer_does_not_discard_the_drive() {
+        // Telemetry opened the drive before the car re-sent its odometer.
+        let samples = vec![
+            odometer_sample(0, None, 48.0),
+            odometer_sample(1, Some(100.0), 48.5),
+            odometer_sample(2, Some(101.9), 49.0),
+        ];
+        assert!(keep_closed_drive(&samples));
+    }
+
+    #[test]
+    fn merge_clock_keeps_a_park_timer_newer_than_the_memory_driving_evidence() {
+        let stored = DriveClock::moving_at(at(0));
+        let memory = DriveClock {
+            last_driving_at: at(2),
+            last_message_at: at(3),
+            park_since: Some(at(3)),
+            stop_kind: Some(StopKind::Park),
+        };
+        let merged = merge_clock(stored, Some(memory));
+        assert_eq!(merged.last_driving_at, at(2));
+        assert_eq!(merged.park_since, Some(at(3)));
+        assert_eq!(merged.stop_kind, Some(StopKind::Park));
+    }
+
+    #[test]
+    fn merge_clock_drops_a_park_timer_older_than_the_driving_evidence() {
+        let stored = DriveClock::moving_at(at(0));
+        let memory = DriveClock {
+            last_driving_at: at(4),
+            last_message_at: at(4),
+            park_since: Some(at(3)),
+            stop_kind: Some(StopKind::Park),
+        };
+        let merged = merge_clock(stored, Some(memory));
+        assert_eq!(merged.park_since, None);
+        assert_eq!(merged.stop_kind, None);
+    }
+
+    #[test]
+    fn movement_window_prefers_the_odometer_then_speed() {
+        assert!(window_shows_movement(Some(0.1), 0));
+        assert!(!window_shows_movement(Some(0.05), 40));
+        assert!(window_shows_movement(None, 2));
+        assert!(!window_shows_movement(None, 1));
+        assert!(!window_shows_movement(Some(f64::NAN), 0));
     }
 }
