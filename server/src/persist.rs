@@ -12,11 +12,11 @@ use crate::geocode::{Geocoder, cache_key};
 use crate::geofence::{Fence, haversine_m, matching_geofence};
 use crate::state::{
     Activity, CONTINUITY_JOIN_SECS, ClosePlan, ClosedDrive, DriveClock, DriveGrace, DriveMotion,
-    DriveSummary, GapFacts, Observation, PARK_REOPEN_SECS, PositionCue, Presence, Sample, StopKind,
-    Tracker, Transition, clock_from_tail, drive_end_cutoff, gap_close_suppressed,
-    gate_stream_sample, keep_closed_drive, merge_clock, observation_motion, plan_drive_close,
-    plan_drive_end_repair, plan_drive_expire, should_reopen_drive, soc_level, summarize_charge,
-    summarize_drive,
+    DriveSummary, GapFacts, MOVEMENT_GUARD_KMH, Observation, PARK_REOPEN_SECS, PositionCue,
+    Presence, Sample, StopKind, Tracker, Transition, clock_from_tail, drive_end_cutoff,
+    gap_close_suppressed, gate_stream_sample, keep_closed_drive, merge_clock, observation_motion,
+    plan_drive_close, plan_drive_end_repair, plan_drive_expire, should_reopen_drive, soc_level,
+    summarize_charge, summarize_drive, window_shows_movement,
 };
 
 /// Identity fields learned from a vehicle list response.
@@ -1723,12 +1723,21 @@ async fn close_drive(
     .fetch_all(&mut **tx)
     .await?;
     let samples: Vec<Sample> = rows.into_iter().map(PositionSample::into_sample).collect();
-    let Some(summary) =
-        summarize_drive(&samples, efficiency).filter(|_| keep_closed_drive(&samples))
-    else {
+    let Some(summary) = summarize_drive(&samples, efficiency) else {
         discard_drive(tx, vehicle_id, drive_id).await?;
         return Ok(None);
     };
+    if !keep_closed_drive(&samples) {
+        if !drive_window_moved(tx, vehicle_id, drive_id, obs.at).await? {
+            discard_drive(tx, vehicle_id, drive_id).await?;
+            return Ok(None);
+        }
+        tracing::warn!(
+            vehicle_id,
+            drive_id,
+            "kept a drive that failed the odometer check: its positions show movement"
+        );
+    }
     let end_battery = summary
         .end_battery_level
         .or(soc_level(obs.battery_level, obs.usable_battery_level));
@@ -1738,6 +1747,37 @@ async fn close_drive(
         .and_then(|(latitude, longitude)| matching_geofence(latitude, longitude, fences));
     update_drive(tx, drive_id, &summary, end_battery, geofence_id).await?;
     Ok(Some(finished_drive(drive_id, &summary)))
+}
+
+/// Movement in the drive window, attached or detached positions alike.
+///
+/// The window runs from the drive start to `until`. Positions of another drive
+/// are ignored. See [`window_shows_movement`].
+async fn drive_window_moved(
+    tx: &mut Transaction<'_, Postgres>,
+    vehicle_id: i64,
+    drive_id: i64,
+    until: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    let (odometer_delta_km, moving_samples): (Option<f64>, i64) = sqlx::query_as(
+        "SELECT MAX(p.odometer_km) FILTER (WHERE p.odometer_km <> 'NaN'::float8)
+              - MIN(p.odometer_km) FILTER (WHERE p.odometer_km <> 'NaN'::float8),
+                COUNT(*) FILTER (WHERE p.speed_kmh > $4 AND p.speed_kmh <> 'NaN'::float8)
+         FROM drives d
+         JOIN positions p ON p.vehicle_id = d.vehicle_id
+         WHERE d.id = $2
+           AND p.vehicle_id = $1
+           AND p.recorded_at >= d.start_at
+           AND p.recorded_at <= GREATEST($3, d.start_at)
+           AND (p.drive_id = $2 OR p.drive_id IS NULL)",
+    )
+    .bind(vehicle_id)
+    .bind(drive_id)
+    .bind(until)
+    .bind(MOVEMENT_GUARD_KMH)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(window_shows_movement(odometer_delta_km, moving_samples))
 }
 
 fn finished_drive(drive_id: i64, summary: &DriveSummary) -> ClosedDrive {
@@ -1941,6 +1981,184 @@ pub(crate) async fn repair_drive_ends(
         unchanged,
         changed,
     })
+}
+
+/// Longest window [`rebuild_drive`] accepts.
+const REBUILD_MAX_WINDOW: chrono::Duration = chrono::Duration::hours(24);
+
+/// What [`rebuild_drive`] found, or wrote. No coordinates, VIN, or secrets.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DriveRebuildReport {
+    /// `true` when `--apply` wrote rows.
+    pub applied: bool,
+    /// Positions of the vehicle in the window that belong to no drive.
+    pub positions: i64,
+    /// Last known minus first known odometer of those positions.
+    pub odometer_delta_km: Option<f64>,
+    /// Drive created by an apply.
+    pub drive_id: Option<i64>,
+}
+
+/// Rebuilds one closed drive from positions that a discard left without a drive.
+///
+/// Refuses a window that is empty, longer than a day, holds fewer than two
+/// detached positions, or overlaps an existing drive of the vehicle. The drive
+/// takes the source of its first position. Its summary and end come from the
+/// same code that closes live drives, so the park tail is detached again.
+/// Dry-run (`apply` false) runs in a read-only transaction and writes nothing.
+/// Address lookups are returned for the caller to geocode after commit.
+pub(crate) async fn rebuild_drive(
+    pool: &PgPool,
+    vehicle_id: i64,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    apply: bool,
+) -> Result<(DriveRebuildReport, Vec<AddressJob>), AppError> {
+    if to <= from || to - from > REBUILD_MAX_WINDOW {
+        return Err(AppError::message(
+            "rebuild window must be positive and at most 24 hours",
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    if !apply {
+        sqlx::query("SET TRANSACTION READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+    }
+    let (efficiency,): (Option<f64>,) =
+        sqlx::query_as("SELECT efficiency_kwh_per_km FROM vehicles WHERE id = $1")
+            .bind(vehicle_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::message("vehicle not found"))?;
+    let (overlap,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (
+             SELECT 1 FROM drives
+             WHERE vehicle_id = $1 AND deleted_at IS NULL
+               AND start_at <= $3 AND COALESCE(end_at, 'infinity'::timestamptz) >= $2
+         )",
+    )
+    .bind(vehicle_id)
+    .bind(from)
+    .bind(to)
+    .fetch_one(&mut *tx)
+    .await?;
+    if overlap {
+        return Err(AppError::message("the window overlaps an existing drive"));
+    }
+    let window: DetachedWindow = sqlx::query_as(
+        "SELECT COUNT(*) AS positions,
+                MIN(recorded_at) AS first_at,
+                MAX(recorded_at) AS last_at,
+                (ARRAY_AGG(odometer_km ORDER BY recorded_at, id)
+                    FILTER (WHERE odometer_km <> 'NaN'::float8))[1] AS first_km,
+                (ARRAY_AGG(odometer_km ORDER BY recorded_at DESC, id DESC)
+                    FILTER (WHERE odometer_km <> 'NaN'::float8))[1] AS last_km,
+                (ARRAY_AGG(source ORDER BY recorded_at, id))[1] AS source
+         FROM positions
+         WHERE vehicle_id = $1 AND drive_id IS NULL AND recorded_at BETWEEN $2 AND $3",
+    )
+    .bind(vehicle_id)
+    .bind(from)
+    .bind(to)
+    .fetch_one(&mut *tx)
+    .await?;
+    let mut report = DriveRebuildReport {
+        applied: apply,
+        positions: window.positions,
+        odometer_delta_km: window
+            .first_km
+            .zip(window.last_km)
+            .map(|(first, last)| last - first),
+        drive_id: None,
+    };
+    let (Some(start_at), Some(end_at)) = (window.first_at, window.last_at) else {
+        return Err(AppError::message("no detached positions in the window"));
+    };
+    if window.positions < 2 {
+        return Err(AppError::message("fewer than two detached positions"));
+    }
+    if !apply {
+        tx.rollback().await?;
+        return Ok((report, Vec::new()));
+    }
+    let (drive_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO drives (vehicle_id, start_at, end_at, source)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id",
+    )
+    .bind(vehicle_id)
+    .bind(start_at)
+    .bind(end_at)
+    .bind(window.source.as_deref().unwrap_or("poll"))
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE positions SET drive_id = $1
+         WHERE vehicle_id = $2 AND drive_id IS NULL AND recorded_at BETWEEN $3 AND $4",
+    )
+    .bind(drive_id)
+    .bind(vehicle_id)
+    .bind(start_at)
+    .bind(end_at)
+    .execute(&mut *tx)
+    .await?;
+    if refresh_closed_drive(&mut tx, drive_id, efficiency)
+        .await?
+        .is_none()
+    {
+        tx.rollback().await?;
+        return Err(AppError::message(
+            "the positions do not make a drive; nothing was written",
+        ));
+    }
+    let ends: (Option<f64>, Option<f64>, Option<f64>, Option<f64>) = sqlx::query_as(
+        "SELECT start_latitude, start_longitude, end_latitude, end_longitude
+         FROM drives WHERE id = $1",
+    )
+    .bind(drive_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    report.drive_id = Some(drive_id);
+    let mut jobs = Vec::new();
+    for (which, latitude, longitude) in [("start", ends.0, ends.1), ("end", ends.2, ends.3)] {
+        if let Some((latitude, longitude)) = latitude.zip(longitude) {
+            jobs.push(AddressJob {
+                drive_id: Some(drive_id),
+                charge_id: None,
+                which,
+                latitude,
+                longitude,
+            });
+        }
+    }
+    Ok((report, jobs))
+}
+
+#[derive(sqlx::FromRow)]
+struct DetachedWindow {
+    positions: i64,
+    first_at: Option<DateTime<Utc>>,
+    last_at: Option<DateTime<Utc>>,
+    first_km: Option<f64>,
+    last_km: Option<f64>,
+    source: Option<String>,
+}
+
+/// Text report for the `rebuild-drive` command.
+pub(crate) fn format_drive_rebuild(report: &DriveRebuildReport) -> String {
+    let mode = if report.applied { "apply" } else { "dry-run" };
+    let delta = report
+        .odometer_delta_km
+        .map_or_else(|| "unknown".to_owned(), |km| format!("{km:.3}"));
+    let drive = report
+        .drive_id
+        .map_or_else(|| "none".to_owned(), |id| id.to_string());
+    format!(
+        "mode={mode}\npositions={}\nodometer_delta_km={delta}\ndrive_id={drive}\n",
+        report.positions
+    )
 }
 
 /// Connects and runs [`repair_drive_ends`]. The URL is not logged.

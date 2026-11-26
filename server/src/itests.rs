@@ -3920,3 +3920,109 @@ async fn authed_status(state: &crate::app::AppState, uri: &str, token: Option<&s
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
 }
+
+async fn insert_detached_position(
+    pool: &sqlx::PgPool,
+    vehicle_id: i64,
+    at: DateTime<Utc>,
+    speed_kmh: f64,
+    odometer_km: Option<f64>,
+    latitude: f64,
+    source: &str,
+) {
+    sqlx::query(
+        "INSERT INTO positions (vehicle_id, recorded_at, latitude, longitude, speed_kmh,
+                                odometer_km, battery_level, source)
+         VALUES ($1, $2, $3, 20.0, $4, $5, 80.0, $6)",
+    )
+    .bind(vehicle_id)
+    .bind(at)
+    .bind(latitude)
+    .bind(speed_kmh)
+    .bind(odometer_km)
+    .bind(source)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn rebuild_drive_reattaches_detached_positions_once() {
+    let Some(db) = TestDb::migrated("rebuild").await else {
+        return;
+    };
+    let archive = test_archive(db.pool.clone());
+    let vin = "5YJ3E1EA7KF000093";
+    let base = Utc::now() - chrono::Duration::hours(2);
+    apply_for_vin(
+        &archive,
+        vin,
+        car(vin),
+        Observation::at(base - chrono::Duration::minutes(5), Presence::Asleep),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let (vehicle_id,): (i64,) = sqlx::query_as("SELECT id FROM vehicles WHERE vin = $1")
+        .bind(vin)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    // A telemetry opener without odometer, then stream points, then a stop.
+    insert_detached_position(&db.pool, vehicle_id, base, 8.0, None, 10.0, "telemetry").await;
+    for step in 1..=30_i32 {
+        let speed = if step > 27 { 0.0 } else { 40.0 };
+        insert_detached_position(
+            &db.pool,
+            vehicle_id,
+            base + chrono::Duration::seconds(i64::from(step) * 10),
+            speed,
+            Some(1000.0 + 0.1 * f64::from(step.min(27))),
+            10.0 + 0.001 * f64::from(step.min(27)),
+            "stream",
+        )
+        .await;
+    }
+    let from = base - chrono::Duration::seconds(1);
+    let to = base + chrono::Duration::seconds(301);
+
+    let dry = crate::persist::rebuild_drive(&db.pool, vehicle_id, from, to, false)
+        .await
+        .unwrap()
+        .0;
+    assert!(!dry.applied);
+    assert_eq!(dry.positions, 31);
+    assert!(dry.drive_id.is_none());
+    let untouched: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM drives), (SELECT COUNT(drive_id) FROM positions)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(untouched, (0, 0), "a dry run writes nothing");
+
+    let applied = crate::persist::rebuild_drive(&db.pool, vehicle_id, from, to, true)
+        .await
+        .unwrap()
+        .0;
+    assert!(applied.applied);
+    let drive_id = applied.drive_id.unwrap();
+    let (end_at, distance, source): (Option<DateTime<Utc>>, Option<f64>, String) =
+        sqlx::query_as("SELECT end_at, distance_km, source FROM drives WHERE id = $1")
+            .bind(drive_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(source, "telemetry", "the first position's source");
+    assert!(end_at.is_some());
+    assert!(
+        distance.is_some_and(|km| (km - 2.6).abs() < 1e-6),
+        "{distance:?}"
+    );
+
+    let again = crate::persist::rebuild_drive(&db.pool, vehicle_id, from, to, true).await;
+    assert!(again.is_err(), "a window that overlaps a drive is refused");
+    let backwards = crate::persist::rebuild_drive(&db.pool, vehicle_id, to, from, false).await;
+    assert!(backwards.is_err());
+}

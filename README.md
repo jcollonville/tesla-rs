@@ -414,6 +414,13 @@ cargo run -p tesla-logger -- repair-drive-ends
 cargo run -p tesla-logger -- repair-drive-ends --apply
 ```
 
+Rebuild one drive from positions that a discard left without a drive (`drive_id` is null). The window is given in RFC 3339 and is at most 24 hours. The command refuses a window that overlaps an existing drive of the vehicle or holds fewer than two detached positions. The drive takes the source of its first position, and its summary and end come from the same code that closes live drives. Without `--apply` it runs in a read-only transaction and only prints counts (no coordinates, VIN, or secrets). With `--apply` everything is one transaction; start and end addresses are then looked up with the configured Nominatim settings, best effort.
+
+```bash
+cargo run -p tesla-logger -- rebuild-drive --vehicle-id 1 --from 2026-01-01T10:00:00Z --to 2026-01-01T10:20:00Z
+cargo run -p tesla-logger -- rebuild-drive --vehicle-id 1 --from 2026-01-01T10:00:00Z --to 2026-01-01T10:20:00Z --apply
+```
+
 ### Check the setup
 
 These checks assume the listener is on port 4000, as in the example file and Compose.
