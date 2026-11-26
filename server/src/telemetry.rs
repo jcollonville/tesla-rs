@@ -43,7 +43,8 @@ pub(crate) fn subscription(
     vins: &[String],
 ) -> Result<tesla_fleet_api::FleetTelemetryConfigRequest, AppError> {
     use tesla_fleet_telemetry::FleetTelemetryConfig;
-    let config = FleetTelemetryConfig::builder(hostname, port, ca_pem)
+    let ca = crate::telemetry_config::ca_chain_pem(ca_pem);
+    let config = FleetTelemetryConfig::builder(hostname, port, ca)
         .field_with("DetailedChargeState", pace(60, None, Some(900)))
         .field_with("ChargeState", pace(60, None, Some(900)))
         .field_with("Gear", pace(5, None, None))
@@ -563,7 +564,17 @@ mod tests {
         assert_eq!(fields["Soc"].minimum_delta, Some(1.0));
         assert!(fields.values().all(|field| field.interval_seconds > 0));
         assert_eq!(request.config.hostname, "logger.example");
-        assert_ne!(request.config.ca, "");
+        assert!(request.config.ca.contains("MIIB"));
+        let chained = subscription(
+            "logger.example",
+            4443,
+            "-----BEGIN CERTIFICATE-----\nLEAFDATA\n-----END CERTIFICATE-----\n\
+             -----BEGIN CERTIFICATE-----\nROOTDATA\n-----END CERTIFICATE-----\n",
+            &["TEST00000000VIN01".to_owned()],
+        )
+        .unwrap();
+        assert!(chained.config.ca.contains("ROOTDATA"));
+        assert!(!chained.config.ca.contains("LEAFDATA"));
     }
 
     use crate::state::{Observation, Presence};

@@ -357,15 +357,27 @@ pub(super) async fn car_card(app: &AppState, id: i64) -> CarCard {
     if cable.stale {
         facts.push(("Charge", "Inconnue".to_owned()));
     }
-    facts.push((
-        "Données",
-        if app.inner.archive.data_source() == "telemetry" {
-            "Télémétrie"
-        } else {
-            "Interrogation"
-        }
-        .to_owned(),
-    ));
+    facts.push(
+        (
+            "Données",
+            if let Some(vin) =
+                sqlx::query_scalar::<_, String>("SELECT vin FROM vehicles WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&app.inner.db)
+                    .await
+                    .ok()
+                    .flatten()
+            {
+                match app.inner.archive.reported_data_source(&vin).await {
+                    "telemetry" => "Télémétrie",
+                    _ => "Interrogation",
+                }
+            } else {
+                "Interrogation"
+            }
+            .to_owned(),
+        ),
+    );
     let seen = state.last_data_at.or(state.last_poll_at);
     let trim = state
         .marketing_name

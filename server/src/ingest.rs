@@ -261,16 +261,29 @@ pub(crate) trait IngestSource: Send + Sync {
     /// Live data when the vehicle is already online, otherwise a resting presence.
     fn observe(&self, vin: &str) -> impl Future<Output = Result<ObserveResult, AppError>> + Send;
 
-    /// Push a Fleet Telemetry config. The default does nothing.
+    /// Push a signed Fleet Telemetry config. The default reports every VIN as configured.
     fn configure_telemetry(
         &self,
         vins: &[String],
         host: &str,
         port: u16,
         ca_pem: &str,
-    ) -> impl Future<Output = Result<(), AppError>> + Send {
-        let _ = (vins, host, port, ca_pem);
-        std::future::ready(Ok(()))
+    ) -> impl Future<Output = Result<crate::telemetry_config::PushOutcome, AppError>> + Send {
+        let _ = (host, port, ca_pem);
+        std::future::ready(Ok(crate::telemetry_config::PushOutcome {
+            configured: vins.to_vec(),
+            skipped: Vec::new(),
+        }))
+    }
+
+    /// Whether Tesla still has our config for this VIN. The default does not call Tesla.
+    fn telemetry_installed(
+        &self,
+        vin: &str,
+        expected_host: &str,
+    ) -> impl Future<Output = Result<bool, AppError>> + Send {
+        let _ = (vin, expected_host);
+        std::future::ready(Ok(true))
     }
 }
 
@@ -344,9 +357,12 @@ pub(crate) struct Archive {
     pub runtime: Option<crate::settings::RuntimeConfig>,
     /// Set when Fleet Telemetry should be subscribed on the cars.
     pub telemetry: Option<TelemetryTarget>,
+    /// A message newer than this is `data_source=telemetry`.
+    pub telemetry_fresh_for: Duration,
 }
 
 impl Archive {
+    /// Configured mode. The live API field uses [`Self::reported_data_source`].
     pub(crate) fn data_source(&self) -> &'static str {
         if self.telemetry.is_some() {
             "telemetry"
@@ -354,24 +370,155 @@ impl Archive {
             "polling"
         }
     }
+
+    pub(crate) async fn reported_data_source(&self, vin: &str) -> &'static str {
+        if self.telemetry.is_none() {
+            return "polling";
+        }
+        crate::telemetry_config::live_data_source(
+            self.telemetry_age(vin).await,
+            self.telemetry_fresh_for,
+        )
+    }
+
+    pub(crate) async fn any_fresh_telemetry(&self) -> bool {
+        if self.telemetry.is_none() {
+            return false;
+        }
+        let slots = self.runtimes.lock().await;
+        for slot in slots.values() {
+            let runtime = slot.lock().await;
+            if runtime
+                .last_telemetry
+                .is_some_and(|at| at.elapsed() <= self.telemetry_fresh_for)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) async fn telemetry_age(&self, vin: &str) -> Option<Duration> {
+        let slots = self.runtimes.lock().await;
+        let slot = slots.get(vin)?;
+        let runtime = slot.lock().await;
+        runtime.last_telemetry.map(|at| at.elapsed())
+    }
 }
 
-/// Where the car should send Fleet Telemetry, plus the VINs already configured.
+/// Where the car should send Fleet Telemetry, plus the VINs Tesla accepted.
 pub(crate) struct TelemetryTarget {
     pub host: String,
     pub port: u16,
     pub ca: String,
-    pushed: Mutex<std::collections::HashSet<String>>,
+    pub check_every: Duration,
+    pub retry_base: Duration,
+    pub retry_cap: Duration,
+    book: Mutex<TelemetryBook>,
+}
+
+struct TelemetryBook {
+    configured: std::collections::BTreeSet<String>,
+    skipped: std::collections::BTreeMap<String, String>,
+    failures: u32,
+    next_attempt: Instant,
+    force: bool,
+    last_error: Option<String>,
 }
 
 impl TelemetryTarget {
-    pub(crate) fn new(host: String, port: u16, ca: String) -> Self {
+    pub(crate) fn new(
+        host: String,
+        port: u16,
+        ca: String,
+        check_every: Duration,
+        retry_base: Duration,
+    ) -> Self {
         Self {
             host,
             port,
             ca,
-            pushed: Mutex::new(std::collections::HashSet::new()),
+            check_every,
+            retry_base,
+            retry_cap: Duration::from_secs(6 * 3600),
+            book: Mutex::new(TelemetryBook {
+                configured: std::collections::BTreeSet::new(),
+                skipped: std::collections::BTreeMap::new(),
+                failures: 0,
+                next_attempt: Instant::now(),
+                force: false,
+                last_error: None,
+            }),
         }
+    }
+
+    pub(crate) async fn force(&self) {
+        let mut book = self.book.lock().await;
+        book.force = true;
+        book.next_attempt = Instant::now();
+    }
+
+    pub(crate) async fn skip_reason(&self, vin: &str) -> Option<String> {
+        self.book.lock().await.skipped.get(vin).cloned()
+    }
+
+    pub(crate) async fn is_configured(&self, vin: &str) -> bool {
+        self.book.lock().await.configured.contains(vin)
+    }
+
+    pub(crate) async fn last_error(&self) -> Option<String> {
+        self.book.lock().await.last_error.clone()
+    }
+
+    async fn due(&self) -> (bool, bool, std::collections::BTreeSet<String>) {
+        let book = self.book.lock().await;
+        (
+            Instant::now() >= book.next_attempt,
+            book.force,
+            book.configured.clone(),
+        )
+    }
+
+    async fn drop_configured(&self, vins: &[String]) {
+        let mut book = self.book.lock().await;
+        for vin in vins {
+            book.configured.remove(vin);
+        }
+    }
+
+    async fn apply(&self, outcome: &crate::telemetry_config::PushOutcome) {
+        let mut book = self.book.lock().await;
+        let next = Instant::now() + self.check_every;
+        let TelemetryBook {
+            configured,
+            skipped,
+            failures,
+            force,
+            last_error,
+            next_attempt,
+        } = &mut *book;
+        crate::telemetry_config::apply_outcome(configured, skipped, outcome);
+        *failures = 0;
+        *force = false;
+        *last_error = None;
+        *next_attempt = next;
+    }
+
+    async fn checked(&self) {
+        let mut book = self.book.lock().await;
+        book.failures = 0;
+        book.force = false;
+        book.last_error = None;
+        book.next_attempt = Instant::now() + self.check_every;
+    }
+
+    async fn fail(&self, err: &AppError) {
+        let mut book = self.book.lock().await;
+        book.failures = book.failures.saturating_add(1);
+        book.force = false;
+        book.last_error = Some(crate::logs::redact_line(&err.to_string(), &[]));
+        book.next_attempt = Instant::now()
+            + crate::telemetry_config::retry_delay(book.failures, self.retry_base, self.retry_cap);
     }
 }
 
@@ -398,6 +545,7 @@ impl Archive {
             drive_grace: crate::state::DriveGrace::standard(),
             runtime: None,
             telemetry: None,
+            telemetry_fresh_for: Duration::from_secs(900),
         }
     }
 
@@ -571,6 +719,7 @@ pub(crate) async fn expire_drives(
 pub(crate) struct FleetPoll<T> {
     client: FleetClient<T>,
     debug: DebugBoard,
+    signing: Option<crate::telemetry_config::SigningMaterial>,
 }
 
 impl<T: AccessTokenProvider> FleetPoll<T> {
@@ -580,7 +729,19 @@ impl<T: AccessTokenProvider> FleetPoll<T> {
     }
 
     pub(crate) fn with_debug(client: FleetClient<T>, debug: DebugBoard) -> Self {
-        Self { client, debug }
+        Self {
+            client,
+            debug,
+            signing: None,
+        }
+    }
+
+    pub(crate) fn with_signing(
+        mut self,
+        signing: crate::telemetry_config::SigningMaterial,
+    ) -> Self {
+        self.signing = Some(signing);
+        self
     }
 
     fn note_http(
@@ -613,7 +774,11 @@ where
             },
         )
         .map_err(fleet_error)?;
-        Ok(Self { client, debug })
+        Ok(Self {
+            client,
+            debug,
+            signing: None,
+        })
     }
 }
 
@@ -784,23 +949,60 @@ impl<T: AccessTokenProvider> IngestSource for FleetPoll<T> {
         host: &str,
         port: u16,
         ca_pem: &str,
-    ) -> Result<(), AppError> {
-        let request = crate::telemetry::subscription(host, port, ca_pem, vins)?;
-        match self.client.create_fleet_telemetry_config(&request).await {
-            Ok(update) => {
-                tracing::info!(
-                    updated = update.updated_vehicles,
-                    "fleet telemetry config applied"
+    ) -> Result<crate::telemetry_config::PushOutcome, AppError> {
+        let Some(signing) = self.signing.as_ref() else {
+            return Err(AppError::message("telemetry signing is not configured"));
+        };
+        let path = if signing.proxy_endpoint.is_some() {
+            "/api/1/vehicles/fleet_telemetry_config"
+        } else {
+            "/api/1/vehicles/fleet_telemetry_config_jws"
+        };
+        match crate::telemetry_config::push_config(&self.client, signing, host, port, ca_pem, vins)
+            .await
+        {
+            Ok(outcome) => {
+                self.note_http(
+                    "POST",
+                    path,
+                    Some(200),
+                    Instant::now(),
+                    "telemetry config applied",
                 );
-                Ok(())
+                Ok(outcome)
             }
             Err(err) => {
                 self.note_http(
                     "POST",
-                    "/api/1/vehicles/fleet_telemetry_config",
-                    fleet_http_status(&err),
+                    path,
+                    None,
                     Instant::now(),
                     "telemetry config was not applied",
+                );
+                Err(err)
+            }
+        }
+    }
+
+    async fn telemetry_installed(&self, vin: &str, expected_host: &str) -> Result<bool, AppError> {
+        let tag = tesla_fleet_api::VehicleTag::new(vin)
+            .map_err(|_| AppError::message("vehicle vin is invalid"))?;
+        match self.client.fleet_telemetry_config(&tag).await {
+            Ok(found) => {
+                let host = found.config.as_ref().map(|cfg| cfg.hostname.as_str());
+                Ok(!crate::telemetry_config::config_needs_resend(
+                    host,
+                    expected_host,
+                ))
+            }
+            Err(FleetError::NotFound { .. }) => Ok(false),
+            Err(err) => {
+                self.note_http(
+                    "GET",
+                    "/api/1/vehicles/{vin}/fleet_telemetry_config",
+                    fleet_http_status(&err),
+                    Instant::now(),
+                    "telemetry config was not read",
                 );
                 Err(fleet_error(err))
             }
@@ -863,33 +1065,74 @@ fn classify_fleet(err: FleetError) -> Result<ObserveResult, AppError> {
     }
 }
 
-async fn subscribe_telemetry(source: &impl IngestSource, archive: &Archive, vehicles: &[Summary]) {
+pub(crate) async fn subscribe_telemetry(
+    source: &impl IngestSource,
+    archive: &Archive,
+    vehicles: &[Summary],
+    billing_blocked: bool,
+) {
     let Some(target) = archive.telemetry.as_ref() else {
         return;
     };
-    let mut pending = Vec::new();
-    {
-        let pushed = target.pushed.lock().await;
-        for summary in vehicles {
-            if !pushed.contains(&summary.vin) {
-                pending.push(summary.vin.clone());
+    let known = vehicles
+        .iter()
+        .map(|summary| summary.vin.clone())
+        .collect::<Vec<_>>();
+    let (due, force, configured) = target.due().await;
+    let Some(plan) =
+        crate::telemetry_config::plan_attempt(due, billing_blocked, &known, &configured, force)
+    else {
+        if billing_blocked {
+            tracing::info!("fleet telemetry config check skipped while the data budget is paused");
+        }
+        return;
+    };
+    let mut missing = Vec::new();
+    for vin in &plan.check {
+        match source.telemetry_installed(vin, &target.host).await {
+            Ok(true) => {}
+            Ok(false) => missing.push(vin.clone()),
+            Err(err) => {
+                target.fail(&err).await;
+                let message = crate::logs::redact_line(&err.to_string(), &[]);
+                tracing::warn!(error = %message, "fleet telemetry config could not be read");
+                return;
             }
         }
     }
-    if pending.is_empty() {
+    if !missing.is_empty() {
+        target.drop_configured(&missing).await;
+        tracing::info!(
+            cars = missing.len(),
+            "fleet telemetry config is gone and will be sent again"
+        );
+    }
+    let mut push = plan.push;
+    push.extend(missing);
+    if push.is_empty() {
+        target.checked().await;
         return;
     }
-    let count = pending.len();
-    if let Err(err) = source
-        .configure_telemetry(&pending, &target.host, target.port, &target.ca)
+    match source
+        .configure_telemetry(&push, &target.host, target.port, &target.ca)
         .await
     {
-        let message = crate::logs::redact_line(&err.to_string(), &[]);
-        tracing::warn!(error = %message, cars = count, "fleet telemetry config was not applied");
-    }
-    let mut pushed = target.pushed.lock().await;
-    for vin in pending {
-        pushed.insert(vin);
+        Ok(outcome) => {
+            for (vin, reason) in &outcome.skipped {
+                tracing::warn!(%vin, %reason, "fleet telemetry config skipped a vehicle");
+            }
+            tracing::info!(
+                configured = outcome.configured.len(),
+                skipped = outcome.skipped.len(),
+                "fleet telemetry config applied"
+            );
+            target.apply(&outcome).await;
+        }
+        Err(err) => {
+            target.fail(&err).await;
+            let message = crate::logs::redact_line(&err.to_string(), &[]);
+            tracing::warn!(error = %message, cars = push.len(), "fleet telemetry config was not applied");
+        }
     }
 }
 
@@ -1235,7 +1478,8 @@ async fn run_cycle(
         crate::budget::resume_billing(&archive.db).await?;
     }
     if policy.telemetry_mode {
-        subscribe_telemetry(source, archive, &vehicles).await;
+        let blocked = gate.blocks_vehicle_data() || gate.cap_reached();
+        subscribe_telemetry(source, archive, &vehicles, blocked).await;
     }
     if vehicles.is_empty() {
         if let Some(account_id) = account_id {
@@ -1463,7 +1707,7 @@ async fn handle_summary(
             runtime.tracker.activity,
             runtime
                 .last_telemetry
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(120)),
+                .is_some_and(|at| at.elapsed() <= archive.telemetry_fresh_for),
             runtime.parked_live_polls,
             movement_is_recent(
                 runtime.drive_clock.map(|clock| clock.last_driving_at),

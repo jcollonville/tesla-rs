@@ -857,6 +857,52 @@ pub struct SkippedVehicles {
     pub other: Map<String, Value>,
 }
 
+impl SkippedVehicles {
+    /// VIN to the reason Tesla gave. A VIN listed twice keeps the first reason.
+    #[must_use]
+    pub fn by_vin(&self) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        let mut put = |reason: &str, vins: &[String]| {
+            for vin in vins {
+                out.entry(vin.clone()).or_insert_with(|| reason.to_owned());
+            }
+        };
+        put("missing_key", &self.missing_key);
+        put("unsupported_hardware", &self.unsupported_hardware);
+        put("unsupported_firmware", &self.unsupported_firmware);
+        put("max_configs", &self.max_configs);
+        for (reason, value) in &self.other {
+            let Some(vins) = value.as_array() else {
+                continue;
+            };
+            let reason = sanitize_skip_reason(reason);
+            for vin in vins {
+                let Some(vin) = vin.as_str() else {
+                    continue;
+                };
+                if vin.len() != 17 || !vin.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+                    continue;
+                }
+                out.entry(vin.to_owned()).or_insert_with(|| reason.clone());
+            }
+        }
+        out
+    }
+}
+
+fn sanitize_skip_reason(reason: &str) -> String {
+    let cleaned: String = reason
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .take(40)
+        .collect();
+    if cleaned.is_empty() {
+        "skipped".to_owned()
+    } else {
+        cleaned
+    }
+}
+
 /// `GET /api/1/vehicles/{vin}/fleet_telemetry_config`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FleetTelemetryConfig {
@@ -1156,5 +1202,25 @@ mod tests {
         assert_eq!(state.fd_window, Some(0));
         assert_eq!(state.df, Some(1));
         assert_eq!(state.tpms_pressure_fl, Some(2.9));
+    }
+
+    #[test]
+    fn skipped_vehicles_keep_a_reason_per_vin() {
+        let skipped: super::SkippedVehicles = serde_json::from_str(
+            r#"{
+                "missing_key": ["TEST00000000VIN01"],
+                "unsupported_hardware": ["TEST00000000VIN02"],
+                "unsupported_firmware": [],
+                "max_configs": ["TEST00000000VIN03"],
+                "future_reason": ["TEST00000000VIN04", "nope"]
+            }"#,
+        )
+        .unwrap();
+        let reasons = skipped.by_vin();
+        assert_eq!(reasons["TEST00000000VIN01"], "missing_key");
+        assert_eq!(reasons["TEST00000000VIN02"], "unsupported_hardware");
+        assert_eq!(reasons["TEST00000000VIN03"], "max_configs");
+        assert_eq!(reasons["TEST00000000VIN04"], "future_reason");
+        assert!(!reasons.contains_key("nope"));
     }
 }

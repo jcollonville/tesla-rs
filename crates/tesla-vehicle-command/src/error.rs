@@ -258,6 +258,9 @@ pub enum CommandError {
     /// A metadata field was longer than 255 bytes or tags were out of order.
     #[error("command metadata is invalid")]
     Metadata,
+    /// A fleet telemetry JWS could not be signed. The message does not include the key.
+    #[error("fleet telemetry configuration could not be signed")]
+    Signing,
     /// Fleet API transport failure.
     #[error(transparent)]
     Fleet(#[from] FleetError),

@@ -12,6 +12,11 @@ use qrcode::types::Color;
 
 /// Inline SVG with a quiet zone. It has no stylesheet URL and no image URL.
 pub(crate) fn svg(data: &str) -> Option<String> {
+    svg_labeled(data, "Code QR pour l'application d'authentification")
+}
+
+/// Inline SVG. `label` is escaped and used as the accessible name.
+pub(crate) fn svg_labeled(data: &str, label: &str) -> Option<String> {
     let code = QrCode::new(data.as_bytes()).ok()?;
     let side = code.width();
     let quiet = 2_usize;
@@ -31,8 +36,12 @@ pub(crate) fn svg(data: &str) -> Option<String> {
             );
         }
     }
+    let label = label
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;");
     Some(format!(
-        r##"<svg class="qr" viewBox="0 0 {full} {full}" width="220" height="220" role="img" aria-label="Code QR pour l'application d'authentification"><rect width="{full}" height="{full}" fill="#ffffff"/><g fill="#111318">{marks}</g></svg>"##
+        r##"<svg class="qr" viewBox="0 0 {full} {full}" width="220" height="220" role="img" aria-label="{label}"><rect width="{full}" height="{full}" fill="#ffffff"/><g fill="#111318">{marks}</g></svg>"##
     ))
 }
 
@@ -48,5 +57,13 @@ mod tests {
         assert!(!svg.contains("http://"));
         assert!(!svg.contains("https://"));
         assert!(!svg.contains("style="));
+        let pairing = super::svg_labeled(
+            "https://tesla.com/_ak/logger.example",
+            "Code QR pour ajouter la clé virtuelle",
+        )
+        .expect("pairing qr");
+        assert!(pairing.contains("ajouter la clé virtuelle"));
+        assert!(!pairing.contains("https://"));
+        assert!(!pairing.contains("http://"));
     }
 }

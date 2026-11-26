@@ -67,6 +67,7 @@ pub(crate) struct Inner {
     pub debug: DebugBoard,
     pub car_renders: CarRenders,
     pub basemap: Basemap,
+    pub links: Mutex<crate::connection::LinkCache>,
 }
 
 pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
@@ -83,7 +84,9 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
             poll_state.inner.config.region,
             Arc::clone(&poll_state.inner.session),
             poll_state.inner.debug.clone(),
-        ) {
+        )
+        .map(|poll| poll.with_signing(signing_from(&poll_state.inner.config)))
+        {
             Ok(fleet) => fleet,
             Err(err) => {
                 let _ = accounts::set_last_error(
@@ -236,6 +239,7 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
         snap.drive_park_grace.as_secs(),
     );
     archive.runtime = Some(runtime.clone());
+    archive.telemetry_fresh_for = boot.telemetry_fresh;
     if boot.telemetry_configured() {
         match boot
             .telemetry_cert_path
@@ -247,6 +251,8 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
                     boot.telemetry_hostname.clone(),
                     boot.telemetry_port,
                     ca,
+                    boot.telemetry_config_check,
+                    std::time::Duration::from_secs(60),
                 ));
                 tracing::info!(
                     host = %boot.telemetry_hostname,
@@ -291,8 +297,17 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
             debug,
             car_renders,
             basemap,
+            links: Mutex::new(crate::connection::LinkCache::unknown()),
         }),
     })
+}
+
+pub(crate) fn signing_from(config: &Config) -> crate::telemetry_config::SigningMaterial {
+    crate::telemetry_config::SigningMaterial {
+        key_path: config.private_key_path.clone(),
+        proxy_endpoint: config.telemetry_proxy_url.clone(),
+        proxy_ca_path: config.telemetry_proxy_ca_path.clone(),
+    }
 }
 
 fn policy_from(config: &Config) -> PollPolicy {
@@ -496,6 +511,7 @@ async fn test_state_full(
             debug,
             car_renders: renders.unwrap_or_else(|| CarRenders::new(false, String::new(), None)),
             basemap: Basemap::disabled(),
+            links: Mutex::new(crate::connection::LinkCache::unknown()),
         }),
     }
 }

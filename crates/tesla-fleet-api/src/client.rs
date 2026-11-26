@@ -87,6 +87,15 @@ impl<T: AccessTokenProvider> FleetClient<T> {
         &self.base_url
     }
 
+    /// Current access token. Callers must not log it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the token provider's error. The message does not include the token.
+    pub async fn access_token(&self) -> Result<secrecy::SecretString, FleetError> {
+        self.tokens.access_token().await
+    }
+
     /// `GET /api/1/users/region`.
     ///
     /// The response is based on the token subject. A token audience is chosen when the token is
@@ -367,6 +376,38 @@ impl<T: AccessTokenProvider> FleetClient<T> {
             .send(
                 reqwest::Method::POST,
                 "api/1/vehicles/fleet_telemetry_config",
+                &[],
+                Some(body),
+                CallClass::Mutation,
+            )
+            .await?;
+        Ok(decoded.value)
+    }
+
+    /// `POST /api/1/vehicles/fleet_telemetry_config_jws`.
+    ///
+    /// `token` is a `Tesla.SS256` JWS of the config object, as produced by `tesla-jws -fleet sign
+    /// TelemetryClient`. The recommended path is still the vehicle-command proxy, which signs and
+    /// forwards on its own. This method does not log `token`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FleetError::InvalidRequest`] when a VIN or the token is not acceptable.
+    pub async fn create_fleet_telemetry_config_jws(
+        &self,
+        vins: &[String],
+        token: &str,
+    ) -> Result<FleetTelemetryConfigUpdate, FleetError> {
+        validate_vins(vins)?;
+        validate_jws_token(token)?;
+        let body = serde_json::json!({
+            "vins": vins,
+            "token": token,
+        });
+        let decoded = self
+            .send(
+                reqwest::Method::POST,
+                "api/1/vehicles/fleet_telemetry_config_jws",
                 &[],
                 Some(body),
                 CallClass::Mutation,
@@ -707,6 +748,27 @@ fn validate_domain(domain: &str) -> Result<(), FleetError> {
             "partner domain must be a lowercase hostname",
         ))
     }
+}
+
+fn validate_jws_token(token: &str) -> Result<(), FleetError> {
+    let mut parts = token.split('.');
+    let header = parts.next().unwrap_or("");
+    let payload = parts.next().unwrap_or("");
+    let signature = parts.next().unwrap_or("");
+    let extra = parts.next();
+    let segment_ok = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 65_536
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    };
+    if extra.is_some() || !segment_ok(header) || !segment_ok(payload) || !segment_ok(signature) {
+        return Err(FleetError::InvalidRequest(
+            "fleet telemetry JWS must be three base64url segments",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_telemetry_request(request: &FleetTelemetryConfigRequest) -> Result<(), FleetError> {

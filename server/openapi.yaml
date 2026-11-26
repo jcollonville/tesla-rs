@@ -431,9 +431,17 @@ components:
           type: string
           enum: [polling, telemetry]
           description: >
-            polling uses the sleep-safe Fleet API schedule. telemetry is active
-            when TELEMETRY_ENABLED is true and the receiver certificate and key
-            are set. Existing clients can ignore this field.
+            telemetry only when a Fleet Telemetry message for this vehicle
+            arrived within TELEMETRY_FRESH_SECS (default 900). Otherwise polling,
+            including when telemetry is configured but quiet. Existing clients
+            can ignore this field.
+        telemetry_skip_reason:
+          type: string
+          nullable: true
+          description: >
+            Why Tesla skipped this VIN on the last signed fleet_telemetry_config
+            push, for example missing_key. Absent when the VIN was accepted or
+            no push has been attempted.
         charge_status_stale:
           type: boolean
           description: >

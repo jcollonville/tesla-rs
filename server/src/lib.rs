@@ -15,6 +15,7 @@ mod accounts;
 mod app;
 mod budget;
 mod config;
+mod connection;
 mod crypto;
 mod debug;
 mod edits;
@@ -28,6 +29,7 @@ mod ingest;
 mod logs;
 mod mqtt;
 mod owner_stream;
+mod partner;
 mod passkeys;
 mod persist;
 mod position_mode;
@@ -38,6 +40,7 @@ mod state;
 mod status;
 mod system;
 mod telemetry;
+mod telemetry_config;
 mod units;
 
 #[cfg(test)]

@@ -46,10 +46,12 @@ mod crypto;
 mod domain;
 mod error;
 mod fleet;
+mod jws;
 mod key;
 mod message;
 mod metadata;
 mod replay;
+mod schnorr;
 mod session;
 mod transport;
 
@@ -62,6 +64,7 @@ pub use client::Vehicle;
 pub use domain::Domain;
 pub use error::{CommandError, MessageFault};
 pub use fleet::FleetTransport;
+pub use jws::{FLEET_TELEMETRY_AUDIENCE, sign_fleet_telemetry_config};
 pub use key::{PrivateKey, PrivateKeyFormat};
 pub use message::FLAG_ENCRYPT_RESPONSE;
 /// Top-level vehicle-command envelope.

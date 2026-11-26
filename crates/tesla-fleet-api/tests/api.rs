@@ -460,3 +460,34 @@ async fn signed_command_posts_base64_routable_message() {
     let text = String::from_utf8_lossy(&body);
     assert!(!text.contains("test-token"));
 }
+
+#[tokio::test]
+async fn fleet_telemetry_config_jws_posts_the_token_and_reads_skipped_vins() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/1/vehicles/fleet_telemetry_config_jws"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"updated_vehicles":1,"skipped_vehicles":{"missing_key":["TEST00000000VIN02"],"unsupported_hardware":[],"max_configs":[]}}}"#,
+        ))
+        .mount(&server)
+        .await;
+    let update = client(&server)
+        .create_fleet_telemetry_config_jws(&["TEST00000000VIN01".to_owned()], "aaa.bbb.ccc")
+        .await
+        .unwrap();
+    assert_eq!(update.updated_vehicles, 1);
+    assert_eq!(
+        update.skipped_vehicles.by_vin()["TEST00000000VIN02"],
+        "missing_key"
+    );
+    let body = server.received_requests().await.unwrap()[0].body.clone();
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("\"token\":\"aaa.bbb.ccc\""));
+    assert!(text.contains("TEST00000000VIN01"));
+    assert!(!text.contains("test-token"));
+    let rejected = client(&server)
+        .create_fleet_telemetry_config_jws(&["TEST00000000VIN01".to_owned()], "not a jws")
+        .await
+        .unwrap_err();
+    assert!(rejected.to_string().contains("JWS"));
+}
