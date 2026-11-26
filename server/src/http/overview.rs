@@ -368,10 +368,10 @@ pub(super) async fn car_card(app: &AppState, id: i64) -> CarCard {
                     .ok()
                     .flatten()
             {
-                match app.inner.archive.reported_data_source(&vin).await {
-                    "telemetry" => "Télémétrie",
-                    _ => "Interrogation",
-                }
+                crate::telemetry_health::data_source_label(
+                    app.inner.archive.telemetry.is_some(),
+                    app.inner.archive.reported_data_source(&vin).await,
+                )
             } else {
                 "Interrogation"
             }
@@ -413,6 +413,44 @@ pub(super) async fn decorate_fleet_card(app: &AppState, card: &mut FleetCard) {
     if let Some((lat, lon)) = position(app, card.id, &state).await {
         card.place = place_at(app, lat, lon).await.map(|place| place.name);
     }
+    card.telemetry_notice = telemetry_notice(app, card.id).await;
+}
+
+pub(super) async fn telemetry_notice(
+    app: &AppState,
+    id: i64,
+) -> Option<super::markup::StatusNotice> {
+    app.inner.archive.telemetry.as_ref()?;
+    let vin: String = sqlx::query_scalar("SELECT vin FROM vehicles WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&app.inner.db)
+        .await
+        .ok()
+        .flatten()?;
+    let activity: Option<String> =
+        sqlx::query_scalar("SELECT activity FROM vehicle_state WHERE vehicle_id = $1")
+            .bind(id)
+            .fetch_optional(&app.inner.db)
+            .await
+            .ok()
+            .flatten();
+    let asleep = activity.as_deref() == Some("asleep");
+    let online = matches!(
+        activity.as_deref(),
+        Some("online" | "driving" | "charging" | "updating")
+    );
+    let health = app.inner.archive.vehicle_health(&vin, asleep, online).await;
+    let notice = health.notice()?;
+    Some(super::markup::StatusNotice {
+        role: if notice.alert { "alert" } else { "status" },
+        class: if notice.alert {
+            "banner bad"
+        } else {
+            "banner note"
+        },
+        icon: notice.icon,
+        text: notice.text,
+    })
 }
 
 #[derive(sqlx::FromRow)]

@@ -243,8 +243,10 @@ Optional:
 | `FLEET_DATA_MONTH_SEED` | `0` | Calls added to the stored month total. Use this for usage from before `fleet_usage` existed. It is added to the rows already stored, so count only the missing calls |
 | `FLEET_DATA_MONTH_SEED_MONTH` | unset | `YYYY-MM`. The seed counts only in that UTC month. If the seed is non-zero and this is unset, the process uses the UTC month at startup and logs that choice |
 | `FLEET_BLOCKED_PROBE_SECS` | `3600` | While Tesla returns 402 or 403 `EXCEEDED_LIMIT`, one probe this often. 300–86400. Success resumes polling |
-| `DRIVE_END_GRACE_SECS` | `300` | Close a drive this long after the last driving evidence when the tail has no exact 0 km/h sample (signal gap, asleep, offline, incomplete poll). 30–1800. Must be at least `DRIVE_PARK_GRACE_SECS`. Does not trim `end_at` |
-| `DRIVE_PARK_GRACE_SECS` | `300` | Close a drive after this long at exact 0 km/h. 15–900. Closure only: `end_at` is the first 0 km/h sample of that final run, not this many seconds earlier. A missing speed does not start the run. Existing values still load |
+| `DRIVE_END_GRACE_SECS` | `300` | Close a drive this long after the last car timestamp when the link drops (asleep, offline, no message). Measured from that timestamp, not from process start. 30–1800. Must be at least `DRIVE_PARK_GRACE_SECS`. A restart waits up to 15 minutes before this gap close, and a coherent resume (odometer and position still plausible, end speed still moving) rejoins the same drive inside that window |
+| `DRIVE_PARK_GRACE_SECS` | `300` | Close a drive after this long at exact 0 km/h when the gear is unknown. 15–900. A known `D`/`R`/`N` stop does not use this timer |
+| `DRIVE_P_CONFIRM_SECS` | `60` | Close a drive after shift `P` with speed at or below 1 km/h, or unknown, held this long. 15–300. `end_at` is the `P` transition, or the first exact 0 km/h sample within 2 minutes before it. `D`/`R` before the timer ends keeps the drive. `D`/`R` within 2 minutes at the same place (under 50 m) reopens it |
+| `DRIVE_STOP_IN_GEAR_SECS` | `1800` | Close a drive that stays at 0 km/h in `D`, `R`, or `N` this long. 300–7200. Going offline or asleep still uses `DRIVE_END_GRACE_SECS` |
 | `NOMINATIM_ENABLED` | `true` | Reverse geocoding. The URL must be `https` when enabled |
 | `NOMINATIM_URL` | `https://nominatim.openstreetmap.org` | Nominatim base URL |
 | `NOMINATIM_CONTACT` | unset | Included in the User-Agent: `tesla-logger/0.1 (self-hosted; …)` |

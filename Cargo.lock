@@ -3160,6 +3160,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.26.2",
+ "tracing",
  "x509-parser",
 ]
 

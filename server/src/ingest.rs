@@ -90,6 +90,8 @@ pub(crate) struct PollFacts {
     pub telemetry_fresh: bool,
     pub stream_fresh: bool,
     pub movement_recent: bool,
+    /// Open drive, vehicle online, and no telemetry message for 90 seconds.
+    pub telemetry_drive_silent: bool,
 }
 
 /// Whether the next cycle should pay for `vehicle_data`.
@@ -122,6 +124,12 @@ pub(crate) fn poll_plan(facts: &PollFacts, policy: &PollPolicy) -> PollPlan {
     // Configured telemetry replaces polling. A stale stream still pays for one
     // rare `vehicle_data` read; that read is counted by the caller.
     if policy.telemetry_mode {
+        if facts.telemetry_drive_silent {
+            return PollPlan {
+                observe: true,
+                wait: policy.drive_fallback,
+            };
+        }
         if facts.telemetry_fresh {
             return PollPlan {
                 observe: false,
@@ -359,6 +367,10 @@ pub(crate) struct Archive {
     pub telemetry: Option<TelemetryTarget>,
     /// A message newer than this is `data_source=telemetry`.
     pub telemetry_fresh_for: Duration,
+    /// Process start. Signal-gap closes wait out the continuity window from here.
+    pub started_at: DateTime<Utc>,
+    /// Set when the telemetry listener fails to start. Empty when it is listening.
+    pub listener_fault: std::sync::Mutex<Option<String>>,
 }
 
 impl Archive {
@@ -470,6 +482,11 @@ impl TelemetryTarget {
         self.book.lock().await.last_error.clone()
     }
 
+    pub(crate) async fn retry_scheduled(&self) -> bool {
+        let book = self.book.lock().await;
+        book.failures > 0 && book.last_error.is_some()
+    }
+
     pub(crate) async fn forget(&self, vins: &[String]) {
         self.drop_configured(vins).await;
         let mut book = self.book.lock().await;
@@ -554,15 +571,54 @@ impl Archive {
             runtime: None,
             telemetry: None,
             telemetry_fresh_for: Duration::from_secs(900),
+            started_at: Utc::now(),
+            listener_fault: std::sync::Mutex::new(None),
         }
+    }
+
+    pub(crate) async fn vehicle_health(
+        &self,
+        vin: &str,
+        asleep: bool,
+        online: bool,
+    ) -> crate::telemetry_health::TelemetryHealth {
+        use crate::telemetry_health::{HealthFacts, classify};
+        let enabled = self.telemetry.is_some();
+        let (configured, skip_reason, retry_scheduled) = if let Some(target) = &self.telemetry {
+            (
+                target.is_configured(vin).await,
+                target.skip_reason(vin).await,
+                target.retry_scheduled().await,
+            )
+        } else {
+            (false, None, false)
+        };
+        let listener_error = self
+            .listener_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        classify(&HealthFacts {
+            enabled,
+            asleep,
+            online,
+            message_age: self.telemetry_age(vin).await,
+            configured,
+            skip_reason: skip_reason.as_deref(),
+            retry_scheduled,
+            listener_error: listener_error.as_deref(),
+            tls_rejected: tesla_fleet_telemetry::tls_handshake_rejections(),
+        })
     }
 
     pub(crate) fn live_drive_grace(&self) -> crate::state::DriveGrace {
         self.runtime.as_ref().map_or(self.drive_grace, |runtime| {
             let snap = runtime.snapshot();
-            crate::state::DriveGrace::from_secs(
+            crate::state::DriveGrace::from_config(
                 snap.drive_end_grace.as_secs(),
                 snap.drive_park_grace.as_secs(),
+                snap.drive_p_confirm.as_secs(),
+                snap.drive_stop_in_gear.as_secs(),
             )
         })
     }
@@ -646,14 +702,20 @@ async fn write_observation(
         if from_telemetry {
             runtime.last_telemetry = Some(Instant::now());
         }
+        let store_position = store_position
+            && !(from_telemetry
+                && crate::state::telemetry_point_repeats(runtime.published.as_ref(), obs));
         apply_observation(
             &archive.db,
             &mut runtime,
             obs,
             &fences,
             &archive.events,
-            live,
-            store_position,
+            crate::persist::ApplyOptions {
+                live,
+                store_position,
+                source: if from_telemetry { "telemetry" } else { "poll" },
+            },
         )
         .await?
     };
@@ -698,7 +760,7 @@ pub(crate) async fn expire_drives(
          JOIN vehicles v ON v.id = d.vehicle_id
          WHERE d.end_at IS NULL
            AND d.deleted_at IS NULL
-           AND d.source IN ('poll', 'stream')",
+           AND d.source IN ('poll', 'stream', 'telemetry')",
     )
     .fetch_all(&archive.db)
     .await?;
@@ -712,11 +774,22 @@ pub(crate) async fn expire_drives(
             &archive.db,
             &mut runtime,
             now,
+            archive.started_at,
             &fences,
             &archive.events,
         )
         .await?;
+        let wake = archive.telemetry.is_some()
+            && crate::state::telemetry_drive_needs_fallback(
+                runtime.open_drive_id.is_some(),
+                runtime.tracker.activity,
+                runtime.last_telemetry.map(|at| at.elapsed()),
+            );
         jobs.extend(due);
+        drop(runtime);
+        if wake {
+            archive.gps.notify();
+        }
     }
     drop(fences);
     crate::persist::settle_addresses(&archive.db, &archive.geocoder, jobs).await;
@@ -1126,8 +1199,8 @@ pub(crate) async fn subscribe_telemetry(
         .await
     {
         Ok(outcome) => {
-            for (vin, reason) in &outcome.skipped {
-                tracing::warn!(%vin, %reason, "fleet telemetry config skipped a vehicle");
+            for (_vin, reason) in &outcome.skipped {
+                tracing::warn!(reason = %reason, "fleet telemetry config skipped a vehicle");
             }
             tracing::info!(
                 configured = outcome.configured.len(),
@@ -1725,13 +1798,22 @@ async fn handle_summary(
     .await?;
     let slot = ensure_runtime(archive, &summary.vin, vehicle_id).await?;
     let now_utc = policy_now(policy);
-    let (activity, telemetry_fresh, parked_live_polls, movement_recent, snap, open_drive_id) = {
+    let (
+        activity,
+        telemetry_fresh,
+        telemetry_age,
+        parked_live_polls,
+        movement_recent,
+        snap,
+        open_drive_id,
+    ) = {
         let runtime = slot.lock().await;
         (
             runtime.tracker.activity,
             runtime
                 .last_telemetry
                 .is_some_and(|at| at.elapsed() <= archive.telemetry_fresh_for),
+            runtime.last_telemetry.map(|at| at.elapsed()),
             runtime.parked_live_polls,
             movement_is_recent(
                 runtime.drive_clock.map(|clock| clock.last_driving_at),
@@ -1754,6 +1836,12 @@ async fn handle_summary(
         telemetry_fresh,
         stream_fresh,
         movement_recent,
+        telemetry_drive_silent: summary.presence == Presence::Online
+            && crate::state::telemetry_drive_needs_fallback(
+                open_drive_id.is_some(),
+                activity,
+                telemetry_age,
+            ),
     };
     let mut plan = poll_plan(&facts, policy);
     if !plan.observe
@@ -1980,6 +2068,7 @@ mod tests {
             telemetry_fresh,
             stream_fresh,
             movement_recent,
+            telemetry_drive_silent: false,
         }
     }
 
@@ -2049,6 +2138,11 @@ mod tests {
         );
         assert!(stale.observe);
         assert_eq!(stale.wait, Duration::from_secs(3_600));
+        let mut driving = facts(Presence::Online, Activity::Driving, 0, false, false, true);
+        driving.telemetry_drive_silent = true;
+        let fallback = poll_plan(&driving, &policy);
+        assert!(fallback.observe);
+        assert_eq!(fallback.wait, policy.drive_fallback);
         let asleep = poll_plan(
             &facts(Presence::Asleep, Activity::Asleep, 0, false, false, false),
             &policy,
@@ -2590,10 +2684,7 @@ mod tests {
                 runtime.next_due = tokio::time::Instant::now();
                 runtime.tracker.activity = Activity::Driving;
                 runtime.tracker.drive_open = true;
-                runtime.drive_clock = Some(crate::state::DriveClock {
-                    last_driving_at: chrono::Utc::now(),
-                    park_since: None,
-                });
+                runtime.drive_clock = Some(crate::state::DriveClock::moving_at(chrono::Utc::now()));
             }
             archive.gps.mark_update(vehicle_id).await;
             let control = super::run_cycle(&source, &archive, &policy(), None)

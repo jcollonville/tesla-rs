@@ -42,6 +42,13 @@ const PROD_CA: &str = include_str!("../certs/prod_ca.crt");
 const ENG_CA: &str = include_str!("../certs/eng_ca.crt");
 
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
+static TLS_HANDSHAKE_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Handshake failures since this process started. No certificate bytes and no VIN.
+#[must_use]
+pub fn tls_handshake_rejections() -> u64 {
+    TLS_HANDSHAKE_REJECTIONS.load(Ordering::Relaxed)
+}
 
 /// Which client CA bundle the listener requires.
 #[derive(Clone, Debug)]
@@ -320,13 +327,26 @@ async fn accept_loop(
                 let tx = tx.clone();
                 connections.spawn(async move {
                     if let Err(error) = handle_connection(stream, peer, tls, tx).await {
-                        let _ = error;
+                        note_connection_error(&error);
                     }
                 });
             }
         }
     }
     connections.abort_all();
+}
+
+fn note_connection_error(error: &TelemetryError) {
+    if matches!(
+        error,
+        TelemetryError::Tls(_)
+            | TelemetryError::Certificate
+            | TelemetryError::UntrustedIssuer { .. }
+            | TelemetryError::ExcludedCertificate
+    ) {
+        TLS_HANDSHAKE_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!("telemetry tls handshake rejected");
+    }
 }
 
 async fn handle_connection(

@@ -41,6 +41,7 @@ mod status;
 mod system;
 mod telemetry;
 mod telemetry_config;
+mod telemetry_health;
 mod units;
 
 #[cfg(test)]

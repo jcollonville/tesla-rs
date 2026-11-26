@@ -1361,7 +1361,7 @@ async fn short_drives_are_deleted_for_poll_and_stream() {
         stream_vin,
         car(stream_vin),
         &stream_fix(
-            t0 + chrono::Duration::seconds(100),
+            t0 + chrono::Duration::seconds(40),
             Some("P"),
             Some(10.0),
             None,
@@ -1374,7 +1374,7 @@ async fn short_drives_are_deleted_for_poll_and_stream() {
     assert_eq!(
         open_drive_count(&db.pool, stream_vin).await,
         1,
-        "five minutes at 0 km/h have not elapsed"
+        "park confirmation has not elapsed"
     );
     apply_stream_for_vin(
         &archive,
@@ -2106,6 +2106,241 @@ async fn parked_stop_stays_two_drives() {
     .unwrap();
     assert_eq!(open_drive_count(&db.pool, vin).await, 1);
     assert_eq!(closed_drives(&db.pool, vin).await.0, 1);
+}
+
+#[tokio::test]
+async fn telemetry_confirms_park_and_keeps_a_stop_in_drive() {
+    let Some(db) = TestDb::migrated("telpark").await else {
+        return;
+    };
+    let archive = test_archive(db.pool.clone());
+    let vin = "5YJ3E1EA7KF000091";
+    let base = Utc::now();
+    let send = |at, shift: &str, speed: f64, odo: f64, lat: f64| {
+        let mut obs = shifted(at, shift, Some(odo), lat, 2.2);
+        obs.speed_kmh = Some(speed);
+        apply_for_vin(&archive, vin, car(vin), obs, true, true)
+    };
+    send(base, "D", 40.0, 100.0, 48.1).await.unwrap();
+    send(base + chrono::Duration::seconds(30), "D", 0.0, 100.2, 48.11)
+        .await
+        .unwrap();
+    send(
+        base + chrono::Duration::seconds(600),
+        "D",
+        0.0,
+        100.2,
+        48.11,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        open_drive_count(&db.pool, vin).await,
+        1,
+        "ten minutes at 0 km/h in D stays one trip"
+    );
+    let park = base + chrono::Duration::seconds(620);
+    send(park, "P", 0.0, 100.2, 48.11).await.unwrap();
+    send(
+        park + chrono::Duration::seconds(30),
+        "D",
+        20.0,
+        100.3,
+        48.111,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        closed_drives(&db.pool, vin).await.0,
+        0,
+        "P for 30 s then D is still one trip"
+    );
+    let again = park + chrono::Duration::seconds(40);
+    send(again, "P", 0.0, 100.4, 48.12).await.unwrap();
+    send(
+        again + chrono::Duration::seconds(60),
+        "P",
+        0.0,
+        100.4,
+        48.12,
+    )
+    .await
+    .unwrap();
+    let (count, end, source): (i64, chrono::DateTime<Utc>, String) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(d.end_at), MAX(d.source) FROM drives d
+         JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE v.vin = $1 AND d.end_at IS NOT NULL",
+    )
+    .bind(vin)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+    assert!(
+        end.signed_duration_since(again).num_milliseconds().abs() <= 1,
+        "end is the P transition ({end} vs {again})"
+    );
+    assert_eq!(source, "telemetry");
+    let points: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM positions p
+         JOIN vehicles v ON v.id = p.vehicle_id
+         WHERE v.vin = $1 AND p.source = 'telemetry'",
+    )
+    .bind(vin)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(points.0 >= 2);
+    let repeat = points.0;
+    send(
+        again + chrono::Duration::seconds(61),
+        "P",
+        0.0,
+        100.4,
+        48.12,
+    )
+    .await
+    .unwrap();
+    let after: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM positions p
+         JOIN vehicles v ON v.id = p.vehicle_id
+         WHERE v.vin = $1 AND p.source = 'telemetry'",
+    )
+    .bind(vin)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(after.0, repeat, "unchanged location does not add a point");
+}
+
+#[tokio::test]
+async fn late_telemetry_does_not_open_a_second_drive_and_stream_shares_it() {
+    let Some(db) = TestDb::migrated("tellate").await else {
+        return;
+    };
+    let archive = test_archive(db.pool.clone());
+    let vin = "5YJ3E1EA7KF000092";
+    let base = Utc::now();
+    let mut rolling = shifted(base, "D", Some(50.0), 48.2, 2.3);
+    rolling.speed_kmh = Some(35.0);
+    apply_stream_for_vin(
+        &archive,
+        vin,
+        car(vin),
+        &stream_fix(base, Some("D"), Some(50.0), Some(48.2), Some(2.3)),
+    )
+    .await
+    .unwrap();
+    let mut later = shifted(
+        base + chrono::Duration::seconds(5),
+        "D",
+        Some(50.1),
+        48.21,
+        2.31,
+    );
+    later.speed_kmh = Some(36.0);
+    apply_for_vin(&archive, vin, car(vin), later, true, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        open_drive_count(&db.pool, vin).await,
+        1,
+        "telemetry joins the stream drive"
+    );
+    let park = base + chrono::Duration::seconds(20);
+    let mut parked = shifted(park, "P", Some(50.2), 48.22, 2.32);
+    parked.speed_kmh = Some(0.0);
+    apply_for_vin(&archive, vin, car(vin), parked, true, true)
+        .await
+        .unwrap();
+    let mut held = shifted(
+        park + chrono::Duration::seconds(60),
+        "P",
+        Some(50.2),
+        48.23,
+        2.33,
+    );
+    held.speed_kmh = Some(0.0);
+    apply_for_vin(&archive, vin, car(vin), held, true, true)
+        .await
+        .unwrap();
+    assert_eq!(open_drive_count(&db.pool, vin).await, 0);
+    let stale = base + chrono::Duration::seconds(10);
+    let mut late = shifted(stale, "D", Some(50.05), 48.205, 2.305);
+    late.speed_kmh = Some(34.0);
+    apply_for_vin(&archive, vin, car(vin), late, true, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        open_drive_count(&db.pool, vin).await,
+        0,
+        "a late D does not open a new drive"
+    );
+    assert_eq!(closed_drives(&db.pool, vin).await.0, 1);
+    let attached: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM positions p
+         JOIN drives d ON d.id = p.drive_id
+         JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE v.vin = $1 AND p.recorded_at = $2",
+    )
+    .bind(vin)
+    .bind(stale)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(attached.0, 1, "the late sample stays on the closed drive");
+}
+
+#[tokio::test]
+async fn restart_gap_does_not_split_a_drive_that_resumes() {
+    let Some(db) = TestDb::migrated("telrestart").await else {
+        return;
+    };
+    let archive = test_archive(db.pool.clone());
+    let vin = "5YJ3E1EA7KF000093";
+    let base = Utc::now() - chrono::Duration::minutes(10);
+    apply_for_vin(
+        &archive,
+        vin,
+        car(vin),
+        shifted(base, "D", Some(80.0), 48.4, 2.4),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    apply_for_vin(
+        &archive,
+        vin,
+        car(vin),
+        shifted(
+            base + chrono::Duration::seconds(30),
+            "D",
+            Some(80.4),
+            48.41,
+            2.41,
+        ),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    archive.runtimes.lock().await.clear();
+    crate::ingest::expire_drives(&archive, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        open_drive_count(&db.pool, vin).await,
+        1,
+        "a restart inside the continuity window does not close the drive"
+    );
+    let mut resume = shifted(Utc::now(), "D", Some(82.0), 48.5, 2.5);
+    resume.speed_kmh = Some(50.0);
+    apply_for_vin(&archive, vin, car(vin), resume, true, false)
+        .await
+        .unwrap();
+    assert_eq!(open_drive_count(&db.pool, vin).await, 1);
+    assert_eq!(closed_drives(&db.pool, vin).await.0, 0);
 }
 
 #[tokio::test]
