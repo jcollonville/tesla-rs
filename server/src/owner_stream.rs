@@ -527,6 +527,7 @@ async fn session_loop<S: TokenStore + 'static>(
         if *stop.borrow() {
             break 'session;
         }
+        reset_carry(&mut carry);
         let access = match session.access_token().await {
             Ok(token) => token,
             Err(SessionError::Missing) => break 'session,
@@ -1101,6 +1102,10 @@ fn consider_sample(
     prepare(carry, sample)
 }
 
+fn reset_carry(carry: &mut Carry) {
+    *carry = Carry::default();
+}
+
 fn prepare(carry: &mut Carry, sample: &StreamSample) -> Option<StreamFix> {
     if sample.shift_state.is_some() {
         carry.shift.clone_from(&sample.shift_state);
@@ -1259,6 +1264,26 @@ mod tests {
             est_range_mi: None,
             heading: None,
         }
+    }
+
+    #[test]
+    fn reconnect_drops_carried_speed() {
+        let mut carry = Carry::default();
+        let mut first = blank();
+        first.speed_mph = Some(30.0);
+        first.shift_state = Some("D".to_owned());
+        first.est_lat = Some(48.1);
+        first.est_lng = Some(11.5);
+        let kept = prepare(&mut carry, &first).unwrap();
+        assert!(kept.speed_kmh.unwrap() > 40.0);
+        super::reset_carry(&mut carry);
+        let mut second = blank();
+        second.recorded_at_ms += 1_000;
+        second.est_lat = Some(48.2);
+        second.est_lng = Some(11.6);
+        let fresh = prepare(&mut carry, &second).unwrap();
+        assert!(fresh.speed_kmh.is_none());
+        assert!(fresh.shift_state.is_none());
     }
 
     #[test]

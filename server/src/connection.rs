@@ -93,6 +93,9 @@ pub(crate) struct VehicleInput {
     pub skip_reason: Option<String>,
     pub config_pushed: bool,
     pub last_message_age: Option<Duration>,
+    /// Short telemetry health chip. Empty hides it.
+    pub health: String,
+    pub health_tone: &'static str,
 }
 
 /// One row of the setup list.
@@ -137,6 +140,8 @@ pub(crate) struct CarLine {
     pub key: String,
     pub config: String,
     pub stream: String,
+    pub health: String,
+    pub health_tone: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -617,6 +622,8 @@ fn key_step(input: &Input, domain: &str, account: &GuideStep) -> GuideStep {
             key: key_label(vehicle.key),
             config: String::new(),
             stream: String::new(),
+            health: String::new(),
+            health_tone: "",
         })
         .collect::<Vec<_>>();
     let url = pairing_url(domain).unwrap_or_default();
@@ -712,6 +719,8 @@ fn telemetry_step(input: &Input, key: &GuideStep) -> GuideStep {
             key: String::new(),
             config: config_label(vehicle, input.telemetry_enabled),
             stream: stream_label(vehicle.last_message_age, input.fresh_for),
+            health: vehicle.health.clone(),
+            health_tone: vehicle.health_tone,
         })
         .collect::<Vec<_>>();
     let received = |vehicle: &VehicleInput| vehicle.last_message_age.is_some();
@@ -918,8 +927,24 @@ mod tests {
             skip_reason: None,
             config_pushed: false,
             last_message_age: None,
+            health: String::new(),
+            health_tone: "",
         }];
         input
+    }
+
+    #[test]
+    fn step_five_carries_the_telemetry_health_chip() {
+        let mut facts = ready();
+        facts.telemetry_enabled = true;
+        facts.vehicles[0].config_pushed = true;
+        facts.vehicles[0].last_message_age = Some(Duration::from_secs(30));
+        facts.vehicles[0].health = "Silencieuse".to_owned();
+        facts.vehicles[0].health_tone = "warn";
+        let report = build(&facts);
+        assert_eq!(guide(&report, 5).cars[0].health, "Silencieuse");
+        assert_eq!(guide(&report, 5).cars[0].health_tone, "warn");
+        assert_eq!(guide(&report, 4).cars[0].health, "");
     }
 
     #[test]
@@ -1056,6 +1081,8 @@ mod tests {
             skip_reason: None,
             config_pushed: false,
             last_message_age: None,
+            health: String::new(),
+            health_tone: "",
         });
         let open = build(&facts);
         assert_eq!(guide(&open, 4).label, "à faire");

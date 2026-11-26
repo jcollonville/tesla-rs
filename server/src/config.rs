@@ -78,9 +78,12 @@ pub(crate) struct Config {
     /// How long a drive stays open after the last driving evidence when the link drops.
     /// Closure detection only. It does not move `end_at`.
     pub drive_end_grace: Duration,
-    /// How long speed must stay at exact 0 km/h before a drive closes.
-    /// Closure only. The stored end is the first 0 km/h sample of that run.
+    /// How long exact 0 km/h with an unknown gear waits before a drive closes.
     pub drive_park_grace: Duration,
+    /// How long shift `P` at standstill waits before a drive closes.
+    pub drive_p_confirm: Duration,
+    /// How long a stop in `D`, `R`, or `N` waits before a drive closes.
+    pub drive_stop_in_gear: Duration,
     /// `local` (default), `oidc`, or `proxy`. Proxy requires an IP allowlist.
     pub auth_mode: String,
     /// Fetch and serve official Tesla renders of the cars. Off keeps the drawings.
@@ -217,6 +220,20 @@ impl Config {
                 "DRIVE_PARK_GRACE_SECS must not exceed DRIVE_END_GRACE_SECS",
             ));
         }
+        let drive_p_confirm = drive_grace_secs(
+            map,
+            "DRIVE_P_CONFIRM_SECS",
+            crate::state::DRIVE_P_CONFIRM_DEFAULT_SECS,
+            crate::state::DRIVE_P_CONFIRM_MIN_SECS,
+            crate::state::DRIVE_P_CONFIRM_MAX_SECS,
+        )?;
+        let drive_stop_in_gear = drive_grace_secs(
+            map,
+            "DRIVE_STOP_IN_GEAR_SECS",
+            crate::state::DRIVE_STOP_IN_GEAR_DEFAULT_SECS,
+            crate::state::DRIVE_STOP_IN_GEAR_MIN_SECS,
+            crate::state::DRIVE_STOP_IN_GEAR_MAX_SECS,
+        )?;
         let fleet_daily_cap = bounded_count(
             map,
             "FLEET_DATA_DAILY_CAP",
@@ -382,6 +399,8 @@ impl Config {
             energy_price_per_kwh: optional_f64(map, "ENERGY_PRICE_PER_KWH")?,
             drive_end_grace: Duration::from_secs(drive_end_grace),
             drive_park_grace: Duration::from_secs(drive_park_grace),
+            drive_p_confirm: Duration::from_secs(drive_p_confirm),
+            drive_stop_in_gear: Duration::from_secs(drive_stop_in_gear),
             auth_mode: auth_mode(map)?,
             car_renders_enabled: optional_bool(map, "CAR_RENDERS_ENABLED")?.unwrap_or(true),
             tile_upstream: tile_upstream(map)?,
@@ -425,6 +444,16 @@ impl Config {
             "Délai à 0 km/h (s)",
             "DRIVE_PARK_GRACE_SECS",
             self.drive_park_grace.as_secs().to_string(),
+        );
+        push(
+            "Confirmation parking (s)",
+            "DRIVE_P_CONFIRM_SECS",
+            self.drive_p_confirm.as_secs().to_string(),
+        );
+        push(
+            "Arrêt en prise (s)",
+            "DRIVE_STOP_IN_GEAR_SECS",
+            self.drive_stop_in_gear.as_secs().to_string(),
         );
         push(
             "Poll charge (60–86400 s)",

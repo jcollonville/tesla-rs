@@ -236,9 +236,11 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
     archive.fleet_account_id = Some(imported.fleet_id);
     archive.owner_account_id = Some(imported.owner_id);
     let snap = runtime.snapshot();
-    archive.drive_grace = crate::state::DriveGrace::from_secs(
+    archive.drive_grace = crate::state::DriveGrace::from_config(
         snap.drive_end_grace.as_secs(),
         snap.drive_park_grace.as_secs(),
+        snap.drive_p_confirm.as_secs(),
+        snap.drive_stop_in_gear.as_secs(),
     );
     archive.runtime = Some(runtime.clone());
     archive.telemetry_fresh_for = boot.telemetry_fresh;

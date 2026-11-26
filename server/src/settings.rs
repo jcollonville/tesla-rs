@@ -153,6 +153,26 @@ pub(crate) const REGISTRY: &[SettingSpec] = &[
         mode: ReloadMode::Hot,
     },
     SettingSpec {
+        key: "DRIVE_P_CONFIRM_SECS",
+        group: SettingGroup::Polling,
+        label: "Confirmation parking",
+        kind: ValueKind::U64 {
+            min: crate::state::DRIVE_P_CONFIRM_MIN_SECS,
+            max: crate::state::DRIVE_P_CONFIRM_MAX_SECS,
+        },
+        mode: ReloadMode::Hot,
+    },
+    SettingSpec {
+        key: "DRIVE_STOP_IN_GEAR_SECS",
+        group: SettingGroup::Polling,
+        label: "Arrêt en prise",
+        kind: ValueKind::U64 {
+            min: crate::state::DRIVE_STOP_IN_GEAR_MIN_SECS,
+            max: crate::state::DRIVE_STOP_IN_GEAR_MAX_SECS,
+        },
+        mode: ReloadMode::Hot,
+    },
+    SettingSpec {
         key: "FLEET_DATA_DAILY_CAP",
         group: SettingGroup::Fleet,
         label: "Plafond vehicle_data / jour",
@@ -314,6 +334,8 @@ pub(crate) const KEYS: &[&str] = &[
     "POLL_PARKED_LIVE_LIMIT",
     "DRIVE_END_GRACE_SECS",
     "DRIVE_PARK_GRACE_SECS",
+    "DRIVE_P_CONFIRM_SECS",
+    "DRIVE_STOP_IN_GEAR_SECS",
     "FLEET_DATA_DAILY_CAP",
     "FLEET_DATA_MONTHLY_CAP",
     "FLEET_DATA_DYNAMIC_BUDGET",
@@ -352,6 +374,8 @@ pub(crate) struct RuntimeSnapshot {
     pub parked_live_limit: u32,
     pub drive_end_grace: Duration,
     pub drive_park_grace: Duration,
+    pub drive_p_confirm: Duration,
+    pub drive_stop_in_gear: Duration,
     pub daily_cap: u64,
     pub monthly_cap: u64,
     pub blocked_probe: Duration,
@@ -387,6 +411,8 @@ impl RuntimeSnapshot {
             parked_live_limit: config.parked_live_limit,
             drive_end_grace: config.drive_end_grace,
             drive_park_grace: config.drive_park_grace,
+            drive_p_confirm: config.drive_p_confirm,
+            drive_stop_in_gear: config.drive_stop_in_gear,
             daily_cap: config.fleet_daily_cap,
             monthly_cap: config.fleet_monthly_cap,
             blocked_probe: config.fleet_blocked_probe,
@@ -471,6 +497,24 @@ impl RuntimeSnapshot {
                     crate::state::DRIVE_PARK_GRACE_MAX_SECS,
                 ) {
                     self.drive_park_grace = Duration::from_secs(secs);
+                }
+            }
+            "DRIVE_P_CONFIRM_SECS" => {
+                if let Some(secs) = parse_bounded_u64(
+                    value,
+                    crate::state::DRIVE_P_CONFIRM_MIN_SECS,
+                    crate::state::DRIVE_P_CONFIRM_MAX_SECS,
+                ) {
+                    self.drive_p_confirm = Duration::from_secs(secs);
+                }
+            }
+            "DRIVE_STOP_IN_GEAR_SECS" => {
+                if let Some(secs) = parse_bounded_u64(
+                    value,
+                    crate::state::DRIVE_STOP_IN_GEAR_MIN_SECS,
+                    crate::state::DRIVE_STOP_IN_GEAR_MAX_SECS,
+                ) {
+                    self.drive_stop_in_gear = Duration::from_secs(secs);
                 }
             }
             "FLEET_DATA_DAILY_CAP" => {

@@ -247,6 +247,7 @@ async fn overview(
         stream_queue: queue_depth.to_string(),
         last_drive,
         last_charge,
+        telemetry_notice: super::overview::telemetry_notice(&app, id).await,
         car,
         month,
     };
@@ -467,6 +468,25 @@ async fn connection_report(
         } else {
             (None, false)
         };
+        let activity: Option<String> =
+            sqlx::query_scalar("SELECT activity FROM vehicle_state WHERE vehicle_id = $1")
+                .bind(row.id)
+                .fetch_optional(&app.inner.db)
+                .await
+                .ok()
+                .flatten();
+        let asleep = activity.as_deref() == Some("asleep");
+        let online = matches!(
+            activity.as_deref(),
+            Some("online" | "driving" | "charging" | "updating")
+        );
+        let (health, health_tone) = if archive.telemetry.is_some() {
+            let state = archive.vehicle_health(&row.vin, asleep, online).await;
+            let (label, tone) = state.chip();
+            (label.to_owned(), tone)
+        } else {
+            (String::new(), "")
+        };
         vehicles.push(crate::connection::VehicleInput {
             id: row.id,
             name: row.name,
@@ -477,6 +497,8 @@ async fn connection_report(
             skip_reason,
             config_pushed,
             last_message_age: archive.telemetry_age(&row.vin).await,
+            health,
+            health_tone,
         });
     }
     let secret_set = !tesla_auth::ExposeSecret::expose_secret(&app.inner.config.client_secret)
@@ -1150,6 +1172,8 @@ fn setting_key_for_label(label: &str) -> Option<&'static str> {
         "Poll conduite repli (60–3600 s)" => Some("POLL_DRIVE_FALLBACK_SECS"),
         "Délai fin de trajet (s)" => Some("DRIVE_END_GRACE_SECS"),
         "Délai à 0 km/h (s)" => Some("DRIVE_PARK_GRACE_SECS"),
+        "Confirmation parking (s)" => Some("DRIVE_P_CONFIRM_SECS"),
+        "Arrêt en prise (s)" => Some("DRIVE_STOP_IN_GEAR_SECS"),
         "Poll charge (60–86400 s)" => Some("POLL_CHARGE_SECS"),
         "Poll à l'arrêt (s)" => Some("POLL_PARKED_SECS"),
         "Poll endormi (s)" => Some("POLL_ASLEEP_SECS"),

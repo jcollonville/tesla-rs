@@ -141,12 +141,18 @@ pub(crate) async fn run(
         Err(err) => {
             tracing::error!(error = %err, "telemetry listener failed");
             debug.set_telemetry("error", Some("telemetry listener failed".to_owned()));
+            if let Ok(mut fault) = archive.listener_fault.lock() {
+                *fault = Some("écoute impossible".to_owned());
+            }
             return;
         }
     };
+    if let Ok(mut fault) = archive.listener_fault.lock() {
+        *fault = None;
+    }
     tracing::info!(addr = %server.local_addr(), "fleet telemetry listening");
     debug.set_telemetry("listening", None);
-    let mut folded: HashMap<String, Observation> = HashMap::new();
+    let mut folded: HashMap<String, Folded> = HashMap::new();
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -156,17 +162,29 @@ pub(crate) async fn run(
             }
             record = server.incoming().recv() => {
                 let Some(record) = record else { break };
-                if let Err(err) = handle_record(&archive, &mut folded, record).await {
-                    tracing::warn!(error = %err, "telemetry record was not archived");
+                let mut batch = vec![record];
+                while let Ok(next) = server.incoming().try_recv() {
+                    batch.push(next);
+                }
+                batch.sort_by_key(|record| record.created_at);
+                for record in batch {
+                    if let Err(err) = handle_record(&archive, &mut folded, record).await {
+                        tracing::warn!(error = %err, "telemetry record was not archived");
+                    }
                 }
             }
         }
     }
 }
 
+struct Folded {
+    obs: Observation,
+    connection_id: String,
+}
+
 async fn handle_record(
     archive: &Archive,
-    folded: &mut HashMap<String, Observation>,
+    folded: &mut HashMap<String, Folded>,
     record: IncomingRecord,
 ) -> Result<(), AppError> {
     match record.decoded {
@@ -175,11 +193,15 @@ async fn handle_record(
             if vin.is_empty() {
                 return Ok(());
             }
-            let obs = folded
-                .entry(vin.clone())
-                .or_insert_with(|| Observation::at(Utc::now(), Presence::Online));
-            fold_vehicle_data(obs, &data);
-            let snapshot = obs.clone();
+            let slot = folded.entry(vin.clone()).or_insert_with(|| Folded {
+                obs: Observation::at(Utc::now(), Presence::Online),
+                connection_id: record.connection_id.clone(),
+            });
+            if slot.connection_id.is_empty() {
+                slot.connection_id.clone_from(&record.connection_id);
+            }
+            fold_vehicle_data(&mut slot.obs, &data);
+            let snapshot = slot.obs.clone();
             apply_for_vin(
                 archive,
                 &vin,
@@ -205,12 +227,30 @@ async fn handle_record(
                 TypedEnum::Known(ConnectivityEvent::Connected) => Presence::Online,
                 _ => return Ok(()),
             };
-            if presence == Presence::Offline {
-                folded.remove(&vin);
-                let slot = archive.runtimes.lock().await.get(&vin).cloned();
-                if let Some(slot) = slot {
-                    slot.lock().await.last_telemetry = None;
+            if presence == Presence::Online {
+                let connection_id = event.connection_id().to_owned();
+                match folded.get_mut(&vin) {
+                    Some(slot) => slot.connection_id.clone_from(&connection_id),
+                    None => {
+                        folded.insert(
+                            vin,
+                            Folded {
+                                obs: Observation::at(Utc::now(), Presence::Online),
+                                connection_id,
+                            },
+                        );
+                    }
                 }
+                return Ok(());
+            }
+            let active = folded.get(&vin).map(|slot| slot.connection_id.as_str());
+            if !crate::telemetry_health::disconnect_is_current(active, event.connection_id()) {
+                return Ok(());
+            }
+            folded.remove(&vin);
+            let slot = archive.runtimes.lock().await.get(&vin).cloned();
+            if let Some(slot) = slot {
+                slot.lock().await.last_telemetry = None;
             }
             apply_for_vin(
                 archive,
@@ -227,7 +267,36 @@ async fn handle_record(
             )
             .await
         }
+        Decoded::Alerts(alerts) => {
+            let count = alerts.alerts().len();
+            tracing::info!(count, "telemetry alerts");
+            for alert in alerts.alerts() {
+                tracing::info!(alert = %clip_label(&alert.name), "telemetry alert");
+            }
+            Ok(())
+        }
+        Decoded::Errors(errors) => {
+            tracing::warn!(count = errors.errors().len(), "telemetry vehicle errors");
+            for error in errors.errors() {
+                tracing::warn!(name = %clip_label(&error.name), "telemetry vehicle error");
+            }
+            Ok(())
+        }
         _ => Ok(()),
+    }
+}
+
+fn clip_label(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(64) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_owned()
+    } else {
+        out
     }
 }
 

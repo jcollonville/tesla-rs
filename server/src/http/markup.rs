@@ -64,6 +64,15 @@ pub(super) struct FleetCard {
     pub limit_pct: Option<f64>,
     pub range: String,
     pub place: Option<String>,
+    pub telemetry_notice: Option<StatusNotice>,
+}
+
+/// Words and an icon for a telemetry problem. Colour is not the only signal.
+pub(super) struct StatusNotice {
+    pub role: &'static str,
+    pub class: &'static str,
+    pub icon: &'static str,
+    pub text: String,
 }
 
 /// What the car is doing, from `vehicle_state`.
@@ -192,6 +201,7 @@ pub(super) struct Overview {
     pub last_charge: Option<Recent>,
     pub car: CarCard,
     pub month: Vec<(&'static str, String)>,
+    pub telemetry_notice: Option<StatusNotice>,
 }
 
 pub(super) struct ConnectionView<'a> {
@@ -432,6 +442,7 @@ pub(super) fn fleet_page(chrome: &Chrome, cards: &[FleetCard], month_total: &str
             p class="lede" { "Ce mois-ci : " (month_total) }
             div class="fleet" {
                 @for card in cards {
+                    (telemetry_banner(card.telemetry_notice.as_ref()))
                     a class="card fleet-card" href=(format!("/v/{}", card.id)) {
                         div class="fleet-head" {
                             div {
@@ -468,6 +479,22 @@ pub(super) fn fleet_page(chrome: &Chrome, cards: &[FleetCard], month_total: &str
         }
     };
     document(chrome.debug_script, body)
+}
+
+fn telemetry_banner(notice: Option<&StatusNotice>) -> Markup {
+    let Some(notice) = notice else {
+        return html! {};
+    };
+    html! {
+        div class=(notice.class) role=(notice.role) {
+            p {
+                span aria-hidden="true" { (notice.icon) " " }
+                (notice.text)
+                " "
+                a href="/connection" { "Connexion" }
+            }
+        }
+    }
 }
 
 pub(super) fn status_chip(status: Status) -> Markup {
@@ -651,6 +678,7 @@ pub(super) fn overview_page(chrome: &Chrome, overview: &Overview) -> String {
             @if overview.last_error != "—" && !overview.last_error.is_empty() {
                 div class="banner bad overview-alert" role="status" { p { "Dernière erreur : " (overview.last_error) } }
             }
+            (telemetry_banner(overview.telemetry_notice.as_ref()))
             (element("tl-vehicle-card", &card_attrs, Some(&vehicle), html! {}))
             section class="card place-card" aria-labelledby="place-title" {
                 h2 id="place-title" class="visually-hidden" { "Position" }
@@ -773,6 +801,10 @@ pub(super) fn connection_page(chrome: &Chrome, view: &ConnectionView<'_>) -> Str
                                             @if !car.key.is_empty() { " — clé " (car.key) }
                                             @if !car.config.is_empty() { " — configuration " (car.config) }
                                             @if !car.stream.is_empty() { " — " (car.stream) }
+                                            @if !car.health.is_empty() {
+                                                " "
+                                                span class=(format!("chip {}", car.health_tone)) { (car.health) }
+                                            }
                                         }
                                     }
                                 }
@@ -1428,7 +1460,7 @@ pub(crate) fn document(debug_script: bool, body: Markup) -> String {
 mod tests {
     use super::{
         CarCard, Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview, Status,
-        VehicleTab, connection_page, fleet_page, login_page, overview_page,
+        StatusNotice, VehicleTab, connection_page, fleet_page, login_page, overview_page,
     };
 
     #[test]
@@ -1651,6 +1683,22 @@ mod tests {
         assert!(html.contains("Red &lt;script&gt;"));
         assert!(!html.contains("Red <script>"));
         assert!(html.contains("poll failed"));
+        let warned = [FleetCard {
+            id: 7,
+            name: "Red".to_owned(),
+            telemetry_notice: Some(StatusNotice {
+                role: "alert",
+                class: "banner bad",
+                icon: "!",
+                text: "La télémétrie est en erreur.".to_owned(),
+            }),
+            ..FleetCard::default()
+        }];
+        let banner = fleet_page(&chrome, &warned, "1.0 km");
+        assert!(banner.contains("role=\"alert\""));
+        assert!(banner.contains("La télémétrie est en erreur."));
+        assert!(banner.contains("href=\"/connection\">Connexion</a>"));
+        assert!(banner.contains("aria-hidden=\"true\">!"));
         assert!(html.contains("72%"));
         assert!(html.contains("fallback"));
         assert!(html.contains("href=\"/settings\""));
@@ -1837,6 +1885,8 @@ mod tests {
                 skip_reason: Some("missing_key".to_owned()),
                 config_pushed: false,
                 last_message_age: None,
+                health: "Ignorée".to_owned(),
+                health_tone: "bad",
             }],
         };
         let open = connection_html(&facts);

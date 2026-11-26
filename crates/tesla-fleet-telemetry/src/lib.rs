@@ -81,4 +81,6 @@ pub use record::{
 };
 
 #[cfg(feature = "server")]
-pub use server::{ClientCa, IncomingRecord, ServerConfig, TelemetryServer};
+pub use server::{
+    ClientCa, IncomingRecord, ServerConfig, TelemetryServer, tls_handshake_rejections,
+};

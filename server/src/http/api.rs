@@ -100,6 +100,21 @@ pub(crate) async fn vehicle_state(
             Some(target) => target.skip_reason(&vin).await,
             None => None,
         };
+        row.telemetry_health = Some(
+            app.inner
+                .archive
+                .vehicle_health(
+                    &vin,
+                    row.activity == "asleep",
+                    matches!(
+                        row.activity.as_str(),
+                        "online" | "driving" | "charging" | "updating"
+                    ),
+                )
+                .await
+                .code()
+                .to_owned(),
+        );
     }
     let snapshot = app.inner.stream_board.snapshot().await;
     let (status, error) = snapshot.for_vehicle(id);
@@ -495,6 +510,20 @@ async fn handle_socket(
                 Some(target) => target.skip_reason(&row.vin).await,
                 None => None,
             };
+            row.state.telemetry_health = Some(
+                archive
+                    .vehicle_health(
+                        &row.vin,
+                        row.state.activity == "asleep",
+                        matches!(
+                            row.state.activity.as_str(),
+                            "online" | "driving" | "charging" | "updating"
+                        ),
+                    )
+                    .await
+                    .code()
+                    .to_owned(),
+            );
             row.state.stream_status = status;
             row.state.stream_error = error;
             row.state.position_mode = gps.mode_name(row.state.vehicle_id).await;
@@ -853,6 +882,11 @@ pub(crate) struct StateJson {
     #[sqlx(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry_skip_reason: Option<String>,
+    /// `ok`, `asleep`, `silent_while_online`, `config_skipped`, `config_missing`,
+    /// `retry_scheduled`, `listener_error`, or `tls_rejected`.
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_health: Option<String>,
     pub tpms_pressure_fl: Option<f64>,
     pub tpms_pressure_fr: Option<f64>,
     pub tpms_pressure_rl: Option<f64>,
@@ -991,6 +1025,7 @@ impl StateJson {
             charge_status_stale: false,
             data_source: default_data_source(),
             telemetry_skip_reason: None,
+            telemetry_health: None,
             tpms_pressure_fl: None,
             tpms_pressure_fr: None,
             tpms_pressure_rl: None,

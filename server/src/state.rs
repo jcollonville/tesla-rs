@@ -558,12 +558,34 @@ pub(crate) const DRIVE_END_GRACE_DEFAULT_SECS: u64 = 300;
 pub(crate) const DRIVE_END_GRACE_MIN_SECS: u64 = 30;
 /// Longest accepted signal-loss grace.
 pub(crate) const DRIVE_END_GRACE_MAX_SECS: u64 = 1_800;
-/// Default time at exact 0 km/h before a drive closes. Five minutes.
+/// Default time at exact 0 km/h with an unknown gear before a drive closes.
 pub(crate) const DRIVE_PARK_GRACE_DEFAULT_SECS: u64 = 300;
-/// Shortest accepted park grace.
+/// Shortest accepted unknown-gear park grace.
 pub(crate) const DRIVE_PARK_GRACE_MIN_SECS: u64 = 15;
-/// Longest accepted park grace.
+/// Longest accepted unknown-gear park grace.
 pub(crate) const DRIVE_PARK_GRACE_MAX_SECS: u64 = 900;
+/// Default time in shift `P` at standstill before a drive closes.
+pub(crate) const DRIVE_P_CONFIRM_DEFAULT_SECS: u64 = 60;
+/// Shortest accepted park confirmation.
+pub(crate) const DRIVE_P_CONFIRM_MIN_SECS: u64 = 15;
+/// Longest accepted park confirmation.
+pub(crate) const DRIVE_P_CONFIRM_MAX_SECS: u64 = 300;
+/// Default time stopped in `D`, `R`, or `N` before a drive closes.
+pub(crate) const DRIVE_STOP_IN_GEAR_DEFAULT_SECS: u64 = 1_800;
+/// Shortest accepted in-gear stop. Kept above the old five-minute split.
+pub(crate) const DRIVE_STOP_IN_GEAR_MIN_SECS: u64 = 300;
+/// Longest accepted in-gear stop.
+pub(crate) const DRIVE_STOP_IN_GEAR_MAX_SECS: u64 = 7_200;
+/// `D` or `R` this soon after a park close, at the same place, is the same trip.
+pub(crate) const PARK_REOPEN_SECS: i64 = 120;
+/// Coherent odometer and position may rejoin a drive across a restart or a gap.
+///
+/// Fifteen minutes covers a ten-minute process gap plus ingest lag. A flat
+/// odometer at the same place does not qualify: that stays the two-minute
+/// park resume. Past this window a later departure is a new drive.
+pub(crate) const CONTINUITY_JOIN_SECS: i64 = 900;
+/// A 0 km/h sample this long before the `P` transition may be the stored end.
+pub(crate) const ZERO_BEFORE_PARK_SECS: i64 = 120;
 
 /// Speed at or below this, with shift `P`, is a confirmed park.
 const STANDSTILL_KMH: f64 = 1.0;
@@ -583,24 +605,40 @@ const MAX_JOIN_SPEED_KMH: f64 = 250.0;
 pub(crate) struct DriveGrace {
     /// Signal loss, asleep, offline, or an incomplete poll.
     pub end: chrono::Duration,
-    /// Sustained exact 0 km/h. Closure only; the trim uses the first 0 sample.
+    /// Exact 0 km/h when the gear is unknown.
     pub park: chrono::Duration,
+    /// Shift `P` with speed at or below 1 km/h, or unknown.
+    pub p_confirm: chrono::Duration,
+    /// Stopped in `D`, `R`, or `N`. Does not apply to a confirmed park.
+    pub stop_in_gear: chrono::Duration,
 }
 
 impl DriveGrace {
-    /// Built-in 300 s signal-loss window and 300 s at 0 km/h.
+    /// Built-in windows: 300 s signal loss, 300 s unknown-gear zero, 60 s in `P`, 1800 s in gear.
     pub(crate) const fn standard() -> Self {
         Self {
             end: chrono::Duration::seconds(300),
             park: chrono::Duration::seconds(300),
+            p_confirm: chrono::Duration::seconds(60),
+            stop_in_gear: chrono::Duration::seconds(1_800),
         }
     }
 
-    /// Windows already checked against the config bounds.
-    pub(crate) fn from_secs(end_secs: u64, park_secs: u64) -> Self {
+    /// All four windows, already checked against their bounds.
+    pub(crate) fn from_config(
+        end_secs: u64,
+        park_secs: u64,
+        p_confirm_secs: u64,
+        stop_in_gear_secs: u64,
+    ) -> Self {
         Self {
             end: chrono::Duration::seconds(i64::try_from(end_secs).unwrap_or(300)),
             park: chrono::Duration::seconds(i64::try_from(park_secs).unwrap_or(300)),
+            p_confirm: chrono::Duration::seconds(i64::try_from(p_confirm_secs).unwrap_or(60)),
+            stop_in_gear: chrono::Duration::seconds(
+                i64::try_from(stop_in_gear_secs)
+                    .unwrap_or(i64::try_from(DRIVE_STOP_IN_GEAR_DEFAULT_SECS).unwrap_or(1_800)),
+            ),
         }
     }
 }
@@ -608,10 +646,14 @@ impl DriveGrace {
 /// What one sample says about an open drive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DriveMotion {
-    /// Shift `D`/`R`/`N`, or speed above 1 km/h without park.
+    /// Shift `D`/`R`/`N` while moving or with unknown speed, or speed above 1 km/h.
     Driving,
-    /// Shift `P` and speed about zero.
+    /// Shift `P` and speed at or below 1 km/h, or unknown.
     Park,
+    /// Shift `D`/`R`/`N` with a known speed at or below 1 km/h.
+    StoppedInGear,
+    /// Exact 0 km/h and no gear. Uses [`DriveGrace::park`].
+    UnknownStandstill,
     /// Charging or starting to charge. Closes the drive at once.
     Charging,
     /// Asleep, offline, incomplete poll, or park while still moving.
@@ -620,16 +662,43 @@ pub(crate) enum DriveMotion {
     Hold,
 }
 
-/// Last driving evidence and the start of a confirmed-park run.
+/// Which stop timer [`DriveClock::park_since`] belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopKind {
+    /// Confirmed park. [`DriveGrace::p_confirm`].
+    Park,
+    /// Unknown gear at exact 0 km/h. [`DriveGrace::park`].
+    Unknown,
+    /// Held in `D`, `R`, or `N`. [`DriveGrace::stop_in_gear`].
+    InGear,
+}
+
+/// Last driving evidence and the start of the current stop run.
 ///
-/// Both instants come from position timestamps, so a restart can rebuild this
-/// from stored rows.
+/// Instants come from position timestamps, so a restart can rebuild this from
+/// stored rows. [`Self::park_since`] is never older than [`Self::last_driving_at`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DriveClock {
     /// Time of the latest sample that was still driving.
     pub last_driving_at: DateTime<Utc>,
-    /// First confirmed-park sample of the current park run.
+    /// Car timestamp of the latest accepted message, driving or not.
+    pub last_message_at: DateTime<Utc>,
+    /// First sample of the current stop run. Never older than [`Self::last_driving_at`].
     pub park_since: Option<DateTime<Utc>>,
+    /// Which grace [`Self::park_since`] uses.
+    pub stop_kind: Option<StopKind>,
+}
+
+impl DriveClock {
+    /// A drive that is moving at `at`, with no stop timer.
+    pub(crate) fn moving_at(at: DateTime<Utc>) -> Self {
+        Self {
+            last_driving_at: at,
+            last_message_at: at,
+            park_since: None,
+            stop_kind: None,
+        }
+    }
 }
 
 /// Whether to keep, wait, or close an open drive.
@@ -684,6 +753,39 @@ pub(crate) struct GapFacts {
     pub gap_m: Option<f64>,
 }
 
+/// A telemetry fix repeats the previous location and gear, so it is not a new point.
+pub(crate) fn telemetry_point_repeats(previous: Option<&Observation>, next: &Observation) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    if previous.shift_state != next.shift_state {
+        return false;
+    }
+    let Some((left_lat, left_lon)) = previous.latitude.zip(previous.longitude) else {
+        return false;
+    };
+    let Some((right_lat, right_lon)) = next.latitude.zip(next.longitude) else {
+        return false;
+    };
+    left_lat.is_finite()
+        && left_lon.is_finite()
+        && right_lat.is_finite()
+        && right_lon.is_finite()
+        && (left_lat - right_lat).abs() < 1e-5
+        && (left_lon - right_lon).abs() < 1e-5
+}
+
+/// Open drive, car still marked driving, and no telemetry message for 90 seconds.
+pub(crate) fn telemetry_drive_needs_fallback(
+    drive_open: bool,
+    activity: Activity,
+    age: Option<std::time::Duration>,
+) -> bool {
+    drive_open
+        && activity == Activity::Driving
+        && age.is_some_and(|age| age >= std::time::Duration::from_secs(90))
+}
+
 /// Speed is present and about zero, or missing next to an explicit park shift.
 pub(crate) fn speed_is_standstill(speed: Option<f64>) -> bool {
     match speed {
@@ -693,19 +795,39 @@ pub(crate) fn speed_is_standstill(speed: Option<f64>) -> bool {
     }
 }
 
+/// Known speed at or below 1 km/h. A missing reading is not a stop.
+fn known_standstill(speed: Option<f64>) -> bool {
+    match speed {
+        Some(speed) if speed.is_finite() => speed <= STANDSTILL_KMH,
+        _ => false,
+    }
+}
+
 /// Classifies a poll or telemetry observation.
 pub(crate) fn observation_motion(obs: &Observation) -> DriveMotion {
     if is_charging(obs) {
         return DriveMotion::Charging;
     }
+    if obs.presence == Presence::Online {
+        match normalized_shift(obs.shift_state.as_deref()) {
+            Some("D" | "R" | "N") if known_standstill(obs.speed_kmh) => {
+                return DriveMotion::StoppedInGear;
+            }
+            Some("D" | "R" | "N") => return DriveMotion::Driving,
+            Some("P") if speed_is_standstill(obs.speed_kmh) => return DriveMotion::Park,
+            Some("P") => return DriveMotion::Gap,
+            _ if obs
+                .speed_kmh
+                .is_some_and(|speed| speed.is_finite() && speed > STANDSTILL_KMH) =>
+            {
+                return DriveMotion::Driving;
+            }
+            _ if speed_is_exact_zero(obs.speed_kmh) => return DriveMotion::UnknownStandstill,
+            _ => {}
+        }
+    }
     if is_driving(obs) {
         return DriveMotion::Driving;
-    }
-    if obs.presence == Presence::Online
-        && normalized_shift(obs.shift_state.as_deref()) == Some("P")
-        && speed_is_standstill(obs.speed_kmh)
-    {
-        return DriveMotion::Park;
     }
     DriveMotion::Gap
 }
@@ -721,11 +843,19 @@ pub(crate) fn stream_motion(
     drive_open: bool,
 ) -> DriveMotion {
     match normalized_shift(shift) {
+        Some("D" | "R" | "N") if known_standstill(speed_kmh) => DriveMotion::StoppedInGear,
         Some("D" | "R" | "N") => DriveMotion::Driving,
         Some("P") if speed_is_standstill(speed_kmh) => DriveMotion::Park,
         Some("P") => DriveMotion::Gap,
         _ => match speed_kmh {
             Some(speed) if speed.is_finite() && speed > STANDSTILL_KMH => DriveMotion::Driving,
+            Some(speed) if speed_is_exact_zero(Some(speed)) => {
+                if drive_open {
+                    DriveMotion::UnknownStandstill
+                } else {
+                    DriveMotion::Gap
+                }
+            }
             _ if drive_open => DriveMotion::Hold,
             _ => DriveMotion::Gap,
         },
@@ -734,11 +864,12 @@ pub(crate) fn stream_motion(
 
 /// Decides whether the open drive should close at `at`.
 ///
-/// Charging closes immediately. Exact 0 km/h starts, or continues, a stop.
-/// [`DriveGrace::park`] is how long that stop must last; it does not choose
-/// `end_at`. A missing speed does not start the stop. Movement, including a
-/// driving shift with no speed, clears it. A signal gap with no 0 km/h sample
-/// uses [`DriveGrace::end`], measured from the last driving evidence.
+/// `at` is a car timestamp. Charging closes immediately. Shift `P` at standstill
+/// (speed missing counts) starts [`DriveGrace::p_confirm`]. `D`/`R`/`N` at a
+/// known standstill uses [`DriveGrace::stop_in_gear`] and does not start the
+/// park timer. Unknown gear at exact 0 km/h keeps [`DriveGrace::park`]. A sample
+/// older than the last accepted message does not move `park_since` backward.
+/// Signal loss uses [`DriveGrace::end`] from the previous car timestamp.
 /// Row `end_at` is chosen later by [`drive_end_cutoff`].
 pub(crate) fn plan_drive_close(
     motion: DriveMotion,
@@ -747,36 +878,102 @@ pub(crate) fn plan_drive_close(
     grace: DriveGrace,
     speed_kmh: Option<f64>,
 ) -> ClosePlan {
+    plan_drive_close_at(motion, at, clock, grace, speed_kmh, true)
+}
+
+/// Wall-clock check used by [`crate::persist::close_drive_if_due`].
+///
+/// `at` is `now` and is not stored as a car message, so a quiet expire tick
+/// cannot refresh the silence anchor.
+pub(crate) fn plan_drive_expire(
+    motion: DriveMotion,
+    at: DateTime<Utc>,
+    clock: DriveClock,
+    grace: DriveGrace,
+) -> ClosePlan {
+    plan_drive_close_at(motion, at, clock, grace, None, false)
+}
+
+fn plan_drive_close_at(
+    motion: DriveMotion,
+    at: DateTime<Utc>,
+    mut clock: DriveClock,
+    grace: DriveGrace,
+    speed_kmh: Option<f64>,
+    record_message: bool,
+) -> ClosePlan {
     if motion == DriveMotion::Charging {
         return ClosePlan::Close { clock };
     }
-    if motion == DriveMotion::Hold && !speed_is_exact_zero(speed_kmh) {
+    let anchor = clock.last_message_at.max(clock.last_driving_at);
+    if record_message && at + chrono::Duration::seconds(1) < anchor {
         return ClosePlan::Continue { clock };
     }
-    let clock = if speed_is_exact_zero(speed_kmh) {
-        DriveClock {
-            last_driving_at: clock.last_driving_at,
-            park_since: Some(clock.park_since.unwrap_or(at)),
+    if motion == DriveMotion::Hold && !speed_is_exact_zero(speed_kmh) {
+        if record_message && at > clock.last_message_at {
+            clock.last_message_at = at;
         }
-    } else if motion == DriveMotion::Driving || speed_is_movement(speed_kmh) {
+        return ClosePlan::Continue { clock };
+    }
+    let stop = match motion {
+        DriveMotion::Park => Some((StopKind::Park, grace.p_confirm)),
+        DriveMotion::StoppedInGear => Some((StopKind::InGear, grace.stop_in_gear)),
+        DriveMotion::UnknownStandstill => Some((StopKind::Unknown, grace.park)),
+        _ => None,
+    };
+    if let Some((kind, window)) = stop {
+        let since = if clock.stop_kind == Some(kind) {
+            clock.park_since.unwrap_or(at)
+        } else {
+            at
+        };
+        let since = since.max(clock.last_driving_at);
+        clock.park_since = Some(since);
+        clock.stop_kind = Some(kind);
+        if record_message && at > clock.last_message_at {
+            clock.last_message_at = at;
+        }
+        return grace_or_wait(at, since, window, clock);
+    }
+    if motion == DriveMotion::Driving || speed_is_movement(speed_kmh) {
         let late_park = clock
             .park_since
             .is_some_and(|since| at + chrono::Duration::seconds(1) < since);
         if late_park {
             return ClosePlan::Continue { clock };
         }
-        DriveClock {
-            last_driving_at: clock.last_driving_at.max(at),
-            park_since: None,
+        clock.last_driving_at = clock.last_driving_at.max(at);
+        clock.park_since = None;
+        clock.stop_kind = None;
+        if record_message {
+            clock.last_message_at = clock.last_message_at.max(at);
         }
-    } else {
-        clock
-    };
-    if let Some(since) = clock.park_since {
-        return grace_or_wait(at, since, grace.park, clock);
+        return ClosePlan::Continue { clock };
     }
     if motion == DriveMotion::Gap {
-        return grace_or_wait(at, clock.last_driving_at, grace.end, clock);
+        let proof = clock.last_message_at.max(clock.last_driving_at);
+        if record_message && at > clock.last_message_at {
+            clock.last_message_at = at;
+        }
+        if let Some(since) = clock.park_since
+            && let Some(kind) = clock.stop_kind
+        {
+            let window = match kind {
+                StopKind::Park => grace.p_confirm,
+                StopKind::Unknown => grace.park,
+                StopKind::InGear => grace.stop_in_gear,
+            };
+            if matches!(
+                grace_or_wait(at, since, window, clock),
+                ClosePlan::Close { .. }
+            ) {
+                return ClosePlan::Close { clock };
+            }
+        }
+        return grace_or_wait(at, proof, grace.end, clock);
+    }
+    if record_message && at > clock.last_message_at {
+        clock.last_message_at = at;
     }
     ClosePlan::Continue { clock }
 }
@@ -806,23 +1003,54 @@ pub(crate) fn clock_from_tail(
     cues: &[PositionCue],
     drive_start: DateTime<Utc>,
 ) -> (DriveClock, DriveMotion) {
-    let park_since = final_zero_run_start(cues);
+    let last_message = cues.first().map_or(drive_start, |cue| cue.at);
     let last_driving = cues
         .iter()
         .find(|cue| position_is_later_movement(cue))
         .map_or(drive_start, |cue| cue.at);
-    let motion = if park_since.is_some() {
-        DriveMotion::Park
-    } else {
-        DriveMotion::Gap
-    };
+    let (park_since, stop_kind, motion) = tail_stop(cues);
+    let park_since = park_since.filter(|since| *since >= last_driving);
     (
         DriveClock {
             last_driving_at: last_driving,
+            last_message_at: last_message.max(last_driving),
             park_since,
+            stop_kind: park_since.and(stop_kind),
         },
         motion,
     )
+}
+
+/// Newest cue first. The stop is the final non-moving run, classified by gear.
+fn tail_stop(cues: &[PositionCue]) -> (Option<DateTime<Utc>>, Option<StopKind>, DriveMotion) {
+    let mut kind = None;
+    let mut since = None;
+    for cue in cues {
+        if position_is_later_movement(cue) {
+            break;
+        }
+        let sample_kind = match normalized_shift(cue.shift_state.as_deref()) {
+            Some("P") if speed_is_standstill(cue.speed_kmh) => Some(StopKind::Park),
+            Some("D" | "R" | "N") if known_standstill(cue.speed_kmh) => Some(StopKind::InGear),
+            _ if speed_is_exact_zero(cue.speed_kmh) => Some(StopKind::Unknown),
+            _ => None,
+        };
+        let Some(sample_kind) = sample_kind else {
+            continue;
+        };
+        if kind.is_some_and(|current| current != sample_kind) {
+            break;
+        }
+        kind = Some(sample_kind);
+        since = Some(cue.at);
+    }
+    let motion = match kind {
+        Some(StopKind::Park) => DriveMotion::Park,
+        Some(StopKind::InGear) => DriveMotion::StoppedInGear,
+        Some(StopKind::Unknown) => DriveMotion::UnknownStandstill,
+        None => DriveMotion::Gap,
+    };
+    (since, kind, motion)
 }
 
 /// Exact 0 km/h. The 1 km/h standstill band used for park detection does not apply.
@@ -886,7 +1114,43 @@ pub(crate) fn drive_end_cutoff(cues: &[PositionCue], drive_start: DateTime<Utc>)
     let Some(newest) = cues.first() else {
         return drive_start;
     };
+    if let Some(park_at) = confirmed_park_transition(cues) {
+        let window = park_at - chrono::Duration::seconds(ZERO_BEFORE_PARK_SECS);
+        let mut zero = None;
+        for cue in cues {
+            if cue.at > park_at {
+                continue;
+            }
+            if cue.at < window || (cue.at < park_at && position_is_later_movement(cue)) {
+                break;
+            }
+            if speed_is_exact_zero(cue.speed_kmh) {
+                zero = Some(cue.at);
+            }
+        }
+        return zero.unwrap_or(park_at);
+    }
     final_zero_run_start(cues).unwrap_or(newest.at)
+}
+
+/// Earliest confirmed `P` in the final non-moving tail, newest cue first.
+fn confirmed_park_transition(cues: &[PositionCue]) -> Option<DateTime<Utc>> {
+    let mut saw_park = false;
+    let mut start = None;
+    for cue in cues {
+        if position_is_later_movement(cue) {
+            break;
+        }
+        match normalized_shift(cue.shift_state.as_deref()) {
+            Some("P") if speed_is_standstill(cue.speed_kmh) => {
+                saw_park = true;
+                start = Some(cue.at);
+            }
+            Some("D" | "R" | "N") if saw_park => break,
+            _ => {}
+        }
+    }
+    saw_park.then_some(start).flatten()
 }
 
 /// New `end_at` for one closed drive, or `None` when the row must stay as stored.
@@ -936,7 +1200,9 @@ pub(crate) fn merge_clock(stored: DriveClock, memory: Option<DriveClock>) -> Dri
     if memory.last_driving_at > stored.last_driving_at {
         return DriveClock {
             last_driving_at: memory.last_driving_at,
+            last_message_at: memory.last_message_at.max(stored.last_message_at),
             park_since: None,
+            stop_kind: None,
         };
     }
     if stored.park_since.is_none()
@@ -945,10 +1211,15 @@ pub(crate) fn merge_clock(stored: DriveClock, memory: Option<DriveClock>) -> Dri
     {
         return DriveClock {
             last_driving_at: stored.last_driving_at,
+            last_message_at: stored.last_message_at.max(memory.last_message_at),
             park_since: Some(since),
+            stop_kind: memory.stop_kind,
         };
     }
-    stored
+    DriveClock {
+        last_message_at: stored.last_message_at.max(memory.last_message_at),
+        ..stored
+    }
 }
 
 /// A read-only split candidate: a short gap with motion, and no huge odometer jump.
@@ -964,7 +1235,48 @@ pub(crate) fn split_candidate(gap: &GapFacts, grace_secs: i64) -> bool {
 /// Requires the same motion test as [`split_candidate`] plus a continuous
 /// odometer. A parked stop at speed zero in the same place stays split.
 pub(crate) fn should_reopen_drive(gap: &GapFacts, grace_secs: i64) -> bool {
-    split_candidate(gap, grace_secs) && odometer_delta(gap).is_some()
+    if split_candidate(gap, grace_secs) && odometer_delta(gap).is_some() {
+        return true;
+    }
+    if same_place_after_park(gap) {
+        return true;
+    }
+    continuous_resume(gap)
+}
+
+/// `D`/`R` within two minutes of a park close, still at that place.
+fn same_place_after_park(gap: &GapFacts) -> bool {
+    if gap.gap_secs < 0 || gap.gap_secs > PARK_REOPEN_SECS {
+        return false;
+    }
+    let end_slow = gap
+        .end_speed_kmh
+        .is_none_or(|speed| !speed.is_finite() || speed <= STANDSTILL_KMH);
+    let close = gap
+        .gap_m
+        .is_some_and(|metres| metres.is_finite() && metres < SAME_PLACE_M);
+    end_slow && close && odometer_plausible(gap)
+}
+
+/// The earlier drive was still moving and the odometer stayed plausible.
+fn continuous_resume(gap: &GapFacts) -> bool {
+    if gap.gap_secs < 0 || gap.gap_secs > CONTINUITY_JOIN_SECS {
+        return false;
+    }
+    if !speed_above(gap.end_speed_kmh, GAP_MOTION_KMH) {
+        return false;
+    }
+    odometer_plausible(gap) && moving_across_gap(gap) && odometer_delta(gap).is_some()
+}
+
+/// Signal-gap closes wait out the continuity window after this process started.
+///
+/// A restart otherwise sees `now` far ahead of the last car timestamp and splits
+/// a drive that is about to resume. Park, in-gear, and charge closes still run:
+/// those timers come from stored samples, not from the process being down.
+pub(crate) fn gap_close_suppressed(now: DateTime<Utc>, process_started: DateTime<Utc>) -> bool {
+    let since = now.signed_duration_since(process_started);
+    since >= chrono::Duration::zero() && since < chrono::Duration::seconds(CONTINUITY_JOIN_SECS)
 }
 
 fn odometer_delta(gap: &GapFacts) -> Option<f64> {
@@ -1049,9 +1361,14 @@ pub(crate) fn stream_drive_decision(
     speed_kmh: Option<f64>,
 ) -> StreamDrive {
     let motion = stream_motion(shift, speed_kmh, tracker.drive_open);
-    let driving = matches!(motion, DriveMotion::Driving | DriveMotion::Hold)
-        && (tracker.drive_open || motion == DriveMotion::Driving);
-    let start_drive = motion == DriveMotion::Driving && !tracker.drive_open;
+    let start_drive =
+        !tracker.drive_open && matches!(motion, DriveMotion::Driving | DriveMotion::StoppedInGear);
+    let driving = start_drive
+        || (tracker.drive_open
+            && matches!(
+                motion,
+                DriveMotion::Driving | DriveMotion::Hold | DriveMotion::StoppedInGear
+            ));
     let end_drive = motion == DriveMotion::Park && tracker.drive_open;
     let end_charge = start_drive && tracker.charge_open;
     let charge_open = tracker.charge_open && !end_charge;
@@ -1075,11 +1392,14 @@ pub(crate) fn stream_drive_decision(
 }
 
 /// A drive that has already been closed. Late stream samples may join it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ClosedDrive {
     pub id: i64,
     pub start_at: DateTime<Utc>,
     pub end_at: DateTime<Utc>,
+    /// Retained end point. Address and geofence use this, not a later sample.
+    pub end_latitude: Option<f64>,
+    pub end_longitude: Option<f64>,
 }
 
 /// Samples older than this at processing time must not open a drive.
@@ -1506,9 +1826,10 @@ mod tests {
 
     use super::{
         Activity, ClosedDrive, Observation, Presence, Sample, Tracker, Transition,
-        gate_stream_sample, keep_closed_drive, plan_drive_close, reduce, sanitize_charger_type,
-        should_store_stream_position, stream_collides_with_poll, stream_drive_decision,
-        summarize_charge, summarize_drive,
+        drive_end_cutoff, gate_stream_sample, keep_closed_drive, plan_drive_close, reduce,
+        sanitize_charger_type, should_reopen_drive, should_store_stream_position,
+        stream_collides_with_poll, stream_drive_decision, stream_motion, summarize_charge,
+        summarize_drive,
     };
 
     fn odometer_sample(minute: i64, odometer_km: Option<f64>, latitude: f64) -> Sample {
@@ -1867,9 +2188,19 @@ mod tests {
     }
 
     fn clock_at(minute: i64) -> super::DriveClock {
+        super::DriveClock::moving_at(at(minute))
+    }
+
+    fn stopped_clock(
+        last_driving: chrono::DateTime<Utc>,
+        park_at: chrono::DateTime<Utc>,
+        kind: super::StopKind,
+    ) -> super::DriveClock {
         super::DriveClock {
-            last_driving_at: at(minute),
-            park_since: None,
+            last_driving_at: last_driving,
+            last_message_at: park_at.max(last_driving),
+            park_since: Some(park_at),
+            stop_kind: Some(kind),
         }
     }
 
@@ -1896,15 +2227,185 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_park_closes_after_sixty_seconds_not_five_minutes() {
+        let grace = super::DriveGrace::standard();
+        let park_at = at(0);
+        let clock = stopped_clock(
+            park_at - Duration::seconds(30),
+            park_at,
+            super::StopKind::Park,
+        );
+        let early = plan_drive_close(
+            super::DriveMotion::Park,
+            park_at + Duration::seconds(30),
+            clock,
+            grace,
+            Some(0.0),
+        );
+        assert!(
+            matches!(early, super::ClosePlan::Wait { .. }),
+            "thirty seconds in P keeps the trip open"
+        );
+        let closed = plan_drive_close(
+            super::DriveMotion::Park,
+            park_at + Duration::seconds(60),
+            clock,
+            grace,
+            Some(0.0),
+        );
+        assert!(
+            matches!(closed, super::ClosePlan::Close { .. }),
+            "P held for the confirm window closes, end time stays the P transition"
+        );
+        let unknown = plan_drive_close(
+            super::DriveMotion::Park,
+            park_at + Duration::seconds(60),
+            super::DriveClock::moving_at(park_at),
+            grace,
+            None,
+        );
+        assert!(
+            matches!(
+                unknown,
+                super::ClosePlan::Close { .. } | super::ClosePlan::Wait { .. }
+            ),
+            "P with unknown speed must start the confirm timer"
+        );
+        assert!(
+            !matches!(unknown, super::ClosePlan::Continue { clock: held } if held.park_since.is_none()),
+            "P with unknown speed must not ignore the park timer"
+        );
+    }
+
+    #[test]
+    fn drive_at_zero_for_ten_minutes_does_not_close() {
+        let grace = super::DriveGrace::standard();
+        let start = at(0);
+        let motion = stream_motion(Some("D"), Some(0.0), true);
+        let first = plan_drive_close(motion, start, clock_at(0), grace, Some(0.0));
+        let (super::ClosePlan::Continue { clock } | super::ClosePlan::Wait { clock, .. }) = first
+        else {
+            panic!("the first 0 km/h sample in D must not close");
+        };
+        let later = plan_drive_close(
+            motion,
+            start + Duration::seconds(600),
+            clock,
+            grace,
+            Some(0.0),
+        );
+        assert!(
+            !matches!(later, super::ClosePlan::Close { .. }),
+            "ten minutes stopped in D is one trip"
+        );
+    }
+
+    #[test]
+    fn park_then_drive_within_thirty_seconds_continues() {
+        let grace = super::DriveGrace::standard();
+        let park_at = at(0);
+        let clock = stopped_clock(
+            park_at - Duration::seconds(20),
+            park_at,
+            super::StopKind::Park,
+        );
+        let resumed = plan_drive_close(
+            super::DriveMotion::Driving,
+            park_at + Duration::seconds(30),
+            clock,
+            grace,
+            Some(18.0),
+        );
+        assert!(matches!(
+            resumed,
+            super::ClosePlan::Continue { clock: next } if next.park_since.is_none()
+        ));
+    }
+
+    #[test]
+    fn late_zero_does_not_set_park_since_before_the_last_drive() {
+        let grace = super::DriveGrace::standard();
+        let clock = super::DriveClock::moving_at(at(10));
+        let late = plan_drive_close(super::DriveMotion::Park, at(0), clock, grace, Some(0.0));
+        let held = match late {
+            super::ClosePlan::Continue { clock }
+            | super::ClosePlan::Wait { clock, .. }
+            | super::ClosePlan::Close { clock } => clock,
+        };
+        assert!(
+            held.park_since
+                .is_none_or(|since| since >= held.last_driving_at),
+            "park_since {held:?} is older than the last driving proof"
+        );
+    }
+
+    #[test]
+    fn same_place_departure_within_two_minutes_reopens() {
+        let parked = super::GapFacts {
+            gap_secs: 90,
+            end_speed_kmh: Some(0.0),
+            start_speed_kmh: Some(22.0),
+            end_odometer_km: Some(50.0),
+            start_odometer_km: Some(50.01),
+            gap_m: Some(12.0),
+        };
+        assert!(should_reopen_drive(&parked, 300));
+    }
+
+    #[test]
+    fn ten_minute_gap_rejoins_when_the_drive_was_still_moving() {
+        let gap = super::GapFacts {
+            gap_secs: 600,
+            end_speed_kmh: Some(48.0),
+            start_speed_kmh: Some(52.0),
+            end_odometer_km: Some(100.0),
+            start_odometer_km: Some(108.0),
+            gap_m: Some(7_500.0),
+        };
+        assert!(should_reopen_drive(&gap, 300));
+        let parked = super::GapFacts {
+            gap_secs: 600,
+            end_speed_kmh: Some(0.0),
+            start_speed_kmh: Some(30.0),
+            end_odometer_km: Some(100.0),
+            start_odometer_km: Some(100.0),
+            gap_m: Some(8.0),
+        };
+        assert!(!should_reopen_drive(&parked, 300));
+    }
+
+    #[test]
+    fn end_cutoff_uses_the_park_transition_unless_zero_is_within_two_minutes() {
+        let start = at(0);
+        let p_at = at(10);
+        let old_zero = p_at - Duration::minutes(3);
+        let moving = old_zero - Duration::seconds(20);
+        let long_gap = vec![
+            cue(p_at, Some(0.0), Some("P")),
+            cue(old_zero, Some(0.0), Some("D")),
+            cue(moving, Some(40.0), Some("D")),
+        ];
+        assert_eq!(drive_end_cutoff(&long_gap, start), p_at);
+        let near_zero = p_at - Duration::seconds(90);
+        let close_stop = vec![
+            cue(p_at, Some(0.0), Some("P")),
+            cue(near_zero, Some(0.0), Some("D")),
+            cue(near_zero - Duration::seconds(15), Some(36.0), Some("D")),
+        ];
+        assert_eq!(drive_end_cutoff(&close_stop, start), near_zero);
+    }
+
+    #[test]
     fn five_minutes_at_zero_closes_and_a_shorter_stop_does_not() {
         let grace = super::DriveGrace::standard();
         let park_at = at(0);
-        let clock = super::DriveClock {
-            last_driving_at: park_at - Duration::seconds(30),
-            park_since: Some(park_at),
-        };
+        let clock = stopped_clock(
+            park_at - Duration::seconds(30),
+            park_at,
+            super::StopKind::Unknown,
+        );
         let early = plan_drive_close(
-            super::DriveMotion::Park,
+            super::DriveMotion::UnknownStandstill,
             park_at + Duration::seconds(240),
             clock,
             grace,
@@ -1912,19 +2413,17 @@ mod tests {
         );
         assert!(matches!(early, super::ClosePlan::Wait { .. }));
         let stopped = plan_drive_close(
-            super::DriveMotion::Park,
+            super::DriveMotion::UnknownStandstill,
             park_at + Duration::seconds(300),
             clock,
             grace,
             Some(0.0),
         );
         assert!(matches!(stopped, super::ClosePlan::Close { .. }));
-        let custom = super::DriveGrace {
-            end: Duration::seconds(300),
-            park: Duration::seconds(120),
-        };
+        let mut custom = super::DriveGrace::standard();
+        custom.park = Duration::seconds(120);
         let custom_wait = plan_drive_close(
-            super::DriveMotion::Park,
+            super::DriveMotion::UnknownStandstill,
             park_at + Duration::seconds(119),
             clock,
             custom,
@@ -1932,7 +2431,7 @@ mod tests {
         );
         assert!(matches!(custom_wait, super::ClosePlan::Wait { .. }));
         let at_threshold = plan_drive_close(
-            super::DriveMotion::Park,
+            super::DriveMotion::UnknownStandstill,
             park_at + Duration::seconds(120),
             clock,
             custom,
@@ -1942,7 +2441,8 @@ mod tests {
         let missing = plan_drive_close(super::DriveMotion::Park, park_at, clock_at(0), grace, None);
         assert!(matches!(
             missing,
-            super::ClosePlan::Continue { clock: held } if held.park_since.is_none()
+            super::ClosePlan::Wait { clock: held, .. }
+                if held.park_since == Some(park_at) && held.stop_kind == Some(super::StopKind::Park)
         ));
         let super::ClosePlan::Continue {
             clock: resumed_clock,
@@ -2078,11 +2578,11 @@ mod tests {
         let moving = cue(at(1), Some(40.0), Some("D"));
         let parked = cue(at(2), None, Some("P"));
         let newest = cue(at(3), None, Some("P"));
-        let cues = vec![newest.clone(), parked, moving];
+        let cues = vec![newest.clone(), parked.clone(), moving];
         assert_eq!(
             super::drive_end_cutoff(&cues, start),
-            newest.at,
-            "missing speed is not a 0 km/h sample"
+            parked.at,
+            "P with unknown speed ends at the park transition, not a later repeat"
         );
     }
 
@@ -2203,10 +2703,7 @@ mod tests {
         assert_eq!(silent.last_driving_at, driving.at);
         assert_eq!(silent.park_since, None);
 
-        let newer = super::DriveClock {
-            last_driving_at: start + Duration::seconds(15),
-            park_since: None,
-        };
+        let newer = super::DriveClock::moving_at(start + Duration::seconds(15));
         let merged = super::merge_clock(silent, Some(newer));
         assert_eq!(merged.last_driving_at, newer.last_driving_at);
         assert_eq!(merged.park_since, None);
@@ -2405,6 +2902,8 @@ mod tests {
             id: 7,
             start_at: start,
             end_at: end,
+            end_latitude: None,
+            end_longitude: None,
         };
         let now = Utc::now();
         let inside = gate_stream_sample(start + Duration::minutes(2), now, Some(closed));

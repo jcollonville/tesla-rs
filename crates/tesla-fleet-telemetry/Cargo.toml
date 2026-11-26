@@ -36,6 +36,7 @@ server = [
     "tokio/rt",
     "tokio/sync",
     "tokio/time",
+    "dep:tracing",
 ]
 
 [dependencies]
@@ -46,6 +47,7 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing = { version = "0.1", optional = true }
 tokio = { workspace = true, optional = true }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite = { version = "0.26", optional = true, default-features = false, features = ["handshake"] }
