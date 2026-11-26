@@ -30,8 +30,11 @@ pub(crate) struct ImportedAccounts {
 
 #[derive(Clone, sqlx::FromRow)]
 pub(crate) struct TeslaAccount {
+    #[allow(dead_code)]
     pub id: i64,
+    #[allow(dead_code)]
     pub label: String,
+    #[allow(dead_code)]
     pub kind: String,
     pub status: String,
     pub last_refresh_at: Option<DateTime<Utc>>,

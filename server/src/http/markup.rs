@@ -194,19 +194,9 @@ pub(super) struct Overview {
     pub month: Vec<(&'static str, String)>,
 }
 
-pub(super) struct Party {
-    pub title: String,
-    pub status: String,
-    pub tone: &'static str,
-    pub expires: String,
-    pub scopes: String,
-    pub last_refresh: String,
-    pub last_error: Option<String>,
-    pub connected: bool,
-}
-
 pub(super) struct ConnectionView<'a> {
-    pub fleet: Party,
+    pub admin: bool,
+    pub sudo: bool,
     pub owner_status: String,
     pub owner_tone: &'static str,
     pub owner_expires: String,
@@ -750,90 +740,105 @@ pub(super) fn connection_page(chrome: &Chrome, view: &ConnectionView<'_>) -> Str
                     "La liste des véhicules de ce compte est indisponible."
                 }
             }
-            p { "Source des données : " strong { (view.report.data_source) } ". " (view.report.telemetry_note) }
-            (party_card(&view.fleet))
             section class="card" {
-                h2 { "Jeton Fleet" }
-                p {
-                    span class=(format!("chip {}", view.report.fleet_tone)) { (view.report.fleet_state) }
-                    " "
-                    (view.report.fleet_detail)
-                }
-                p { "Scopes : " (view.fleet.scopes) }
-            }
-            section class="card" {
-                h2 { "Fleet API" }
-                div class="toolbar-actions" {
-                    a class="button" href="/auth/login" { "Connecter" }
-                    form method="post" action="/auth/refresh" {
-                        input type="hidden" name="csrf" value=(view.csrf);
-                        (vehicle_field(view.vehicle_id))
-                        button class="tonal" type="submit" { "Rafraîchir" }
-                    }
-                    form method="post" action="/auth/disconnect" {
-                        input type="hidden" name="csrf" value=(view.csrf);
-                        (vehicle_field(view.vehicle_id))
-                        button class="danger" type="submit" { "Déconnecter" }
-                    }
-                }
-            }
-            section class="card" {
-                h2 { "Domaine partenaire" }
-                p {
-                    span class=(format!("chip {}", view.report.partner_tone)) { (view.report.partner_state) }
-                    " "
-                    (view.report.partner_detail)
-                }
-                @if view.report.show_partner_action {
-                    form method="post" action="/connection/partner" {
-                        input type="hidden" name="csrf" value=(view.csrf);
-                        (vehicle_field(view.vehicle_id))
-                        button type="submit" { "Enregistrer le domaine" }
-                    }
-                } @else {
-                    p class="muted" { "Un administrateur enregistre le domaine." }
-                }
-            }
-            section class="card" {
-                h2 { "Clé virtuelle" }
-                p { "Ouvrez ce lien dans l'application Tesla pour ajouter la clé sur la voiture." }
-                @if view.report.pairing_url.is_empty() {
-                    p { "Le domaine n'est pas utilisable pour un lien de clé." }
-                } @else {
-                    p { a href=(view.report.pairing_url) rel="noreferrer noopener" target="_blank" { (view.report.pairing_url) } }
-                    @if !view.report.pairing_qr.is_empty() {
-                        (maud::PreEscaped(view.report.pairing_qr.clone()))
-                    }
-                }
-            }
-            section class="card" {
-                h2 { "Télémétrie" }
-                @if view.report.vehicles.is_empty() {
-                    p { "Aucun véhicule sur ce compte." }
-                } @else {
-                    ul {
-                        @for car in &view.report.vehicles {
-                            li {
-                                strong { (car.name) }
-                                " — clé " (car.key_state)
-                                ", configuration " (car.config_state)
-                                ", flux " (car.stream_state)
-                                ", source " (car.source)
-                                "."
+                h2 id="setup-heading" { "Mise en route" }
+                p id="setup-progress" { (view.report.progress) }
+                ol class="setup" start="0" aria-labelledby="setup-heading" {
+                    @for step in &view.report.steps {
+                        li {
+                            div class="step-line" {
+                                span class=(format!("chip {}", step.tone)) {
+                                    @if step.label == "Validé" {
+                                        (check_icon())
+                                    }
+                                    (step.label)
+                                }
+                                h3 {
+                                    (step.title)
+                                    @if step.optional {
+                                        span class="muted" { " (facultative)" }
+                                    }
+                                    span class="step-help" {
+                                        button type="button" class="help" aria-describedby=(format!("step-help-{}", step.index)) aria-label=(format!("Aide : {}", step.title)) { "?" }
+                                        p id=(format!("step-help-{}", step.index)) class="help-tip" role="tooltip" { (step.help) }
+                                    }
+                                }
+                            }
+                            p { (step.detail) }
+                            @if !step.cars.is_empty() {
+                                ul {
+                                    @for car in &step.cars {
+                                        li {
+                                            strong { (car.name) }
+                                            @if !car.key.is_empty() { " — clé " (car.key) }
+                                            @if !car.config.is_empty() { " — configuration " (car.config) }
+                                            @if !car.stream.is_empty() { " — " (car.stream) }
+                                        }
+                                    }
+                                }
+                            }
+                            @if let Some(action) = &step.action {
+                                (guide_action(view, action))
+                            }
+                            @if step.show_refresh {
+                                form method="post" action="/auth/refresh" {
+                                    input type="hidden" name="csrf" value=(view.csrf);
+                                    (vehicle_field(view.vehicle_id))
+                                    button class="ghost small" type="submit" { "Rafraîchir" }
+                                }
+                            }
+                            @if let Some(manual) = &step.manual {
+                                p class="muted" {
+                                    (manual.text)
+                                    @for copy in &manual.copies {
+                                        br;
+                                        (copy.label) " " code { (copy.value) }
+                                    }
+                                }
                             }
                         }
                     }
                 }
-                @if view.report.show_telemetry_action {
-                    form method="post" action="/connection/telemetry" {
-                        input type="hidden" name="csrf" value=(view.csrf);
-                        (vehicle_field(view.vehicle_id))
-                        button type="submit" { "Renvoyer la configuration" }
+                p class="muted" { "Aucun secret n'est affiché : ni jeton, ni clé privée." }
+                @if view.report.show_disconnect {
+                    details class="danger-zone" {
+                        summary { "Déconnecter mon compte Tesla" }
+                        p { "Tesla ne fournit pas d'endpoint serveur pour révoquer le jeton Fleet. La documentation ne propose qu'une page de consentement, à confirmer sur le compte Tesla. Cette action retire la configuration de télémétrie des véhicules de ce compte si Tesla l'accepte, efface les jetons Fleet et Owner stockés ici, et arrête l'interrogation et le streaming. Les véhicules, trajets, charges, positions et réglages sont conservés." }
+                        @if let Some(url) = &view.report.revoke_url {
+                            p { a href=(url) rel="noreferrer noopener" target="_blank" { "Ouvrir la page Tesla pour retirer l'application" } }
+                        }
+                        p { "Retirez aussi l'application dans les applications tierces du compte Tesla si elle y figure encore." }
+                        form method="post" action="/auth/disconnect" {
+                            input type="hidden" name="csrf" value=(view.csrf);
+                            input type="hidden" name="confirm" value="disconnect";
+                            (vehicle_field(view.vehicle_id))
+                            button class="danger" type="submit" { "Déconnecter mon compte Tesla" }
+                        }
                     }
                 }
             }
-            section class="card" {
-                h2 { "Streaming Owner API (ancien)" }
+            @if view.admin {
+                section class="card danger-zone" {
+                    h2 { "Supprimer les données" }
+                    p { "Irréversible. Efface un véhicule et seulement ses trajets, charges, positions et réglages. Les autres véhicules restent. La déconnexion ne fait pas ça." }
+                    @if view.sudo {
+                        @for car in &view.report.deletions {
+                            form class="stack" method="post" action=(format!("/v/{}/delete", car.id)) {
+                                input type="hidden" name="csrf" value=(view.csrf);
+                                label class="field" for=(format!("delete-{}", car.id)) {
+                                    "Tapez " strong { (car.name) } " pour confirmer"
+                                    input id=(format!("delete-{}", car.id)) type="text" name="confirm" autocomplete="off" spellcheck="false" maxlength="120" required;
+                                }
+                                button class="danger" type="submit" { "Supprimer les données de ce véhicule" }
+                            }
+                        }
+                    } @else {
+                        p class="muted" { "Un administrateur avec sudo actif peut supprimer les données. Sudo dure 5 minutes." }
+                    }
+                }
+            }
+            details class="legacy" {
+                summary { "Streaming Owner API (ancien)" }
                 p { "Utilise l'Owner API et le socket de streaming historiques de Tesla. Ils sont non officiels et Tesla peut les retirer. Le polling Fleet reste la source pour le reste. Le stream ajoute environ une position par seconde en conduite." }
                 div class="meta" {
                     span class=(format!("chip {}", stream_tone(view.stream_status))) {
@@ -896,34 +901,58 @@ pub(super) fn connection_page(chrome: &Chrome, view: &ConnectionView<'_>) -> Str
                     (vehicle_field(view.vehicle_id))
                     button class="danger" type="submit" { "Déconnecter l'Owner API" }
                 }
-            }
-            section class="card" {
-                h2 { "Owner API" }
                 dl class="facts" {
                     div { dt { "État" } dd { span class=(format!("chip {}", view.owner_tone)) { (view.owner_status) } } }
                     div { dt { "Expiration du jeton" } dd { (view.owner_expires) } }
                     div { dt { "Scopes" } dd { (view.owner_scopes) } }
                     div { dt { "Dernier rafraîchissement" } dd { (view.owner_last_refresh) } }
+                    div { dt { "Empreinte de la clé publique" } dd { code { (view.fingerprint) } } }
                     @if let Some(error) = &view.owner_last_error {
                         div { dt { "Dernière erreur" } dd { (error) } }
                     }
                 }
             }
-            section class="card" {
-                h2 { "Clé publique" }
-                p {
-                    span class=(format!("chip {}", view.report.public_key_tone)) { (view.report.public_key_state) }
-                    " "
-                    (view.report.public_key_detail)
-                }
-                dl class="facts" {
-                    div { dt { "Empreinte" } dd { code { (view.fingerprint) } } }
-                }
-                p class="muted" { "Aucun secret n'est affiché : ni jeton, ni clé privée." }
-            }
         }
     };
     document(chrome.debug_script, body)
+}
+
+fn check_icon() -> Markup {
+    html! {
+        svg class="check" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" {
+            path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 8.5 6.5 12 13 4" {}
+        }
+    }
+}
+
+fn guide_action(view: &ConnectionView<'_>, action: &crate::connection::GuideAction) -> Markup {
+    html! {
+        @match action {
+            crate::connection::GuideAction::RegisterPartner => {
+                form method="post" action="/connection/partner" {
+                    input type="hidden" name="csrf" value=(view.csrf);
+                    (vehicle_field(view.vehicle_id))
+                    button type="submit" { "Enregistrer le domaine" }
+                }
+            }
+            crate::connection::GuideAction::Connect => {
+                p { a class="button" href="/auth/login" { "Connecter" } }
+            }
+            crate::connection::GuideAction::ResendTelemetry => {
+                form method="post" action="/connection/telemetry" {
+                    input type="hidden" name="csrf" value=(view.csrf);
+                    (vehicle_field(view.vehicle_id))
+                    button type="submit" { "Renvoyer la configuration" }
+                }
+            }
+            crate::connection::GuideAction::Pair { url, qr } => {
+                p { a href=(url) rel="noreferrer noopener" target="_blank" { (url) } }
+                @if !qr.is_empty() {
+                    (maud::PreEscaped(qr.clone()))
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn settings_page(
@@ -1180,26 +1209,6 @@ pub(crate) fn missing_page(chrome: &Chrome) -> String {
     document(chrome.debug_script, body)
 }
 
-fn party_card(party: &Party) -> Markup {
-    html! {
-        section class="card" {
-            div class="vehicle-head" {
-                h2 { (party.title) }
-                span class=(format!("chip {}", party.tone)) { (party.status) }
-            }
-            dl class="facts" {
-                div { dt { "Expiration du jeton" } dd { (party.expires) } }
-                div { dt { "Scopes" } dd { (party.scopes) } }
-                div { dt { "Jeton" } dd { (if party.connected { "enregistré" } else { "absent" }) } }
-                div { dt { "Dernier rafraîchissement" } dd { (party.last_refresh) } }
-                @if let Some(error) = &party.last_error {
-                    div { dt { "Dernière erreur" } dd { (error) } }
-                }
-            }
-        }
-    }
-}
-
 fn vehicle_field(vehicle_id: Option<i64>) -> Markup {
     html! {
         @if let Some(id) = vehicle_id {
@@ -1418,7 +1427,7 @@ pub(crate) fn document(debug_script: bool, body: Markup) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CarCard, Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview, Party, Status,
+        CarCard, Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview, Status,
         VehicleTab, connection_page, fleet_page, login_page, overview_page,
     };
 
@@ -1705,16 +1714,8 @@ mod tests {
         let html = connection_page(
             &chrome,
             &ConnectionView {
-                fleet: Party {
-                    title: "Compte Fleet".to_owned(),
-                    status: "connecté".to_owned(),
-                    tone: "ok",
-                    expires: "2026-01-01".to_owned(),
-                    scopes: "openid vehicle_device_data".to_owned(),
-                    last_refresh: "—".to_owned(),
-                    last_error: None,
-                    connected: true,
-                },
+                admin: true,
+                sudo: false,
                 owner_status: "déconnecté".to_owned(),
                 owner_tone: "neutral",
                 owner_expires: "—".to_owned(),
@@ -1743,9 +1744,19 @@ mod tests {
         assert!(html.contains("N'utilisez pas celui de TeslaMate"));
         assert!(!html.contains("void/callback"));
         assert!(html.contains("href=\"/debug\""));
-        assert!(html.contains("href=\"/auth/login\""));
-        assert!(html.contains("action=\"/auth/refresh\""));
-        assert!(html.contains("action=\"/auth/disconnect\""));
+        assert!(html.contains("<ol class=\"setup\" start=\"0\""));
+        assert!(html.contains("aria-describedby=\"step-help-0\""));
+        assert!(html.contains("role=\"tooltip\""));
+        assert!(html.contains("Validé"));
+        assert!(html.contains("2 étapes sur 5 validées"));
+        assert!(html.contains("Enregistrer le domaine"));
+        assert!(html.contains("bloquée"));
+        assert!(html.contains("Nécessite l'étape 2."));
+        assert!(html.contains("facultative"));
+        assert!(!html.contains("href=\"/auth/login\""));
+        assert!(!html.contains("action=\"/auth/refresh\""));
+        assert!(!html.contains("action=\"/auth/disconnect\""));
+        assert!(html.contains("sudo"));
         assert!(html.contains("action=\"/auth/owner/start\""));
         assert!(html.contains("action=\"/auth/owner/callback\""));
         assert!(html.contains("action=\"/auth/owner/refresh\""));
@@ -1767,45 +1778,15 @@ mod tests {
         preview("connection.html", &html);
     }
 
-    #[test]
-    fn connection_page_shows_each_component_with_one_action() {
-        let mut facts = crate::connection::Input {
-            now: chrono::Utc::now(),
-            fleet_present: false,
-            fleet_readable: true,
-            fleet_expires: None,
-            partner: crate::connection::PartnerState::Missing,
-            public_key_published: true,
-            domain: "logger.example".to_owned(),
-            telemetry_enabled: true,
-            fresh_for: std::time::Duration::from_secs(900),
-            is_admin: true,
-            vehicles: vec![crate::connection::VehicleInput {
-                name: "Faucon".to_owned(),
-                key: crate::connection::KeyState::Unpaired,
-                skip_reason: Some("missing_key".to_owned()),
-                config_pushed: false,
-                last_message_age: None,
-            }],
-        };
-        let _ = &mut facts;
-        let report = crate::connection::build(&facts);
-        let html = connection_page(
+    fn connection_html(facts: &crate::connection::Input) -> String {
+        connection_page(
             &Chrome {
                 section: Some(VehicleTab::Connection),
                 ..chrome()
             },
             &ConnectionView {
-                fleet: Party {
-                    title: "Compte Fleet".to_owned(),
-                    status: "déconnecté".to_owned(),
-                    tone: "bad",
-                    expires: "—".to_owned(),
-                    scopes: "—".to_owned(),
-                    last_refresh: "—".to_owned(),
-                    last_error: None,
-                    connected: false,
-                },
+                admin: true,
+                sudo: true,
                 owner_status: "déconnecté".to_owned(),
                 owner_tone: "neutral",
                 owner_expires: "—".to_owned(),
@@ -1823,25 +1804,77 @@ mod tests {
                 stream_status: "disabled",
                 streaming_enabled: true,
                 authorize_url: None,
-                report,
+                report: crate::connection::build(facts),
             },
-        );
-        assert!(html.contains("Absent"));
-        assert!(html.contains("Pas enregistré"));
-        assert!(html.contains("Publiée"));
-        assert!(html.contains("https://tesla.com/_ak/logger.example"));
-        assert!(html.contains("Pas appariée"));
-        assert!(html.contains("clé virtuelle absente"));
-        assert!(html.contains("Aucun message reçu"));
-        assert!(html.contains("Secours (interrogation)"));
-        assert!(html.contains("action=\"/connection/partner\""));
-        assert!(html.contains("action=\"/connection/telemetry\""));
-        assert!(html.contains("Enregistrer le domaine"));
-        assert!(html.contains("Renvoyer la configuration"));
-        assert!(html.contains("Streaming Owner API (ancien)"));
-        assert!(html.contains("name=\"csrf\" value=\"csrf-token\""));
-        assert!(html.contains("<svg"));
-        assert!(!html.contains("BEGIN EC PRIVATE KEY"));
+        )
+    }
+
+    #[test]
+    fn connection_page_shows_each_component_with_one_action() {
+        let mut facts = crate::connection::Input {
+            now: chrono::Utc::now(),
+            fleet_present: true,
+            fleet_readable: true,
+            fleet_expires: Some(chrono::Utc::now() + chrono::Duration::hours(2)),
+            scopes: crate::connection::test_scopes(),
+            refresh_failed: false,
+            partner: crate::connection::PartnerState::Registered,
+            public_key_published: true,
+            domain: "logger.example".to_owned(),
+            redirect_uri: "https://logger.example/auth/callback".to_owned(),
+            client_configured: true,
+            client_id: "logger-app".to_owned(),
+            region: tesla_auth::Region::Europe,
+            fingerprint: "sha256:abcd".to_owned(),
+            telemetry_enabled: true,
+            telemetry_port: 4443,
+            fresh_for: std::time::Duration::from_secs(900),
+            is_admin: true,
+            vehicles: vec![crate::connection::VehicleInput {
+                id: 4,
+                name: "Faucon".to_owned(),
+                key: crate::connection::KeyState::Unpaired,
+                skip_reason: Some("missing_key".to_owned()),
+                config_pushed: false,
+                last_message_age: None,
+            }],
+        };
+        let open = connection_html(&facts);
+        preview("connection-open.html", &open);
+        assert!(open.contains("https://tesla.com/_ak/logger.example"));
+        assert!(open.contains("Pas appariée"));
+        assert!(open.contains("action=\"/auth/disconnect\""));
+        assert!(open.contains("Déconnecter mon compte Tesla"));
+        assert!(open.contains("ne fournit pas d'endpoint serveur"));
+        assert!(open.contains("applications tierces"));
+        assert!(!open.contains("href=\"/auth/login\""));
+        assert!(!open.contains("action=\"/auth/refresh\""));
+        assert!(!open.contains("action=\"/connection/partner\""));
+        assert!(!open.contains("action=\"/connection/telemetry\""));
+        assert!(open.contains("Supprimer les données de ce véhicule"));
+        assert!(open.contains("action=\"/v/4/delete\""));
+        assert!(open.contains("<svg"));
+        assert!(!open.contains("BEGIN EC PRIVATE KEY"));
+        assert!(!open.contains("logger-app-secret"));
+
+        facts.fleet_expires = Some(facts.now + chrono::Duration::minutes(5));
+        let expiring = connection_html(&facts);
+        preview("connection-expiring.html", &expiring);
+        assert!(expiring.contains("action=\"/auth/refresh\""));
+        assert!(expiring.contains("Rafraîchir"));
+
+        facts.partner = crate::connection::PartnerState::Missing;
+        facts.fleet_present = false;
+        facts.fleet_expires = None;
+        let early = connection_html(&facts);
+        preview("connection-early.html", &early);
+        assert!(early.contains("Pas enregistré") || early.contains("n'est pas enregistré"));
+        assert!(early.contains("action=\"/connection/partner\""));
+        assert!(early.contains("Enregistrer le domaine"));
+        assert!(!early.contains("href=\"/auth/login\""));
+        assert!(!early.contains("https://tesla.com/_ak/logger.example"));
+        assert!(early.contains("Streaming Owner API (ancien)"));
+        assert!(early.contains("name=\"csrf\" value=\"csrf-token\""));
     }
 
     #[test]
@@ -1907,16 +1940,8 @@ mod tests {
                 ..chrome
             },
             &ConnectionView {
-                fleet: Party {
-                    title: "Compte Fleet".to_owned(),
-                    status: "connecté".to_owned(),
-                    tone: "ok",
-                    expires: "—".to_owned(),
-                    scopes: "—".to_owned(),
-                    last_refresh: "—".to_owned(),
-                    last_error: None,
-                    connected: false,
-                },
+                admin: false,
+                sudo: false,
                 owner_status: "déconnecté".to_owned(),
                 owner_tone: "neutral",
                 owner_expires: "—".to_owned(),
@@ -1994,16 +2019,8 @@ mod tests {
                 connection_page(
                     &connection_chrome,
                     &ConnectionView {
-                        fleet: Party {
-                            title: "Fleet".to_owned(),
-                            status: "connecté".to_owned(),
-                            tone: "ok",
-                            expires: "—".to_owned(),
-                            scopes: "—".to_owned(),
-                            last_refresh: "—".to_owned(),
-                            last_error: None,
-                            connected: false,
-                        },
+                        admin: false,
+                        sudo: false,
                         owner_status: "déconnecté".to_owned(),
                         owner_tone: "neutral",
                         owner_expires: "—".to_owned(),

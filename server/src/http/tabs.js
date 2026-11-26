@@ -20,4 +20,9 @@
       });
     });
   });
+  document.addEventListener("keydown", function (event) {
+    if (event.key !== "Escape") return;
+    var active = document.activeElement;
+    if (active && active.classList && active.classList.contains("help")) active.blur();
+  });
 })();
