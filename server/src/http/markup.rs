@@ -240,10 +240,35 @@ pub(super) struct TokenLine {
     pub scopes: String,
 }
 
-pub(super) struct AccessLine {
-    pub user: String,
-    pub vehicle: String,
+pub(super) struct VehicleOption {
+    pub id: i64,
+    pub name: String,
+}
+
+pub(super) struct UserAccessCell {
+    pub vehicle_id: i64,
+    pub vehicle_name: String,
+    pub role: Option<&'static str>,
+}
+
+pub(super) struct UserLine {
+    pub id: i64,
+    pub username: String,
     pub role: String,
+    pub totp_enabled: bool,
+    pub must_change_password: bool,
+    pub is_self: bool,
+    pub created: String,
+    pub access: Vec<UserAccessCell>,
+}
+
+pub(super) struct UsersPanel<'a> {
+    pub admin: bool,
+    pub sudo: bool,
+    pub users: &'a [UserLine],
+    pub vehicles: &'a [VehicleOption],
+    pub notice: Option<&'a str>,
+    pub error: Option<&'a str>,
 }
 
 pub(super) struct SessionLine {
@@ -974,7 +999,7 @@ pub(super) fn security_page(
     tokens: &[TokenLine],
     revealed: Option<&str>,
     account: &str,
-    access: &[AccessLine],
+    users: &UsersPanel<'_>,
     sessions: &[SessionLine],
     audit: &[AuditLine],
 ) -> String {
@@ -983,13 +1008,21 @@ pub(super) fn security_page(
         section class="card" {
             h2 { "Compte" }
             p { "Connecté en tant que " (account) "." }
-            form class="stack" method="post" action="/sudo" {
-                input type="hidden" name="csrf" value=(&chrome.csrf);
-                label class="field" for="sudo-password" {
-                    "Mot de passe pour les actions sensibles"
-                    input id="sudo-password" type="password" name="password" autocomplete="current-password" required;
+            @if users.admin {
+                @if users.sudo {
+                    div class="banner note" role="status" {
+                        p { "Mode administrateur actif pendant 5 minutes. Les actions sensibles sont autorisées." }
+                    }
+                } @else {
+                    form class="stack" method="post" action="/sudo" {
+                        input type="hidden" name="csrf" value=(&chrome.csrf);
+                        label class="field" for="sudo-password" {
+                            "Mot de passe pour les actions sensibles"
+                            input id="sudo-password" type="password" name="password" autocomplete="current-password" required;
+                        }
+                        button class="tonal" type="submit" { "Confirmer pour 5 minutes" }
+                    }
                 }
-                button class="tonal" type="submit" { "Confirmer pour 5 minutes" }
             }
         }
         section class="card" {
@@ -1026,118 +1059,76 @@ pub(super) fn security_page(
             p id="passkey-status" class="muted" aria-live="polite" {}
             script src="/static/setup.js" defer {}
         }
-        section class="card" {
-            h2 { "Utilisateurs et véhicules" }
-            ul class="list" {
-                @for row in access {
-                    li { span { (row.user) " · " (row.vehicle) } span class="chip" { (row.role) } }
-                }
-            }
-            form class="stack" method="post" action="/users" {
-                input type="hidden" name="csrf" value=(&chrome.csrf);
-                label class="field" for="new-user" {
-                    "Nouvel utilisateur"
-                    input id="new-user" name="username" required maxlength="80";
-                }
-                label class="field" for="new-user-password" {
-                    "Mot de passe"
-                    input id="new-user-password" type="password" name="password" required minlength="12";
-                }
-                label class="field" for="new-user-role" {
-                    "Rôle"
-                    select id="new-user-role" name="role" {
-                        option value="user" { "user" }
-                        option value="admin" { "admin" }
-                    }
-                }
-                button type="submit" { "Créer l'utilisateur" }
-            }
-            form class="stack" method="post" action="/vehicle-access" {
-                input type="hidden" name="csrf" value=(&chrome.csrf);
-                label class="field" for="access-user" {
-                    "Utilisateur (id)"
-                    input id="access-user" name="user_id" required;
-                }
-                label class="field" for="access-vehicle" {
-                    "Véhicule (id)"
-                    input id="access-vehicle" name="vehicle_id" required;
-                }
-                label class="field" for="access-role" {
-                    "Accès"
-                    select id="access-role" name="role" {
-                        option value="viewer" { "viewer" }
-                        option value="owner" { "owner" }
-                        option value="" { "retirer" }
-                    }
-                }
-                button class="tonal" type="submit" { "Mettre à jour l'accès" }
-            }
+        @if users.admin {
+            (users_panel(chrome, users))
         }
-        section class="card" {
-            h2 { "Sessions" }
-            ul class="list" {
-                @for session in sessions {
-                    li {
-                        span { (session.user) " · " (session.seen) }
-                        form method="post" action=(format!("/sessions/{}/revoke", session.id_hash)) {
-                            input type="hidden" name="csrf" value=(&chrome.csrf);
-                            button class="ghost" type="submit" { "Révoquer" }
+        @if users.admin {
+            section class="card" {
+                h2 { "Sessions" }
+                ul class="list" {
+                    @for session in sessions {
+                        li {
+                            span { (session.user) " · " (session.seen) }
+                            form method="post" action=(format!("/sessions/{}/revoke", session.id_hash)) {
+                                input type="hidden" name="csrf" value=(&chrome.csrf);
+                                button class="ghost" type="submit" { "Révoquer" }
+                            }
                         }
                     }
                 }
             }
-        }
-        section class="card" {
-            h2 { "Journal d'audit" }
-            p class="muted" { "Ajouts seulement. Rien ne se supprime depuis l'interface." }
-            ul class="list" {
-                @for row in audit {
-                    li { span { (row.at) " · " (row.action) } span class="chip" { (row.outcome) } }
+            section class="card" {
+                h2 { "Journal d'audit" }
+                p class="muted" { "Ajouts seulement. Rien ne se supprime depuis l'interface." }
+                ul class="list" {
+                    @for row in audit {
+                        li { span { (row.at) " · " (row.action) } span class="chip" { (row.outcome) } }
+                    }
                 }
             }
-        }
-        section class="card" {
-            h2 { "Jetons API" }
-            p class="muted" { "Un jeton ne voit pas plus que son créateur. Il n'est affiché qu'une fois." }
-            @if let Some(token) = revealed {
-                div class="banner note" role="status" {
-                    p { "Nouveau jeton API, affiché une seule fois." }
-                    code class="secret" { (token) }
+            section class="card" {
+                h2 { "Jetons API" }
+                p class="muted" { "Un jeton ne voit pas plus que son créateur. Il n'est affiché qu'une fois." }
+                @if let Some(token) = revealed {
+                    div class="banner note" role="status" {
+                        p { "Nouveau jeton API, affiché une seule fois." }
+                        code class="secret" { (token) }
+                    }
                 }
-            }
-            form class="stack" method="post" action="/tokens" {
-                input type="hidden" name="csrf" value=(&chrome.csrf);
-                label class="field" for="token-name" {
-                    "Nom"
-                    input id="token-name" name="name" required maxlength="80" autocomplete="off";
+                form class="stack" method="post" action="/tokens" {
+                    input type="hidden" name="csrf" value=(&chrome.csrf);
+                    label class="field" for="token-name" {
+                        "Nom"
+                        input id="token-name" name="name" required maxlength="80" autocomplete="off";
+                    }
+                    label class="field" for="token-scopes" {
+                        "Scopes (read, read:live, write, admin)"
+                        input id="token-scopes" name="scopes" value="read read:live";
+                    }
+                    label class="field" for="token-days" {
+                        "Expiration en jours, vide pour aucune"
+                        input id="token-days" name="expires_days";
+                    }
+                    label class="field" for="token-vehicles" {
+                        "Véhicules, vide pour ceux du créateur"
+                        input id="token-vehicles" name="vehicle_ids";
+                    }
+                    button type="submit" { "Créer un jeton" }
                 }
-                label class="field" for="token-scopes" {
-                    "Scopes (read, read:live, write, admin)"
-                    input id="token-scopes" name="scopes" value="read read:live";
-                }
-                label class="field" for="token-days" {
-                    "Expiration en jours, vide pour aucune"
-                    input id="token-days" name="expires_days";
-                }
-                label class="field" for="token-vehicles" {
-                    "Véhicules, vide pour ceux du créateur"
-                    input id="token-vehicles" name="vehicle_ids";
-                }
-                button type="submit" { "Créer un jeton" }
-            }
-            ul class="list" {
-                @for token in tokens {
-                    li {
-                        span { (token.name) " · " (token.scopes) }
-                        span class="row" {
-                            @if token.active {
-                                span class="chip ok" { "actif" }
-                            } @else {
-                                span class="chip" { "révoqué" }
-                            }
-                            form method="post" action=(format!("/tokens/{}/revoke", token.id)) {
-                                input type="hidden" name="csrf" value=(&chrome.csrf);
-                                button class="ghost" type="submit" { "Révoquer" }
+                ul class="list" {
+                    @for token in tokens {
+                        li {
+                            span { (token.name) " · " (token.scopes) }
+                            span class="row" {
+                                @if token.active {
+                                    span class="chip ok" { "actif" }
+                                } @else {
+                                    span class="chip" { "révoqué" }
+                                }
+                                form method="post" action=(format!("/tokens/{}/revoke", token.id)) {
+                                    input type="hidden" name="csrf" value=(&chrome.csrf);
+                                    button class="ghost" type="submit" { "Révoquer" }
+                                }
                             }
                         }
                     }
@@ -1146,6 +1137,201 @@ pub(super) fn security_page(
         }
     };
     document(chrome.debug_script, body)
+}
+
+fn users_panel(chrome: &Chrome, panel: &UsersPanel<'_>) -> Markup {
+    html! {
+        section class="card users-panel" id="users" {
+            div class="card-head" {
+                h2 { "Utilisateurs et droits" }
+                span class="chip" { (panel.users.len()) " compte" @if panel.users.len() != 1 { "s" } }
+            }
+            p class="muted" {
+                "Administrateur : toute la console. Utilisateur : uniquement les véhicules accordés. "
+                "Sur un véhicule, "
+                strong { "Propriétaire" }
+                " voit et édite ; "
+                strong { "Lecteur" }
+                " consulte seulement."
+            }
+            @if let Some(error) = panel.error {
+                div class="banner bad" role="alert" { p { (error) } }
+            }
+            @if let Some(notice) = panel.notice {
+                div class="banner note" role="status" { p { (notice) } }
+            }
+            @if panel.users.is_empty() {
+                p class="muted" { "Aucun utilisateur pour l'instant." }
+            } @else {
+                div class="users" {
+                    @for user in panel.users {
+                        (user_card(chrome, panel, user))
+                    }
+                }
+            }
+            @if panel.sudo {
+                details class="create-user" {
+                    summary { "Créer un utilisateur" }
+                    form class="stack create-user-form" method="post" action="/users" {
+                        input type="hidden" name="csrf" value=(&chrome.csrf);
+                        div class="form-grid" {
+                            label class="field" for="new-user" {
+                                "Nom d'utilisateur"
+                                input id="new-user" name="username" required maxlength="80" autocomplete="off";
+                            }
+                            label class="field" for="new-user-role" {
+                                "Rôle global"
+                                select id="new-user-role" name="role" {
+                                    option value="user" selected { "Utilisateur" }
+                                    option value="admin" { "Administrateur" }
+                                }
+                            }
+                        }
+                        label class="field" for="new-user-password" {
+                            "Mot de passe temporaire (12 caractères minimum)"
+                            input id="new-user-password" type="password" name="password" required minlength="12" autocomplete="new-password";
+                        }
+                        p class="muted" {
+                            "Un administrateur reçoit tous les véhicules. Pour un utilisateur, accordez les véhicules juste après la création."
+                        }
+                        button type="submit" { "Créer l'utilisateur" }
+                    }
+                }
+            } @else {
+                p class="muted" { "Confirmez votre mot de passe ci-dessus pour créer un compte ou modifier les droits." }
+            }
+        }
+    }
+}
+
+fn user_card(chrome: &Chrome, panel: &UsersPanel<'_>, user: &UserLine) -> Markup {
+    let role_label = if user.role == "admin" {
+        "Administrateur"
+    } else {
+        "Utilisateur"
+    };
+    let role_class = if user.role == "admin" {
+        "chip role-admin"
+    } else {
+        "chip role-user"
+    };
+    html! {
+        article class="user-card" {
+            header class="user-card-head" {
+                div class="user-identity" {
+                    h3 { (user.username) }
+                    p class="muted" {
+                        "Créé " (user.created)
+                        @if user.is_self { " · vous" }
+                    }
+                }
+                div class="user-badges" {
+                    span class=(role_class) { (role_label) }
+                    @if user.totp_enabled {
+                        span class="chip ok" { "2FA" }
+                    } @else {
+                        span class="chip bad" { "2FA manquant" }
+                    }
+                    @if user.must_change_password {
+                        span class="chip" { "Mot de passe à changer" }
+                    }
+                }
+            }
+            @if user.role == "admin" {
+                p class="muted user-access-note" { "Accès à tous les véhicules (rôle administrateur)." }
+            } @else if user.access.is_empty() {
+                p class="muted user-access-note" { "Aucun véhicule accordé." }
+            } @else {
+                ul class="access-chips" aria-label="Accès véhicules" {
+                    @for cell in &user.access {
+                        @if let Some(role) = cell.role {
+                            li {
+                                span { (cell.vehicle_name) }
+                                span class="chip" {
+                                    @if role == "owner" { "Propriétaire" } @else { "Lecteur" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            @if panel.sudo {
+                details class="user-manage" {
+                    summary { "Gérer les droits" }
+                    div class="user-manage-body" {
+                        form class="stack inline-form" method="post" action=(format!("/users/{}/role", user.id)) {
+                            input type="hidden" name="csrf" value=(&chrome.csrf);
+                            label class="field" {
+                                "Rôle global"
+                                select name="role" {
+                                    @if user.role == "user" {
+                                        option value="user" selected { "Utilisateur" }
+                                        option value="admin" { "Administrateur" }
+                                    } @else {
+                                        option value="user" { "Utilisateur" }
+                                        option value="admin" selected { "Administrateur" }
+                                    }
+                                }
+                            }
+                            button class="tonal small" type="submit" { "Enregistrer le rôle" }
+                        }
+                        @if user.role != "admin" && !panel.vehicles.is_empty() {
+                            h4 { "Accès par véhicule" }
+                            div class="access-matrix" {
+                                @for vehicle in panel.vehicles {
+                                    @let current = user.access.iter()
+                                        .find(|cell| cell.vehicle_id == vehicle.id)
+                                        .and_then(|cell| cell.role)
+                                        .unwrap_or("");
+                                    form class="access-row" method="post" action="/vehicle-access" {
+                                        input type="hidden" name="csrf" value=(&chrome.csrf);
+                                        input type="hidden" name="user_id" value=(user.id.to_string());
+                                        input type="hidden" name="vehicle_id" value=(vehicle.id.to_string());
+                                        span class="access-vehicle" { (vehicle.name) }
+                                        label class="field" {
+                                            span class="visually-hidden" { "Droit" }
+                                            select name="role" {
+                                                @if current.is_empty() {
+                                                    option value="" selected { "Aucun" }
+                                                } @else {
+                                                    option value="" { "Aucun" }
+                                                }
+                                                @if current == "viewer" {
+                                                    option value="viewer" selected { "Lecteur" }
+                                                } @else {
+                                                    option value="viewer" { "Lecteur" }
+                                                }
+                                                @if current == "owner" {
+                                                    option value="owner" selected { "Propriétaire" }
+                                                } @else {
+                                                    option value="owner" { "Propriétaire" }
+                                                }
+                                            }
+                                        }
+                                        button class="tonal small" type="submit" { "Appliquer" }
+                                    }
+                                }
+                            }
+                        }
+                        form class="stack inline-form" method="post" action=(format!("/users/{}/password", user.id)) {
+                            input type="hidden" name="csrf" value=(&chrome.csrf);
+                            label class="field" {
+                                "Réinitialiser le mot de passe"
+                                input type="password" name="password" required minlength="12" autocomplete="new-password" placeholder="12 caractères minimum";
+                            }
+                            button class="tonal small" type="submit" { "Réinitialiser" }
+                        }
+                        @if !user.is_self {
+                            form class="inline-form" method="post" action=(format!("/users/{}/delete", user.id)) {
+                                input type="hidden" name="csrf" value=(&chrome.csrf);
+                                button class="danger small" type="submit" { "Supprimer cet utilisateur" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn debug_page(chrome: &Chrome, frames: u64, logs: u64, console: &str) -> String {
@@ -1569,7 +1755,10 @@ mod tests {
         vehicles: &[NavVehicle],
         remembered: Option<i64>,
     ) -> Vec<(&'static str, String)> {
-        use super::{SettingRow, TokenLine, debug_page, security_page, settings_page, system_page};
+        use super::{
+            SettingRow, TokenLine, UsersPanel, debug_page, security_page, settings_page,
+            system_page,
+        };
         let page = |global| Chrome {
             vehicles: vehicles.to_vec(),
             global,
@@ -1590,7 +1779,14 @@ mod tests {
                     &[] as &[TokenLine],
                     None,
                     "admin",
-                    &[],
+                    &UsersPanel {
+                        admin: true,
+                        sudo: true,
+                        users: &[],
+                        vehicles: &[],
+                        notice: None,
+                        error: None,
+                    },
                     &[],
                     &[],
                 ),
@@ -1614,6 +1810,83 @@ mod tests {
         assert!(html.contains("viewport"));
         assert!(html.contains("/static/ui.css"));
         preview("login.html", &html);
+    }
+
+    #[test]
+    fn security_page_renders_user_rights_for_admins() {
+        use super::{UserAccessCell, UserLine, UsersPanel, VehicleOption, security_page};
+        let users = [UserLine {
+            id: 2,
+            username: "alice".to_owned(),
+            role: "user".to_owned(),
+            totp_enabled: true,
+            must_change_password: false,
+            is_self: false,
+            created: "2026-03-01".to_owned(),
+            access: vec![UserAccessCell {
+                vehicle_id: 4,
+                vehicle_name: "Faucon".to_owned(),
+                role: Some("viewer"),
+            }],
+        }];
+        let vehicles = [VehicleOption {
+            id: 4,
+            name: "Faucon".to_owned(),
+        }];
+        let html = security_page(
+            &Chrome {
+                global: GlobalTab::Security,
+                ..chrome()
+            },
+            &[],
+            None,
+            "admin",
+            &UsersPanel {
+                admin: true,
+                sudo: true,
+                users: &users,
+                vehicles: &vehicles,
+                notice: None,
+                error: None,
+            },
+            &[],
+            &[],
+        );
+        assert!(html.contains("Utilisateurs et droits"));
+        assert!(html.contains("alice"));
+        assert!(html.contains("Lecteur"));
+        assert!(html.contains("action=\"/users/2/role\""));
+        assert!(html.contains("action=\"/users/2/delete\""));
+        assert!(html.contains("Créer un utilisateur"));
+        assert!(html.contains("Propriétaire"));
+        preview("security-users.html", &html);
+    }
+
+    #[test]
+    fn security_page_hides_user_admin_from_non_admins() {
+        use super::{UsersPanel, security_page};
+        let html = security_page(
+            &Chrome {
+                global: GlobalTab::Security,
+                ..chrome()
+            },
+            &[],
+            None,
+            "alice",
+            &UsersPanel {
+                admin: false,
+                sudo: false,
+                users: &[],
+                vehicles: &[],
+                notice: None,
+                error: None,
+            },
+            &[],
+            &[],
+        );
+        assert!(!html.contains("Utilisateurs et droits"));
+        assert!(!html.contains("Jetons API"));
+        assert!(!html.contains("Journal d'audit"));
     }
 
     #[test]
@@ -1951,7 +2224,8 @@ mod tests {
     #[test]
     fn every_page_uses_the_same_content_column() {
         use super::{
-            debug_page, missing_page, placeholder_page, security_page, settings_page, system_page,
+            UsersPanel, debug_page, missing_page, placeholder_page, security_page, settings_page,
+            system_page,
         };
         let vehicle_chrome = Chrome {
             vehicles: vec![vehicle(4, "Faucon")],
@@ -2069,7 +2343,14 @@ mod tests {
                     &[],
                     None,
                     "admin",
-                    &[],
+                    &UsersPanel {
+                        admin: true,
+                        sudo: false,
+                        users: &[],
+                        vehicles: &[],
+                        notice: None,
+                        error: None,
+                    },
                     &[],
                     &[],
                 ),

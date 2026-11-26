@@ -466,26 +466,68 @@ fn uri_encode(value: &str) -> String {
     out
 }
 
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub(crate) struct UserRecord {
+    pub id: i64,
+    pub username: String,
+    pub role: String,
+    pub must_change_password: bool,
+    pub totp_enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub(crate) struct AccessRecord {
+    pub user_id: i64,
+    pub vehicle_id: i64,
+    pub role: String,
+}
+
+pub(crate) async fn list_users(pool: &PgPool) -> Result<Vec<UserRecord>, AppError> {
+    Ok(sqlx::query_as(
+        "SELECT id, username, role, must_change_password, totp_enabled, created_at
+         FROM users
+         ORDER BY role DESC, username",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+pub(crate) async fn list_access(pool: &PgPool) -> Result<Vec<AccessRecord>, AppError> {
+    Ok(sqlx::query_as(
+        "SELECT user_id, vehicle_id, role FROM vehicle_access ORDER BY user_id, vehicle_id",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
 pub(crate) async fn create_user(
     pool: &PgPool,
     actor: i64,
     username: &str,
     password: &str,
     role: &str,
-) -> Result<(), AppError> {
+) -> Result<i64, AppError> {
     if !matches!(role, "admin" | "user") || username.trim().is_empty() {
         return Err(AppError::message("user name and role are required"));
     }
+    if password.trim().len() < 12 {
+        return Err(AppError::message("password must be at least 12 characters"));
+    }
     let hash = hash_password(password)?;
-    sqlx::query(
+    let id: (i64,) = sqlx::query_as(
         "INSERT INTO users (username, password_hash, role, must_change_password, totp_enabled)
-         VALUES ($1, $2, $3, true, false)",
+         VALUES ($1, $2, $3, true, false)
+         RETURNING id",
     )
     .bind(username.trim())
     .bind(hash)
     .bind(role)
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
+    if role == "admin" {
+        grant_all_vehicles(pool, id.0).await?;
+    }
     audit(
         pool,
         Some(actor),
@@ -494,6 +536,136 @@ pub(crate) async fn create_user(
         &serde_json::json!({ "username": username.trim(), "role": role }).to_string(),
     )
     .await;
+    Ok(id.0)
+}
+
+pub(crate) async fn set_user_role(
+    pool: &PgPool,
+    actor: i64,
+    user_id: i64,
+    role: &str,
+) -> Result<(), AppError> {
+    if !matches!(role, "admin" | "user") {
+        return Err(AppError::message("role must be admin or user"));
+    }
+    let current: Option<(String,)> = sqlx::query_as("SELECT role FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some((current_role,)) = current else {
+        return Err(AppError::message("user not found"));
+    };
+    if current_role == "admin" && role != "admin" {
+        ensure_another_admin(pool, user_id).await?;
+    }
+    sqlx::query("UPDATE users SET role = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(role)
+        .execute(pool)
+        .await?;
+    if role == "admin" {
+        grant_all_vehicles(pool, user_id).await?;
+    }
+    audit(
+        pool,
+        Some(actor),
+        "user.role",
+        "ok",
+        &serde_json::json!({ "user_id": user_id, "role": role }).to_string(),
+    )
+    .await;
+    Ok(())
+}
+
+pub(crate) async fn reset_user_password(
+    pool: &PgPool,
+    actor: i64,
+    user_id: i64,
+    password: &str,
+) -> Result<(), AppError> {
+    if password.trim().len() < 12 {
+        return Err(AppError::message("password must be at least 12 characters"));
+    }
+    let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_none() {
+        return Err(AppError::message("user not found"));
+    }
+    let hash = hash_password(password)?;
+    sqlx::query("UPDATE users SET password_hash = $2, must_change_password = true WHERE id = $1")
+        .bind(user_id)
+        .bind(hash)
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    audit(
+        pool,
+        Some(actor),
+        "user.password_reset",
+        "ok",
+        &serde_json::json!({ "user_id": user_id }).to_string(),
+    )
+    .await;
+    Ok(())
+}
+
+pub(crate) async fn delete_user(pool: &PgPool, actor: i64, user_id: i64) -> Result<(), AppError> {
+    if actor == user_id {
+        return Err(AppError::message("cannot delete your own account"));
+    }
+    let current: Option<(String,)> = sqlx::query_as("SELECT role FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some((role,)) = current else {
+        return Err(AppError::message("user not found"));
+    };
+    if role == "admin" {
+        ensure_another_admin(pool, user_id).await?;
+    }
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    audit(
+        pool,
+        Some(actor),
+        "user.delete",
+        "ok",
+        &serde_json::json!({ "user_id": user_id }).to_string(),
+    )
+    .await;
+    Ok(())
+}
+
+async fn ensure_another_admin(pool: &PgPool, user_id: i64) -> Result<(), AppError> {
+    let others: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM users WHERE role = 'admin' AND id <> $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
+    if others.0 == 0 {
+        return Err(AppError::message(
+            "the last administrator cannot be removed",
+        ));
+    }
+    Ok(())
+}
+
+async fn grant_all_vehicles(pool: &PgPool, user_id: i64) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO vehicle_access (user_id, vehicle_id, role)
+         SELECT $1, id, 'owner' FROM vehicles
+         ON CONFLICT (user_id, vehicle_id) DO UPDATE SET role = 'owner'",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -525,7 +697,19 @@ pub(crate) async fn set_vehicle_access(
         }
         _ => return Err(AppError::message("vehicle role must be owner or viewer")),
     }
-    audit(pool, Some(actor), "vehicle_access", "ok", "{}").await;
+    audit(
+        pool,
+        Some(actor),
+        "vehicle_access",
+        "ok",
+        &serde_json::json!({
+            "user_id": user_id,
+            "vehicle_id": vehicle_id,
+            "role": role,
+        })
+        .to_string(),
+    )
+    .await;
     Ok(())
 }
 
@@ -1006,5 +1190,79 @@ mod tests {
             .unwrap();
         assert!(loaded.needs_setup());
         assert!(loaded.is_admin());
+    }
+
+    #[tokio::test]
+    async fn admin_can_manage_users_and_vehicle_rights() {
+        let Some(db) = crate::test_util::TestDb::migrated("identity_users").await else {
+            return;
+        };
+        let state = crate::app::test_state(db.pool.clone()).await;
+        let login = super::login(&state, "admin", "test-password", "", "127.0.0.1")
+            .await
+            .unwrap();
+        let super::LoginResult::Session(issued) = login else {
+            panic!("expected a session");
+        };
+        let admin = super::load_session(&db.pool, &issued.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let vehicle: (i64,) = sqlx::query_as(
+            "INSERT INTO vehicles (vin, name) VALUES ('5YJ30000000000002', 'Blue') RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let user_id =
+            super::create_user(&db.pool, admin.user_id, "alice", "temporary-pass", "user")
+                .await
+                .unwrap();
+        super::set_vehicle_access(&db.pool, admin.user_id, user_id, vehicle.0, Some("viewer"))
+            .await
+            .unwrap();
+        let users = super::list_users(&db.pool).await.unwrap();
+        assert!(
+            users
+                .iter()
+                .any(|user| user.username == "alice" && user.role == "user")
+        );
+        let access = super::list_access(&db.pool).await.unwrap();
+        assert!(access.iter().any(|row| row.user_id == user_id
+            && row.vehicle_id == vehicle.0
+            && row.role == "viewer"));
+        super::set_user_role(&db.pool, admin.user_id, user_id, "admin")
+            .await
+            .unwrap();
+        let access = super::list_access(&db.pool).await.unwrap();
+        assert!(access.iter().any(|row| row.user_id == user_id
+            && row.vehicle_id == vehicle.0
+            && row.role == "owner"));
+        super::set_user_role(&db.pool, admin.user_id, user_id, "user")
+            .await
+            .unwrap();
+        super::reset_user_password(&db.pool, admin.user_id, user_id, "another-secret")
+            .await
+            .unwrap();
+        let row: (bool,) = sqlx::query_as("SELECT must_change_password FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert!(row.0);
+        super::delete_user(&db.pool, admin.user_id, user_id)
+            .await
+            .unwrap();
+        let remaining: (i64,) = sqlx::query_as("SELECT count(*) FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining.0, 0);
+        assert!(
+            super::delete_user(&db.pool, admin.user_id, admin.user_id)
+                .await
+                .is_err()
+        );
     }
 }

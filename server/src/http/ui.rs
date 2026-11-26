@@ -15,10 +15,10 @@ use tesla_auth::{CallbackParams, ExposeSecret, TokenStore};
 use zeroize::Zeroize;
 
 use super::markup::{
-    AccessLine, AuditLine, Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview,
-    Party, SessionLine, SettingRow, SetupStep, TokenLine, VehicleTab, connection_page, debug_page,
-    fleet_page, login_page, missing_page, overview_page, security_page, settings_page, setup_page,
-    system_page,
+    AuditLine, Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview, Party,
+    SessionLine, SettingRow, SetupStep, TokenLine, UserAccessCell, UserLine, UsersPanel,
+    VehicleOption, VehicleTab, connection_page, debug_page, fleet_page, login_page, missing_page,
+    overview_page, security_page, settings_page, setup_page, system_page,
 };
 use super::{cookie, ui_session};
 use crate::accounts::{self, TokenPublic};
@@ -68,6 +68,9 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/security/totp/confirm", post(confirm_totp))
         .route("/sudo", post(sudo))
         .route("/users", post(create_user))
+        .route("/users/{id}/role", post(set_user_role))
+        .route("/users/{id}/password", post(reset_user_password))
+        .route("/users/{id}/delete", post(delete_user))
         .route("/vehicle-access", post(set_access))
         .route("/sessions/{id}/revoke", post(revoke_session))
         .route("/logs", get(logs_redirect))
@@ -1011,15 +1014,86 @@ async fn create_user(
     if !csrf_ok(&headers, &form.csrf) || !principal.is_admin() || !principal.sudo_active() {
         return (StatusCode::FORBIDDEN, "sudo required").into_response();
     }
-    let _ = crate::identity::create_user(
+    match crate::identity::create_user(
         &app.inner.db,
         principal.user_id,
         &form.username,
         &form.password,
         &form.role,
     )
-    .await;
-    Redirect::to("/security").into_response()
+    .await
+    {
+        Ok(_) => Redirect::to("/security?notice=user_created#users").into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "user create failed");
+            Redirect::to("/security?error=user_create#users").into_response()
+        }
+    }
+}
+
+async fn set_user_role(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<RoleForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) || !principal.is_admin() || !principal.sudo_active() {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
+    }
+    match crate::identity::set_user_role(&app.inner.db, principal.user_id, id, &form.role).await {
+        Ok(()) => Redirect::to("/security?notice=role_saved#users").into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, user_id = id, "user role update failed");
+            Redirect::to("/security?error=role#users").into_response()
+        }
+    }
+}
+
+async fn reset_user_password(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<ResetPasswordForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) || !principal.is_admin() || !principal.sudo_active() {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
+    }
+    match crate::identity::reset_user_password(&app.inner.db, principal.user_id, id, &form.password)
+        .await
+    {
+        Ok(()) => Redirect::to("/security?notice=password_reset#users").into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, user_id = id, "user password reset failed");
+            Redirect::to("/security?error=password#users").into_response()
+        }
+    }
+}
+
+async fn delete_user(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let Some(principal) = ui_session(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) || !principal.is_admin() || !principal.sudo_active() {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
+    }
+    match crate::identity::delete_user(&app.inner.db, principal.user_id, id).await {
+        Ok(()) => Redirect::to("/security?notice=user_deleted#users").into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, user_id = id, "user delete failed");
+            Redirect::to("/security?error=delete#users").into_response()
+        }
+    }
 }
 
 async fn set_access(
@@ -1038,15 +1112,21 @@ async fn set_access(
     } else {
         Some(form.role.as_str())
     };
-    let _ = crate::identity::set_vehicle_access(
+    match crate::identity::set_vehicle_access(
         &app.inner.db,
         principal.user_id,
         form.user_id,
         form.vehicle_id,
         role,
     )
-    .await;
-    Redirect::to("/security").into_response()
+    .await
+    {
+        Ok(()) => Redirect::to("/security?notice=access_saved#users").into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "vehicle access update failed");
+            Redirect::to("/security?error=access#users").into_response()
+        }
+    }
 }
 
 async fn revoke_session(
@@ -1074,12 +1154,32 @@ struct UserForm {
 }
 
 #[derive(Deserialize)]
+struct RoleForm {
+    csrf: String,
+    role: String,
+}
+
+#[derive(Deserialize)]
+struct ResetPasswordForm {
+    csrf: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
 struct AccessForm {
     csrf: String,
     user_id: i64,
     vehicle_id: i64,
     #[serde(default)]
     role: String,
+}
+
+#[derive(Deserialize)]
+struct SecurityQuery {
+    #[serde(default)]
+    notice: String,
+    #[serde(default)]
+    error: String,
 }
 
 async fn sudo(
@@ -1537,8 +1637,15 @@ async fn disconnect_account(
     Redirect::to("/system").into_response()
 }
 
-async fn security(State(app): State<AppState>, headers: HeaderMap) -> Response {
+async fn security(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SecurityQuery>,
+) -> Response {
     let Some(page) = signed_page(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    let Some(principal) = ui_session(&app, &headers).await else {
         return Redirect::to("/").into_response();
     };
     let tokens = token_rows(&app).await.unwrap_or_default();
@@ -1556,16 +1663,32 @@ async fn security(State(app): State<AppState>, headers: HeaderMap) -> Response {
             scopes: token.scopes.join(" "),
         })
         .collect::<Vec<_>>();
-    let access = access_lines(&app).await;
-    let sessions = session_lines(&app).await;
-    let audit = audit_lines(&app).await;
+    let (users, vehicles) = users_panel_data(&app, principal.user_id).await;
+    let panel = UsersPanel {
+        admin: page.admin,
+        sudo: principal.sudo_active(),
+        users: &users,
+        vehicles: &vehicles,
+        notice: security_notice(&query.notice),
+        error: security_error(&query.error),
+    };
+    let sessions = if page.admin {
+        session_lines(&app).await
+    } else {
+        Vec::new()
+    };
+    let audit = if page.admin {
+        audit_lines(&app).await
+    } else {
+        Vec::new()
+    };
     html_page(
         security_page(
             &chrome(&page, None, None, GlobalTab::Security, false),
             &lines,
             revealed.as_deref(),
             &page.username,
-            &access,
+            &panel,
             &sessions,
             &audit,
         ),
@@ -2283,24 +2406,95 @@ async fn token_rows(app: &AppState) -> Result<Vec<TokenRow>, sqlx::Error> {
         .await
 }
 
-async fn access_lines(app: &AppState) -> Vec<AccessLine> {
-    sqlx::query_as::<_, (String, String, String)>(
-        "SELECT u.username, COALESCE(v.name, v.id::text), a.role
-         FROM vehicle_access a
-         JOIN users u ON u.id = a.user_id
-         JOIN vehicles v ON v.id = a.vehicle_id
-         ORDER BY u.username, v.id",
+async fn users_panel_data(
+    app: &AppState,
+    current_user_id: i64,
+) -> (Vec<UserLine>, Vec<VehicleOption>) {
+    let users = crate::identity::list_users(&app.inner.db)
+        .await
+        .unwrap_or_default();
+    let access = crate::identity::list_access(&app.inner.db)
+        .await
+        .unwrap_or_default();
+    let vehicles = sqlx::query_as::<_, (i64, String)>(
+        "SELECT id, COALESCE(NULLIF(name, ''), 'Véhicule ' || id::text) FROM vehicles ORDER BY id",
     )
     .fetch_all(&app.inner.db)
     .await
-    .unwrap_or_default()
-    .into_iter()
-    .map(|(user, vehicle, role)| AccessLine {
-        user,
-        vehicle,
-        role,
-    })
-    .collect()
+    .unwrap_or_default();
+    let vehicle_opts: Vec<VehicleOption> = vehicles
+        .into_iter()
+        .map(|(id, name)| VehicleOption { id, name })
+        .collect();
+    let lines = users
+        .into_iter()
+        .map(|user| {
+            let cells = access
+                .iter()
+                .filter(|row| row.user_id == user.id)
+                .filter_map(|row| {
+                    let role = match row.role.as_str() {
+                        "owner" => "owner",
+                        "viewer" => "viewer",
+                        _ => return None,
+                    };
+                    let name = vehicle_opts
+                        .iter()
+                        .find(|vehicle| vehicle.id == row.vehicle_id)
+                        .map_or_else(
+                            || format!("Véhicule {}", row.vehicle_id),
+                            |vehicle| vehicle.name.clone(),
+                        );
+                    Some(UserAccessCell {
+                        vehicle_id: row.vehicle_id,
+                        vehicle_name: name,
+                        role: Some(role),
+                    })
+                })
+                .collect();
+            UserLine {
+                id: user.id,
+                username: user.username,
+                role: user.role,
+                totp_enabled: user.totp_enabled,
+                must_change_password: user.must_change_password,
+                is_self: user.id == current_user_id,
+                created: user.created_at.format("%Y-%m-%d").to_string(),
+                access: cells,
+            }
+        })
+        .collect();
+    (lines, vehicle_opts)
+}
+
+fn security_notice(key: &str) -> Option<&'static str> {
+    match key {
+        "user_created" => {
+            Some("Utilisateur créé. Il devra changer son mot de passe et activer le 2FA.")
+        }
+        "role_saved" => Some("Rôle enregistré."),
+        "password_reset" => {
+            Some("Mot de passe réinitialisé. Les sessions de ce compte ont été révoquées.")
+        }
+        "user_deleted" => Some("Utilisateur supprimé."),
+        "access_saved" => Some("Accès véhicule mis à jour."),
+        _ => None,
+    }
+}
+
+fn security_error(key: &str) -> Option<&'static str> {
+    match key {
+        "user_create" => {
+            Some("Impossible de créer l'utilisateur. Vérifiez le nom, le rôle et le mot de passe.")
+        }
+        "role" => Some(
+            "Impossible de changer le rôle (dernier administrateur ou utilisateur introuvable).",
+        ),
+        "password" => Some("Impossible de réinitialiser le mot de passe."),
+        "delete" => Some("Impossible de supprimer cet utilisateur."),
+        "access" => Some("Impossible de mettre à jour l'accès véhicule."),
+        _ => None,
+    }
 }
 
 async fn session_lines(app: &AppState) -> Vec<SessionLine> {
