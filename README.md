@@ -260,8 +260,12 @@ Optional:
 | `TELEMETRY_BIND` | `0.0.0.0:4443` | Telemetry listen socket |
 | `TELEMETRY_HOSTNAME` | `TESLA_DOMAIN` | Hostname the car dials. No scheme and no port |
 | `TELEMETRY_PORT` | bind port | Port advertised in the fleet telemetry config. Defaults to the port in `TELEMETRY_BIND` |
-| `TELEMETRY_CERT_PATH` | unset | PEM certificate chain. Required for telemetry to start. The same PEM is the `ca` the car uses to authenticate the server |
-| `TELEMETRY_KEY_PATH` | unset | PEM private key. Required for telemetry to start |
+| `TELEMETRY_CERT_PATH` | unset | PEM certificate chain for the receiver. Required for telemetry to start. The `ca` sent to the car is this file without the first certificate when more than one is present (leaf, then chain) |
+| `TELEMETRY_KEY_PATH` | unset | PEM private key for the receiver. Required for telemetry to start. Not the application virtual key |
+| `TELEMETRY_FRESH_SECS` | `900` | A message newer than this makes `data_source` `telemetry` and holds off the fallback `vehicle_data` poll. 30–86400 |
+| `TELEMETRY_CONFIG_CHECK_SECS` | `3600` | How often a pushed config is read back. If Tesla dropped it, it is sent again. 300–86400. Failures back off from 60 s up to 6 h. Skipped while the Fleet data budget is paused |
+| `TELEMETRY_PROXY_URL` | unset | `tesla-http-proxy` base URL. When set, the unsigned config is posted there and the proxy signs it. `https` requires `TELEMETRY_PROXY_CA`. `http` is allowed only on localhost |
+| `TELEMETRY_PROXY_CA` | unset | PEM CA (or the proxy certificate) used to verify `TELEMETRY_PROXY_URL` |
 | `RUST_LOG` | `info,sqlx=warn,hyper=warn,h2=warn,rumqttc=warn,reqwest=warn` | stderr filter. Leave `sqlx` off `trace`; query logs can include bound values |
 | `TESLA_TIMEZONE` | `Europe/Paris` | IANA zone for `/api/v1/vehicles/{id}/stats/series` bucket boundaries. ISO weeks start on Monday |
 | `ENERGY_PRICE_PER_KWH` | unset | Used as `charges.cost` when that column is null, for `charge_cost` and `cost_per_km` |
@@ -272,7 +276,7 @@ Booleans and integers that are unset use the defaults. An empty value in the dot
 
 #### Private key
 
-Generate a key with the example above (`TESLA_KEY_FILE=server/private-key.pem`). The logger does not generate one. On startup it reads the PEM and serves the public key at `/.well-known/appspecific/com.tesla.3p.public-key.pem` with no authentication. It does not call Fleet API partner registration.
+Generate a key with the example above (`TESLA_KEY_FILE=server/private-key.pem`). The logger does not generate one. On startup it reads the PEM and serves the public key at `/.well-known/appspecific/com.tesla.3p.public-key.pem` with no authentication. Register the domain with `tesla-logger register-partner` or the button on the connection page. That calls `POST /api/1/partner_accounts` with a partner token. The public key must already be reachable on `https://<TESLA_DOMAIN>` at that path. Pair each car at `https://tesla.com/_ak/<TESLA_DOMAIN>`.
 
 #### Postgres for `cargo run`
 
@@ -324,7 +328,7 @@ That is the `serve` command. `cargo run -p tesla-logger -- serve` is the same. T
 
 Leave `TELEMETRY_ENABLED=false` to stay on the sleep-safe polling schedule. Polling never calls `wake_up`. After the car parks it takes at most `POLL_PARKED_LIVE_LIMIT` (default 1) `vehicle_data` snapshots, then only `GET /api/1/vehicles`, at `POLL_BACKOFF_SECS` (default 30 minutes). A live `vehicle_data` call resets Tesla's sleep timer. The `endpoints` query is still that live call, so it is billed and can wake the car. Tesla documents `vehicle_data_cached` as a non-waking cache, and does not list it as free, so the idle path does not use it.
 
-To switch to telemetry, set `TELEMETRY_ENABLED=true`, `TELEMETRY_CERT_PATH`, and `TELEMETRY_KEY_PATH`. Put the certificate's hostname in `TELEMETRY_HOSTNAME` (default `TESLA_DOMAIN`) and publish `TELEMETRY_PORT` (default the bind port) so the car can reach the receiver. On startup the logger posts a fleet telemetry config for the account vehicles: charge state (`DetailedChargeState` and `ChargeState`), the charge schedule fields, gear, location, speed, odometer, and state of charge, with `minimum_delta` on the numeric signals. While records are fresh, `vehicle_data` is not polled, including during a charge. If the stream goes quiet and the car is online, one `vehicle_data` read runs every `POLL_TELEMETRY_FALLBACK_SECS` (default 1 hour) and counts toward the caps. The state API field `data_source` is `telemetry` in this mode and `polling` otherwise.
+To switch to telemetry, set `TELEMETRY_ENABLED=true`, `TELEMETRY_CERT_PATH`, and `TELEMETRY_KEY_PATH`. Put the certificate's hostname in `TELEMETRY_HOSTNAME` (default `TESLA_DOMAIN`) and publish `TELEMETRY_PORT` (default the bind port) so the car can reach the receiver. The car dials that port with mutual TLS. Do not put an HTTP reverse proxy in front of it. On startup the logger signs and posts a fleet telemetry config for the account vehicles: charge state (`DetailedChargeState` and `ChargeState`), the charge schedule fields, gear, location, speed, odometer, and state of charge, with `minimum_delta` on the numeric signals. Signing uses `TELEMETRY_PROXY_URL` when set (the official `tesla-http-proxy`, which holds the application private key). Otherwise the logger signs a `Tesla.SS256` JWS with `TESLA_PRIVATE_KEY_PATH` and posts `fleet_telemetry_config_jws`. A VIN is remembered only when Tesla accepts it. `skipped_vehicles` is logged and returned as `telemetry_skip_reason` on the state API. If a later read shows the config is gone, it is sent again with backoff, and not while the Fleet data budget is paused. While records are fresher than `TELEMETRY_FRESH_SECS`, `vehicle_data` is not polled, including during a charge. If the stream goes quiet and the car is online, one `vehicle_data` read runs every `POLL_TELEMETRY_FALLBACK_SECS` (default 1 hour) and counts toward the caps. `data_source` is `telemetry` only after a message inside `TELEMETRY_FRESH_SECS`, and `polling` otherwise. Owner streaming is unchanged.
 
 Plugged and charging status comes from `vehicle_data` `charge_state` in polling mode and from `DetailedChargeState` (with `ChargeState` as a fallback) in telemetry mode. If `vehicle_data` is paused and telemetry is not fresh, `charge_status` is `unknown` and `charge_status_stale` is true.
 

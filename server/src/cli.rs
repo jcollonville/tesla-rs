@@ -1,7 +1,8 @@
 // Copyright (C) 2026 Jean Collonvillé
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Process entry points for `serve`, `import-teslamate`, `repair-drive-ends`, and `healthcheck`.
+//! Process entry points for `serve`, `import-teslamate`, `repair-drive-ends`,
+//! `register-partner`, and `healthcheck`.
 
 use std::time::Duration;
 
@@ -44,6 +45,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let report = crate::persist::repair_drive_ends_at(&url, apply).await?;
             print!("{}", crate::persist::format_drive_end_repair(&report));
         }
+        Command::RegisterPartner => {
+            let config = Config::load()?;
+            crate::partner::register(&config).await?;
+            println!(
+                "registered domain={}",
+                crate::partner::partner_domain(&config.domain)?
+            );
+        }
         Command::Healthcheck { url } => healthcheck(&url).await?,
     }
     Ok(())
@@ -84,6 +93,12 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Register `TESLA_DOMAIN` with Tesla (`POST /api/1/partner_accounts`).
+    ///
+    /// The public key must already be reachable at
+    /// `https://<domain>/.well-known/appspecific/com.tesla.3p.public-key.pem`.
+    #[command(name = "register-partner")]
+    RegisterPartner,
     /// GET a URL and exit 0 when the status is successful.
     Healthcheck {
         /// URL to request. Defaults to the local health endpoint.
@@ -153,7 +168,10 @@ mod tests {
                     assert_eq!(source, "postgres://localhost/teslamate");
                     assert_eq!(batch_size, 1000);
                 }
-                Command::Serve | Command::Healthcheck { .. } | Command::RepairDriveEnds { .. } => {
+                Command::Serve
+                | Command::Healthcheck { .. }
+                | Command::RepairDriveEnds { .. }
+                | Command::RegisterPartner => {
                     panic!("{name} parsed as a different command");
                 }
             }
@@ -165,16 +183,28 @@ mod tests {
         let dry = Cli::try_parse_from(["tesla-logger", "repair-drive-ends"]).unwrap();
         match dry.command.unwrap() {
             Command::RepairDriveEnds { apply } => assert!(!apply),
-            Command::Serve | Command::ImportTeslaMate { .. } | Command::Healthcheck { .. } => {
+            Command::Serve
+            | Command::ImportTeslaMate { .. }
+            | Command::Healthcheck { .. }
+            | Command::RegisterPartner => {
                 panic!("dry-run parsed as a different command");
             }
         }
         let write = Cli::try_parse_from(["tesla-logger", "repair-drive-ends", "--apply"]).unwrap();
         match write.command.unwrap() {
             Command::RepairDriveEnds { apply } => assert!(apply),
-            Command::Serve | Command::ImportTeslaMate { .. } | Command::Healthcheck { .. } => {
+            Command::Serve
+            | Command::ImportTeslaMate { .. }
+            | Command::Healthcheck { .. }
+            | Command::RegisterPartner => {
                 panic!("apply parsed as a different command");
             }
         }
+    }
+
+    #[test]
+    fn register_partner_is_a_command() {
+        let cli = Cli::try_parse_from(["tesla-logger", "register-partner"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::RegisterPartner)));
     }
 }

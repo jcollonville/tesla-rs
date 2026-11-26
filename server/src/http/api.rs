@@ -90,10 +90,17 @@ pub(crate) async fn vehicle_state(
         .unwrap_or_else(|| StateJson::offline(id));
     let fresh = charge_reading_fresh(&app, id).await;
     annotate_charge_status(&mut row, fresh);
-    app.inner
-        .archive
-        .data_source()
-        .clone_into(&mut row.data_source);
+    if let Some(vin) = vehicle_vin(&app.inner.db, id).await {
+        app.inner
+            .archive
+            .reported_data_source(&vin)
+            .await
+            .clone_into(&mut row.data_source);
+        row.telemetry_skip_reason = match &app.inner.archive.telemetry {
+            Some(target) => target.skip_reason(&vin).await,
+            None => None,
+        };
+    }
     let snapshot = app.inner.stream_board.snapshot().await;
     let (status, error) = snapshot.for_vehicle(id);
     row.stream_status = status;
@@ -107,10 +114,11 @@ pub(crate) async fn fleet_usage(
 ) -> Result<Json<FleetUsageJson>, ApiError> {
     let gate = crate::budget::gate(&app.inner.db, budget_query(&app, Utc::now())).await;
     let mut body = FleetUsageJson::from_gate(&gate);
-    app.inner
-        .archive
-        .data_source()
-        .clone_into(&mut body.data_source);
+    if app.inner.archive.any_fresh_telemetry().await {
+        "telemetry".clone_into(&mut body.data_source);
+    } else {
+        "polling".clone_into(&mut body.data_source);
+    }
     Ok(Json(body))
 }
 
@@ -432,7 +440,6 @@ pub(crate) async fn ws(
         board: app.inner.stream_board.clone(),
         gps: app.inner.archive.gps.clone(),
         archive: std::sync::Arc::clone(&app.inner.archive),
-        data_source: app.inner.archive.data_source().to_owned(),
         budget_blocked: crate::budget::gate(&app.inner.db, budget_query(&app, Utc::now()))
             .await
             .blocks_vehicle_data(),
@@ -446,7 +453,6 @@ struct LiveSocket {
     board: crate::owner_stream::StreamBoard,
     gps: crate::position_mode::GpsBoard,
     archive: std::sync::Arc<crate::ingest::Archive>,
-    data_source: String,
     budget_blocked: bool,
     allowed: Option<Vec<i64>>,
 }
@@ -461,7 +467,6 @@ async fn handle_socket(
         board,
         gps,
         archive,
-        data_source,
         budget_blocked,
         allowed,
     } = live;
@@ -485,7 +490,11 @@ async fn handle_socket(
             let (status, error) = snapshot.for_vehicle(row.state.vehicle_id);
             let fresh = !budget_blocked || telemetry_fresh(&archive, row.state.vehicle_id).await;
             annotate_charge_status(&mut row.state, fresh);
-            row.state.data_source.clone_from(&data_source);
+            row.state.data_source = archive.reported_data_source(&row.vin).await.to_owned();
+            row.state.telemetry_skip_reason = match &archive.telemetry {
+                Some(target) => target.skip_reason(&row.vin).await,
+                None => None,
+            };
             row.state.stream_status = status;
             row.state.stream_error = error;
             row.state.position_mode = gps.mode_name(row.state.vehicle_id).await;
@@ -555,6 +564,12 @@ async fn handle_socket(
                                     Some(text) => serde_json::Value::String(text),
                                     None => serde_json::Value::Null,
                                 },
+                            );
+                            object.insert(
+                                "data_source".to_owned(),
+                                serde_json::Value::String(
+                                    archive.reported_data_source(&event.vin).await.to_owned(),
+                                ),
                             );
                         }
                         if socket
@@ -830,10 +845,14 @@ pub(crate) struct StateJson {
     #[sqlx(default)]
     #[serde(default)]
     pub charge_status_stale: bool,
-    /// `polling` or `telemetry`.
+    /// `polling` or `telemetry`. `telemetry` means a message arrived inside `TELEMETRY_FRESH_SECS`.
     #[sqlx(default)]
     #[serde(default = "default_data_source")]
     pub data_source: String,
+    /// Why Tesla skipped this VIN on the last config push.
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_skip_reason: Option<String>,
     pub tpms_pressure_fl: Option<f64>,
     pub tpms_pressure_fr: Option<f64>,
     pub tpms_pressure_rl: Option<f64>,
@@ -903,7 +922,16 @@ pub(super) async fn telemetry_fresh(archive: &crate::ingest::Archive, vehicle_id
     let runtime = slot.lock().await;
     runtime
         .last_telemetry
-        .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(900))
+        .is_some_and(|at| at.elapsed() <= archive.telemetry_fresh_for)
+}
+
+async fn vehicle_vin(pool: &sqlx::PgPool, id: i64) -> Option<String> {
+    sqlx::query_scalar("SELECT vin FROM vehicles WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
 }
 
 fn default_stream_status() -> String {
@@ -962,6 +990,7 @@ impl StateJson {
             charge_status: None,
             charge_status_stale: false,
             data_source: default_data_source(),
+            telemetry_skip_reason: None,
             tpms_pressure_fl: None,
             tpms_pressure_fr: None,
             tpms_pressure_rl: None,

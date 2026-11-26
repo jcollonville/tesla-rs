@@ -48,6 +48,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/v/{id}/stats", get(stats))
         .route("/v/{id}/connection", get(vehicle_connection))
         .route("/connection", get(account_connection))
+        .route("/connection/partner", post(register_partner))
+        .route("/connection/telemetry", post(resend_telemetry))
         .route("/settings", get(settings))
         .route("/settings/override", post(save_setting))
         .route("/debug", get(debug_page_handler))
@@ -426,8 +428,283 @@ pub(super) async fn render_connection(
         stream_status: snapshot.summary(),
         streaming_enabled: app.inner.config.owner_stream_enabled,
         authorize_url: authorize_url.as_deref(),
+        report: connection_report(app, &page, account_id, fleet_token.present, &fleet_token).await,
     };
     html_page(connection_page(&chrome, &view), page.cookie)
+}
+
+async fn connection_report(
+    app: &AppState,
+    page: &Page,
+    account_id: i64,
+    fleet_present: bool,
+    fleet_token: &TokenPublic,
+) -> crate::connection::Report {
+    refresh_partner(app).await;
+    let rows = named_vins(&app.inner.db, account_id).await;
+    let vins = rows.iter().map(|(_, vin)| vin.clone()).collect::<Vec<_>>();
+    if fleet_present {
+        refresh_pairing(app, &vins).await;
+    }
+    let (partner, pairing) = {
+        let cache = app.inner.links.lock().await;
+        (cache.partner.clone(), cache.pairing.clone())
+    };
+    let archive = &app.inner.archive;
+    let mut vehicles = Vec::new();
+    for (name, vin) in rows {
+        let (skip_reason, config_pushed) = if let Some(target) = archive.telemetry.as_ref() {
+            (
+                target.skip_reason(&vin).await,
+                target.is_configured(&vin).await,
+            )
+        } else {
+            (None, false)
+        };
+        vehicles.push(crate::connection::VehicleInput {
+            name,
+            key: pairing
+                .get(&vin)
+                .copied()
+                .unwrap_or(crate::connection::KeyState::Unknown),
+            skip_reason,
+            config_pushed,
+            last_message_age: archive.telemetry_age(&vin).await,
+        });
+    }
+    crate::connection::build(&crate::connection::Input {
+        now: Utc::now(),
+        fleet_present,
+        fleet_readable: fleet_token.readable,
+        fleet_expires: fleet_token.expires_at,
+        partner,
+        public_key_published: app.inner.public_key_pem.contains("BEGIN PUBLIC KEY"),
+        domain: app.inner.config.domain.clone(),
+        telemetry_enabled: app.inner.config.telemetry_enabled,
+        fresh_for: archive.telemetry_fresh_for,
+        is_admin: page.admin,
+        vehicles,
+    })
+}
+
+async fn named_vins(pool: &sqlx::PgPool, account_id: i64) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT COALESCE(NULLIF(name, ''), 'Véhicule'), vin
+         FROM vehicles WHERE account_id = $1 ORDER BY id",
+    )
+    .bind(account_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+async fn refresh_partner(app: &AppState) {
+    if app
+        .inner
+        .links
+        .lock()
+        .await
+        .partner_fresh(Duration::from_secs(300))
+    {
+        return;
+    }
+    let state = match tokio::time::timeout(
+        Duration::from_secs(3),
+        crate::partner::lookup(&app.inner.config),
+    )
+    .await
+    {
+        Ok(Ok(state)) => state,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = %crate::logs::redact_line(&err.to_string(), &[]),
+                "partner domain could not be checked"
+            );
+            crate::connection::PartnerState::Unknown {
+                message: "La vérification du domaine n'a pas abouti.".to_owned(),
+            }
+        }
+        Err(_) => crate::connection::PartnerState::Unknown {
+            message: "La vérification du domaine a expiré.".to_owned(),
+        },
+    };
+    let mut cache = app.inner.links.lock().await;
+    cache.partner = state;
+    cache.partner_at = Some(Instant::now());
+}
+
+async fn refresh_pairing(app: &AppState, vins: &[String]) {
+    if vins.is_empty()
+        || app
+            .inner
+            .links
+            .lock()
+            .await
+            .pairing_fresh(Duration::from_secs(60))
+    {
+        return;
+    }
+    let token = match app.inner.session.access_token().await {
+        Ok(token) => token,
+        Err(err) => {
+            tracing::warn!(
+                error = %crate::logs::redact_line(&err.to_string(), &[]),
+                "fleet token was not available for virtual-key status"
+            );
+            return;
+        }
+    };
+    let Ok(client) = tesla_fleet_api::FleetClient::for_region(
+        app.inner.config.region,
+        tesla_fleet_api::BearerToken::new(tesla_auth::ExposeSecret::expose_secret(&token)),
+    ) else {
+        return;
+    };
+    let Ok(Ok(status)) =
+        tokio::time::timeout(Duration::from_secs(3), client.fleet_status(vins)).await
+    else {
+        tracing::warn!("virtual-key status could not be read");
+        return;
+    };
+    let mut pairing = std::collections::BTreeMap::new();
+    for vin in vins {
+        let state = if status.key_paired_vins.iter().any(|item| item == vin) {
+            crate::connection::KeyState::Paired
+        } else if status.unpaired_vins.iter().any(|item| item == vin) {
+            crate::connection::KeyState::Unpaired
+        } else {
+            crate::connection::KeyState::Unknown
+        };
+        pairing.insert(vin.clone(), state);
+    }
+    let mut cache = app.inner.links.lock().await;
+    cache.pairing = pairing;
+    cache.pairing_at = Some(Instant::now());
+}
+
+async fn register_partner(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let Some(page) = signed_page(&app, &headers).await else {
+        return Redirect::to("/").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) {
+        return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
+    }
+    if !page.admin {
+        return render_connection(
+            &app,
+            &headers,
+            form.vehicle_id,
+            Some("Un administrateur doit enregistrer le domaine."),
+            None,
+        )
+        .await;
+    }
+    match crate::partner::register(&app.inner.config).await {
+        Ok(()) => {
+            let mut cache = app.inner.links.lock().await;
+            cache.partner = crate::connection::PartnerState::Registered;
+            cache.partner_at = Some(Instant::now());
+            Redirect::to(&connection_location(form.vehicle_id)).into_response()
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %crate::logs::redact_line(&err.to_string(), &[]),
+                "partner domain was not registered"
+            );
+            render_connection(
+                &app,
+                &headers,
+                form.vehicle_id,
+                Some("L'enregistrement du domaine a été refusé."),
+                None,
+            )
+            .await
+        }
+    }
+}
+
+async fn resend_telemetry(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    if signed_page(&app, &headers).await.is_none() || !csrf_ok(&headers, &form.csrf) {
+        return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
+    }
+    if !app.inner.config.telemetry_enabled {
+        return render_connection(
+            &app,
+            &headers,
+            form.vehicle_id,
+            Some("La télémétrie n'est pas activée."),
+            None,
+        )
+        .await;
+    }
+    let gate = crate::budget::gate(&app.inner.db, super::api::budget_query(&app, Utc::now())).await;
+    if gate.blocks_vehicle_data() || gate.cap_reached() {
+        return render_connection(
+            &app,
+            &headers,
+            form.vehicle_id,
+            Some("Le budget Fleet est en pause. La configuration sera renvoyée quand il reprend."),
+            None,
+        )
+        .await;
+    }
+    let Some(target) = app.inner.archive.telemetry.as_ref() else {
+        return render_connection(
+            &app,
+            &headers,
+            form.vehicle_id,
+            Some("Le certificat de télémétrie n'est pas chargé."),
+            None,
+        )
+        .await;
+    };
+    target.force().await;
+    let Ok(fleet) = crate::ingest::FleetPoll::connect(
+        app.inner.config.region,
+        std::sync::Arc::clone(&app.inner.session),
+        app.inner.debug.clone(),
+    )
+    .map(|poll| poll.with_signing(crate::app::signing_from(&app.inner.config))) else {
+        return render_connection(
+            &app,
+            &headers,
+            form.vehicle_id,
+            Some("Le client Fleet n'a pas pu être ouvert."),
+            None,
+        )
+        .await;
+    };
+    let rows = named_vins(&app.inner.db, app.inner.fleet_account_id).await;
+    let vehicles = rows
+        .into_iter()
+        .map(|(name, vin)| crate::ingest::Summary {
+            vin,
+            tesla_id: 0,
+            legacy_vehicle_id: None,
+            name: Some(name),
+            presence: crate::state::Presence::Online,
+        })
+        .collect::<Vec<_>>();
+    crate::ingest::subscribe_telemetry(&fleet, &app.inner.archive, &vehicles, false).await;
+    if target.last_error().await.is_some() {
+        return render_connection(
+            &app,
+            &headers,
+            form.vehicle_id,
+            Some("La configuration n'a pas été envoyée."),
+            None,
+        )
+        .await;
+    }
+    Redirect::to(&connection_location(form.vehicle_id)).into_response()
 }
 
 fn party(fallback: &str, account: Option<&accounts::TeslaAccount>, token: &TokenPublic) -> Party {

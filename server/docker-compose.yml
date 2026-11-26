@@ -25,6 +25,10 @@ services:
         condition: service_healthy
     ports:
       - "4000:4000"
+      # Fleet Telemetry is mutual TLS on 4443. Publish it only when
+      # TELEMETRY_ENABLED=true, and do not terminate it on an HTTP proxy.
+      # The car dials TELEMETRY_HOSTNAME:TELEMETRY_PORT.
+      # - "4443:4443"
     env_file:
       - .env
     environment:
@@ -36,6 +40,13 @@ services:
     volumes:
       - logger-data:/data
       - ./private-key.pem:/keys/private-key.pem:ro
+      # Receiver certificate (leaf first, then the CA chain) and its key.
+      # Uncomment together with port 4443 above.
+      # - ./telemetry.pem:/certs/telemetry.pem:ro
+      # - ./telemetry.key:/certs/telemetry.key:ro
+      # Optional tesla-http-proxy CA, used only to verify TELEMETRY_PROXY_URL.
+      # Keep the proxy on this network. Do not publish its port.
+      # - ./proxy-ca.pem:/certs/proxy-ca.pem:ro
     healthcheck:
       test: ["CMD", "tesla-logger", "healthcheck", "--url", "http://127.0.0.1:4000/healthz"]
       interval: 30s

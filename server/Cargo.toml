@@ -33,6 +33,7 @@ tesla-auth = { workspace = true }
 tesla-owner-api = { workspace = true }
 tesla-fleet-api = { workspace = true }
 tesla-fleet-telemetry = { workspace = true }
+tesla-vehicle-command = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "io-util", "fs"] }
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }

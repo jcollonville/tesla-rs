@@ -58,6 +58,13 @@ pub(crate) struct Config {
     pub telemetry_hostname: String,
     pub telemetry_port: u16,
     pub telemetry_fallback: Duration,
+    /// How recent a telemetry message must be before `data_source` is `telemetry`.
+    pub telemetry_fresh: Duration,
+    /// How often a pushed config is read back, and re-sent if Tesla dropped it.
+    pub telemetry_config_check: Duration,
+    /// `tesla-http-proxy` URL. Unset means the logger signs a JWS itself.
+    pub telemetry_proxy_url: Option<String>,
+    pub telemetry_proxy_ca_path: Option<PathBuf>,
     pub fleet_dynamic_budget: bool,
     pub fleet_month_seed: u64,
     /// Set when the seed should count. Empty in the environment means the UTC month at startup.
@@ -110,6 +117,19 @@ impl std::fmt::Debug for Config {
             .field(
                 "mqtt_password",
                 &self.mqtt_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("telemetry_fresh_secs", &self.telemetry_fresh.as_secs())
+            .field(
+                "telemetry_config_check_secs",
+                &self.telemetry_config_check.as_secs(),
+            )
+            .field("telemetry_proxy_url", &self.telemetry_proxy_url)
+            .field(
+                "telemetry_proxy_ca_path",
+                &self
+                    .telemetry_proxy_ca_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
             )
             .field("timezone", &self.timezone)
             .field("energy_price_per_kwh", &self.energy_price_per_kwh)
@@ -173,6 +193,7 @@ impl Config {
         let nominatim_enabled = optional_bool(map, "NOMINATIM_ENABLED")?.unwrap_or(true);
         let mqtt_enabled = optional_bool(map, "MQTT_ENABLED")?.unwrap_or(false);
         let telemetry_enabled = optional_bool(map, "TELEMETRY_ENABLED")?.unwrap_or(false);
+        let (telemetry_proxy_url, telemetry_proxy_ca_path) = telemetry_proxy(map)?;
         let telemetry_bind = optional(map, "TELEMETRY_BIND")
             .unwrap_or_else(|| "0.0.0.0:4443".to_owned())
             .parse::<SocketAddr>()
@@ -339,6 +360,22 @@ impl Config {
                 crate::budget::TELEMETRY_FALLBACK_MIN_SECS,
                 crate::budget::TELEMETRY_FALLBACK_MAX_SECS,
             )?),
+            telemetry_fresh: Duration::from_secs(bounded_secs(
+                map,
+                "TELEMETRY_FRESH_SECS",
+                900,
+                30,
+                86_400,
+            )?),
+            telemetry_config_check: Duration::from_secs(bounded_secs(
+                map,
+                "TELEMETRY_CONFIG_CHECK_SECS",
+                3600,
+                300,
+                86_400,
+            )?),
+            telemetry_proxy_url,
+            telemetry_proxy_ca_path,
             owner_stream_enabled,
             owner_token_store_path,
             timezone: timezone_name(map)?,
@@ -495,6 +532,23 @@ impl Config {
             self.telemetry_bind.to_string(),
         );
         push(
+            "Télémétrie fraîche (s)",
+            "TELEMETRY_FRESH_SECS",
+            self.telemetry_fresh.as_secs().to_string(),
+        );
+        push(
+            "Contrôle config télémétrie (s)",
+            "TELEMETRY_CONFIG_CHECK_SECS",
+            self.telemetry_config_check.as_secs().to_string(),
+        );
+        push(
+            "Proxy commandes",
+            "TELEMETRY_PROXY_URL",
+            self.telemetry_proxy_url
+                .clone()
+                .unwrap_or_else(|| "—".to_owned()),
+        );
+        push(
             "Stream Owner",
             "OWNER_STREAM_ENABLED",
             self.owner_stream_enabled.to_string(),
@@ -608,6 +662,49 @@ fn tile_upstream(map: &BTreeMap<String, String>) -> Result<Option<String>, AppEr
 }
 
 const TILE_UPSTREAM: &str = "https://tiles.openfreemap.org";
+
+fn telemetry_proxy(
+    map: &BTreeMap<String, String>,
+) -> Result<(Option<String>, Option<PathBuf>), AppError> {
+    let Some(raw) = optional(map, "TELEMETRY_PROXY_URL") else {
+        return Ok((None, optional(map, "TELEMETRY_PROXY_CA").map(PathBuf::from)));
+    };
+    let url =
+        Url::parse(&raw).map_err(|_| AppError::message("TELEMETRY_PROXY_URL is not a URL"))?;
+    if url.username() != "" || url.password().is_some() {
+        return Err(AppError::message(
+            "TELEMETRY_PROXY_URL must not include a username or password",
+        ));
+    }
+    let ca = optional(map, "TELEMETRY_PROXY_CA").map(PathBuf::from);
+    match url.scheme() {
+        "https" => {
+            if ca.is_none() {
+                return Err(AppError::message(
+                    "TELEMETRY_PROXY_CA is required when TELEMETRY_PROXY_URL is https",
+                ));
+            }
+        }
+        "http" => {
+            let host = url.host_str().unwrap_or("");
+            if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+                return Err(AppError::message(
+                    "TELEMETRY_PROXY_URL may use http only on localhost",
+                ));
+            }
+        }
+        _ => {
+            return Err(AppError::message(
+                "TELEMETRY_PROXY_URL must be http or https",
+            ));
+        }
+    }
+    let mut endpoint = url;
+    endpoint.set_path("/api/1/vehicles/fleet_telemetry_config");
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    Ok((Some(endpoint.to_string()), ca))
+}
 
 fn optional(map: &BTreeMap<String, String>, key: &str) -> Option<String> {
     map.get(key)
@@ -856,6 +953,12 @@ mod tests {
         assert!(config.fleet_dynamic_budget);
         assert_eq!(config.parked_live_limit, 1);
         assert_eq!(config.data_source(), "polling");
+        assert_eq!(config.telemetry_fresh, std::time::Duration::from_secs(900));
+        assert_eq!(
+            config.telemetry_config_check,
+            std::time::Duration::from_secs(3600)
+        );
+        assert!(config.telemetry_proxy_url.is_none());
         assert_eq!(config.backoff_poll, std::time::Duration::from_secs(1_800));
         assert_eq!(
             config.fleet_blocked_probe,
@@ -956,5 +1059,39 @@ mod tests {
         assert_eq!(config.charge_poll, std::time::Duration::from_secs(300));
         assert_eq!(config.fleet_daily_cap, 100);
         assert_eq!(config.fleet_monthly_cap, 400);
+    }
+
+    #[test]
+    fn command_proxy_url_requires_a_ca_on_https_and_loopback_on_http() {
+        let mut map = base_map();
+        map.insert(
+            "TELEMETRY_PROXY_URL".into(),
+            "https://proxy.example:4443".into(),
+        );
+        assert!(
+            Config::from_map(&map)
+                .unwrap_err()
+                .to_string()
+                .contains("CA")
+        );
+        map.insert("TELEMETRY_PROXY_CA".into(), "/certs/proxy-ca.pem".into());
+        let config = Config::from_map(&map).unwrap();
+        assert_eq!(
+            config.telemetry_proxy_url.as_deref(),
+            Some("https://proxy.example:4443/api/1/vehicles/fleet_telemetry_config")
+        );
+        map.insert(
+            "TELEMETRY_PROXY_URL".into(),
+            "http://proxy.example:4443".into(),
+        );
+        assert!(Config::from_map(&map).is_err());
+        map.insert("TELEMETRY_PROXY_URL".into(), "http://127.0.0.1:4443".into());
+        assert!(Config::from_map(&map).is_ok());
+        map.insert(
+            "TELEMETRY_PROXY_URL".into(),
+            "https://user:secret@proxy.example:4443".into(),
+        );
+        let err = Config::from_map(&map).unwrap_err().to_string();
+        assert!(!err.contains("secret"));
     }
 }

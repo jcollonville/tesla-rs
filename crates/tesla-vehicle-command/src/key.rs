@@ -145,6 +145,17 @@ impl PrivateKey {
         &self.public
     }
 
+    /// Tesla Schnorr/P-256 signature over `message`.
+    ///
+    /// The signature is 96 bytes: the nonce point `x || y` followed by the scalar `r`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandError::Signing`] when the scalar is not a valid nonce input.
+    pub fn sign_schnorr(&self, message: &[u8]) -> Result<[u8; 96], CommandError> {
+        crate::schnorr::sign(self.scalar.expose_secret(), message)
+    }
+
     /// Writes a private-key PEM with mode `0600` on Unix.
     ///
     /// The file is replaced via a temporary sibling. Existing contents are overwritten.

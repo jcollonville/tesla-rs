@@ -224,6 +224,7 @@ pub(super) struct ConnectionView<'a> {
     pub stream_status: &'a str,
     pub streaming_enabled: bool,
     pub authorize_url: Option<&'a str>,
+    pub report: crate::connection::Report,
 }
 
 pub(super) struct SettingRow {
@@ -749,7 +750,17 @@ pub(super) fn connection_page(chrome: &Chrome, view: &ConnectionView<'_>) -> Str
                     "La liste des véhicules de ce compte est indisponible."
                 }
             }
+            p { "Source des données : " strong { (view.report.data_source) } ". " (view.report.telemetry_note) }
             (party_card(&view.fleet))
+            section class="card" {
+                h2 { "Jeton Fleet" }
+                p {
+                    span class=(format!("chip {}", view.report.fleet_tone)) { (view.report.fleet_state) }
+                    " "
+                    (view.report.fleet_detail)
+                }
+                p { "Scopes : " (view.fleet.scopes) }
+            }
             section class="card" {
                 h2 { "Fleet API" }
                 div class="toolbar-actions" {
@@ -767,7 +778,62 @@ pub(super) fn connection_page(chrome: &Chrome, view: &ConnectionView<'_>) -> Str
                 }
             }
             section class="card" {
-                h2 { "Streaming Owner API" }
+                h2 { "Domaine partenaire" }
+                p {
+                    span class=(format!("chip {}", view.report.partner_tone)) { (view.report.partner_state) }
+                    " "
+                    (view.report.partner_detail)
+                }
+                @if view.report.show_partner_action {
+                    form method="post" action="/connection/partner" {
+                        input type="hidden" name="csrf" value=(view.csrf);
+                        (vehicle_field(view.vehicle_id))
+                        button type="submit" { "Enregistrer le domaine" }
+                    }
+                } @else {
+                    p class="muted" { "Un administrateur enregistre le domaine." }
+                }
+            }
+            section class="card" {
+                h2 { "Clé virtuelle" }
+                p { "Ouvrez ce lien dans l'application Tesla pour ajouter la clé sur la voiture." }
+                @if view.report.pairing_url.is_empty() {
+                    p { "Le domaine n'est pas utilisable pour un lien de clé." }
+                } @else {
+                    p { a href=(view.report.pairing_url) rel="noreferrer noopener" target="_blank" { (view.report.pairing_url) } }
+                    @if !view.report.pairing_qr.is_empty() {
+                        (maud::PreEscaped(view.report.pairing_qr.clone()))
+                    }
+                }
+            }
+            section class="card" {
+                h2 { "Télémétrie" }
+                @if view.report.vehicles.is_empty() {
+                    p { "Aucun véhicule sur ce compte." }
+                } @else {
+                    ul {
+                        @for car in &view.report.vehicles {
+                            li {
+                                strong { (car.name) }
+                                " — clé " (car.key_state)
+                                ", configuration " (car.config_state)
+                                ", flux " (car.stream_state)
+                                ", source " (car.source)
+                                "."
+                            }
+                        }
+                    }
+                }
+                @if view.report.show_telemetry_action {
+                    form method="post" action="/connection/telemetry" {
+                        input type="hidden" name="csrf" value=(view.csrf);
+                        (vehicle_field(view.vehicle_id))
+                        button type="submit" { "Renvoyer la configuration" }
+                    }
+                }
+            }
+            section class="card" {
+                h2 { "Streaming Owner API (ancien)" }
                 p { "Utilise l'Owner API et le socket de streaming historiques de Tesla. Ils sont non officiels et Tesla peut les retirer. Le polling Fleet reste la source pour le reste. Le stream ajoute environ une position par seconde en conduite." }
                 div class="meta" {
                     span class=(format!("chip {}", stream_tone(view.stream_status))) {
@@ -845,6 +911,11 @@ pub(super) fn connection_page(chrome: &Chrome, view: &ConnectionView<'_>) -> Str
             }
             section class="card" {
                 h2 { "Clé publique" }
+                p {
+                    span class=(format!("chip {}", view.report.public_key_tone)) { (view.report.public_key_state) }
+                    " "
+                    (view.report.public_key_detail)
+                }
                 dl class="facts" {
                     div { dt { "Empreinte" } dd { code { (view.fingerprint) } } }
                 }
@@ -1663,6 +1734,7 @@ mod tests {
                 authorize_url: Some(
                     "https://auth.tesla.com/oauth2/v3/authorize?client_id=ownerapi&redirect_uri=tesla%3A%2F%2Fauth%2Fcallback",
                 ),
+                report: crate::connection::Report::blank(),
             },
         );
         assert!(html.contains("tesla://auth/callback?"));
@@ -1693,6 +1765,83 @@ mod tests {
         assert!(html.contains("\"selected\":true"));
         assert!(html.contains("Connexion Tesla"));
         preview("connection.html", &html);
+    }
+
+    #[test]
+    fn connection_page_shows_each_component_with_one_action() {
+        let mut facts = crate::connection::Input {
+            now: chrono::Utc::now(),
+            fleet_present: false,
+            fleet_readable: true,
+            fleet_expires: None,
+            partner: crate::connection::PartnerState::Missing,
+            public_key_published: true,
+            domain: "logger.example".to_owned(),
+            telemetry_enabled: true,
+            fresh_for: std::time::Duration::from_secs(900),
+            is_admin: true,
+            vehicles: vec![crate::connection::VehicleInput {
+                name: "Faucon".to_owned(),
+                key: crate::connection::KeyState::Unpaired,
+                skip_reason: Some("missing_key".to_owned()),
+                config_pushed: false,
+                last_message_age: None,
+            }],
+        };
+        let _ = &mut facts;
+        let report = crate::connection::build(&facts);
+        let html = connection_page(
+            &Chrome {
+                section: Some(VehicleTab::Connection),
+                ..chrome()
+            },
+            &ConnectionView {
+                fleet: Party {
+                    title: "Compte Fleet".to_owned(),
+                    status: "déconnecté".to_owned(),
+                    tone: "bad",
+                    expires: "—".to_owned(),
+                    scopes: "—".to_owned(),
+                    last_refresh: "—".to_owned(),
+                    last_error: None,
+                    connected: false,
+                },
+                owner_status: "déconnecté".to_owned(),
+                owner_tone: "neutral",
+                owner_expires: "—".to_owned(),
+                owner_scopes: "—".to_owned(),
+                owner_last_refresh: "—".to_owned(),
+                owner_last_error: None,
+                owner_connected: false,
+                fingerprint: "sha256:abcd".to_owned(),
+                shared_names: Vec::new(),
+                shared_ok: true,
+                csrf: "csrf-token",
+                vehicle_id: None,
+                error: None,
+                notice: None,
+                stream_status: "disabled",
+                streaming_enabled: true,
+                authorize_url: None,
+                report,
+            },
+        );
+        assert!(html.contains("Absent"));
+        assert!(html.contains("Pas enregistré"));
+        assert!(html.contains("Publiée"));
+        assert!(html.contains("https://tesla.com/_ak/logger.example"));
+        assert!(html.contains("Pas appariée"));
+        assert!(html.contains("clé virtuelle absente"));
+        assert!(html.contains("Aucun message reçu"));
+        assert!(html.contains("Secours (interrogation)"));
+        assert!(html.contains("action=\"/connection/partner\""));
+        assert!(html.contains("action=\"/connection/telemetry\""));
+        assert!(html.contains("Enregistrer le domaine"));
+        assert!(html.contains("Renvoyer la configuration"));
+        assert!(html.contains("Streaming Owner API (ancien)"));
+        assert!(html.contains("name=\"csrf\" value=\"csrf-token\""));
+        assert!(html.contains("<svg"));
+        assert!(!html.contains("BEGIN EC PRIVATE KEY"));
     }
 
     #[test]
@@ -1785,6 +1934,7 @@ mod tests {
                 stream_status: "disabled",
                 streaming_enabled: false,
                 authorize_url: None,
+                report: crate::connection::Report::blank(),
             },
         );
         for (name, html) in [
@@ -1871,6 +2021,7 @@ mod tests {
                         stream_status: "disabled",
                         streaming_enabled: false,
                         authorize_url: None,
+                        report: crate::connection::Report::blank(),
                     },
                 ),
             ),
