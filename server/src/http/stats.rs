@@ -1323,6 +1323,7 @@ mod tests {
                     vehicles: Vec::new(),
                     remembered: None,
                     admin: true,
+                    sudo: false,
                     username: "admin".into(),
                 },
                 Some(vehicle),

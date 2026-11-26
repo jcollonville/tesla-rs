@@ -303,6 +303,8 @@ pub(crate) async fn upsert_vehicle(
     identity: VehicleIdentity<'_>,
     account_id: Option<i64>,
 ) -> Result<i64, AppError> {
+    // VIN is the unique vehicle key. `tesla_id` is not unique: a second car can
+    // carry the same Fleet id in fixtures, and overwriting the VIN would merge them.
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO vehicles (vin, tesla_id, legacy_vehicle_id, name, source, external_id, account_id)
          VALUES ($1, $2, $3, $4, 'fleet', $1, $5)
@@ -322,6 +324,37 @@ pub(crate) async fn upsert_vehicle(
     .fetch_one(pool)
     .await?;
     Ok(row.0)
+}
+
+/// Deletes one vehicle and the rows that belong to it. Shared addresses and
+/// geofences stay. The statement runs in one transaction.
+pub(crate) async fn delete_vehicle_data(pool: &PgPool, vehicle_id: i64) -> Result<bool, AppError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM import_links WHERE entity = 'car' AND local_id = $1")
+        .bind(vehicle_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM import_links
+         WHERE entity = 'drive' AND local_id IN (SELECT id FROM drives WHERE vehicle_id = $1)",
+    )
+    .bind(vehicle_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM import_links
+         WHERE entity = 'charge' AND local_id IN (SELECT id FROM charges WHERE vehicle_id = $1)",
+    )
+    .bind(vehicle_id)
+    .execute(&mut *tx)
+    .await?;
+    let removed = sqlx::query("DELETE FROM vehicles WHERE id = $1")
+        .bind(vehicle_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(removed == 1)
 }
 
 pub(crate) async fn load_runtime(
@@ -2456,6 +2489,7 @@ mod tests {
     use super::{DriveEndRepairReport, LiveEvent, format_drive_end_repair};
     use crate::state::{Observation, Presence};
     use crate::status::{at_secs, merge_stream};
+    use tesla_auth::TokenStore;
 
     #[test]
     fn drive_end_repair_report_lists_counts_and_ids_only() {
@@ -2543,5 +2577,219 @@ mod tests {
         assert!(value.get("outside_temp_c").is_none(), "{text}");
         assert!(!text.contains("null"), "{text}");
         assert_eq!(value["speed_kmh"], 42.0);
+    }
+
+    #[tokio::test]
+    async fn disconnect_keeps_trips_and_reconnect_does_not_duplicate_the_vehicle() {
+        let Some(db) = crate::test_util::TestDb::migrated("keep-data").await else {
+            return;
+        };
+        let fleet: (i64,) = sqlx::query_as(
+            "INSERT INTO tesla_accounts (label, kind, tokens, status)
+             VALUES ('Fleet', 'fleet', decode('010203', 'hex'), 'connected') RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let owner: (i64,) = sqlx::query_as(
+            "INSERT INTO tesla_accounts (label, kind, tokens, status)
+             VALUES ('Owner', 'owner', decode('040506', 'hex'), 'connected') RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let fleet_store =
+            crate::accounts::DbTokenStore::open(db.pool.clone(), fleet.0, Some("test-key"))
+                .unwrap();
+        let owner_store =
+            crate::accounts::DbTokenStore::open(db.pool.clone(), owner.0, Some("test-key"))
+                .unwrap();
+        let vin = "5YJ30000000000R01";
+        let id = super::upsert_vehicle(
+            &db.pool,
+            super::VehicleIdentity {
+                vin,
+                tesla_id: Some(4242),
+                legacy_vehicle_id: None,
+                name: Some("Faucon"),
+            },
+            Some(fleet.0),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO drives (vehicle_id, start_at, distance_km) VALUES ($1, now(), 12.5)",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO charges (vehicle_id, start_at, energy_added_kwh) VALUES ($1, now(), 8.0)",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO positions (vehicle_id, recorded_at, latitude, longitude)
+             VALUES ($1, '2024-06-01T12:00:00Z', 48.1, 2.2)",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        fleet_store.clear().await.unwrap();
+        owner_store.clear().await.unwrap();
+        let tokens: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM tesla_accounts WHERE id IN ($1, $2) AND tokens IS NULL AND status = 'disconnected'",
+        )
+        .bind(fleet.0)
+        .bind(owner.0)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(tokens.0, 2);
+        let again = super::upsert_vehicle(
+            &db.pool,
+            super::VehicleIdentity {
+                vin,
+                tesla_id: Some(4242),
+                legacy_vehicle_id: Some(7),
+                name: Some("Faucon"),
+            },
+            Some(fleet.0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, id);
+        let vehicles: (i64,) = sqlx::query_as("SELECT count(*) FROM vehicles WHERE vin = $1")
+            .bind(vin)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(vehicles.0, 1);
+        let drives: (i64,) = sqlx::query_as("SELECT count(*) FROM drives WHERE vehicle_id = $1")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let charges: (i64,) = sqlx::query_as("SELECT count(*) FROM charges WHERE vehicle_id = $1")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let positions: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM positions WHERE vehicle_id = $1")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!((drives.0, charges.0, positions.0), (1, 1, 1));
+
+        let other = super::upsert_vehicle(
+            &db.pool,
+            super::VehicleIdentity {
+                vin: "5YJ30000000000R02",
+                tesla_id: Some(4242),
+                legacy_vehicle_id: None,
+                name: Some("Autre"),
+            },
+            Some(fleet.0),
+        )
+        .await
+        .unwrap();
+        assert_ne!(other, id);
+        let rows: (i64,) = sqlx::query_as("SELECT count(*) FROM vehicles")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.0, 2);
+        let still: (i64,) = sqlx::query_as("SELECT count(*) FROM drives WHERE vehicle_id = $1")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(still.0, 1);
+        let vin_now: (String,) = sqlx::query_as("SELECT vin FROM vehicles WHERE id = $1")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(vin_now.0, vin);
+    }
+
+    #[tokio::test]
+    async fn delete_vehicle_removes_only_that_cars_rows() {
+        let Some(db) = crate::test_util::TestDb::migrated("delete-car").await else {
+            return;
+        };
+        for (vin, name) in [
+            ("5YJ30000000000D01", "Faucon"),
+            ("5YJ30000000000D02", "Millenium"),
+        ] {
+            let id = super::upsert_vehicle(
+                &db.pool,
+                super::VehicleIdentity {
+                    vin,
+                    tesla_id: None,
+                    legacy_vehicle_id: None,
+                    name: Some(name),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO drives (vehicle_id, start_at) VALUES ($1, now())")
+                .bind(id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO positions (vehicle_id, recorded_at, latitude, longitude)
+                 VALUES ($1, '2024-06-01T12:00:00Z', 48.1, 2.2)",
+            )
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO vehicle_settings (vehicle_id, key, value) VALUES ($1, 'note', '\"x\"')",
+            )
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        let first: (i64,) =
+            sqlx::query_as("SELECT id FROM vehicles WHERE vin = '5YJ30000000000D01'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(super::delete_vehicle_data(&db.pool, first.0).await.unwrap());
+        let left: (i64,) = sqlx::query_as("SELECT count(*) FROM vehicles")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(left.0, 1);
+        let drives: (i64,) = sqlx::query_as("SELECT count(*) FROM drives")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let positions: (i64,) = sqlx::query_as("SELECT count(*) FROM positions")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let settings: (i64,) = sqlx::query_as("SELECT count(*) FROM vehicle_settings")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!((drives.0, positions.0, settings.0), (1, 1, 1));
+        let name: (String,) = sqlx::query_as("SELECT name FROM vehicles")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(name.0, "Millenium");
+        assert!(!super::delete_vehicle_data(&db.pool, first.0).await.unwrap());
     }
 }

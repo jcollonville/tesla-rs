@@ -389,6 +389,7 @@ form.logout { margin: 0; flex: none; }
 }
 .chip.ok { background: var(--green-soft); color: var(--green); }
 .chip.bad { background: var(--danger-soft); color: var(--danger); }
+.chip.warn { background: rgba(194, 124, 14, 0.12); color: var(--amber); }
 .chip.dc { min-height: 20px; padding: 0 7px; background: var(--green-soft); color: var(--green); font-size: 0.6875rem; font-weight: 700; letter-spacing: 0.04em; }
 .chip.source { min-height: 22px; font-size: 0.75rem; color: var(--muted); }
 
@@ -527,6 +528,45 @@ ul.list li {
   border-top: 1px solid var(--line);
 }
 
+ol.setup { margin: 0; padding-left: 1.4rem; }
+ol.setup > li { margin: 0 0 calc(var(--space) * 2); padding-bottom: calc(var(--space) * 2); border-bottom: 1px solid var(--line); }
+.step-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.step-line h3 { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; font-size: 1rem; }
+.step-help { position: relative; display: inline-flex; }
+.step-help button.help {
+  width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 700;
+}
+.step-help button.help:hover, .step-help button.help:focus { background: var(--surface-3); }
+.help-tip {
+  position: absolute;
+  z-index: 3;
+  left: 0;
+  top: calc(100% + 6px);
+  width: min(320px, 70vw);
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.4;
+  color: var(--text);
+  visibility: hidden;
+}
+.step-help button:hover + .help-tip,
+.step-help button:focus + .help-tip,
+.step-help button:focus-visible + .help-tip { visibility: visible; }
+details.legacy { margin-top: calc(var(--space) * 3); }
+details.legacy > summary { color: var(--muted); cursor: pointer; }
+svg.check { display: block; }
 ol.steps { margin: 4px 0 calc(var(--space) * 2); padding-left: calc(var(--space) * 3); }
 ol.steps li { margin: var(--space) 0; }
 .steps {

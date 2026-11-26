@@ -16,7 +16,7 @@ use zeroize::Zeroize;
 
 use super::markup::{
     AccessLine, AuditLine, Chrome, ConnectionView, FleetCard, GlobalTab, NavVehicle, Overview,
-    Party, SessionLine, SettingRow, SetupStep, TokenLine, VehicleTab, connection_page, debug_page,
+    SessionLine, SettingRow, SetupStep, TokenLine, VehicleTab, connection_page, debug_page,
     fleet_page, login_page, missing_page, overview_page, security_page, settings_page, setup_page,
     system_page,
 };
@@ -50,6 +50,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/connection", get(account_connection))
         .route("/connection/partner", post(register_partner))
         .route("/connection/telemetry", post(resend_telemetry))
+        .route("/v/{id}/delete", post(delete_vehicle))
         .route("/settings", get(settings))
         .route("/settings/override", post(save_setting))
         .route("/debug", get(debug_page_handler))
@@ -112,6 +113,8 @@ pub(super) struct CsrfForm {
     pub(super) csrf: String,
     #[serde(default)]
     pub(super) vehicle_id: Option<i64>,
+    #[serde(default)]
+    pub(super) confirm: String,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +148,7 @@ pub(crate) struct Page {
     pub(crate) vehicles: Vec<VehicleRow>,
     pub(crate) remembered: Option<i64>,
     pub(crate) admin: bool,
+    pub(crate) sudo: bool,
     pub(crate) username: String,
 }
 
@@ -390,7 +394,8 @@ pub(super) async fn render_connection(
     let section = vehicle_id.map(|_| VehicleTab::Connection);
     let chrome = chrome(&page, vehicle_id, section, GlobalTab::None, false);
     let view = ConnectionView {
-        fleet: party("Compte Fleet", fleet_account.as_ref(), &fleet_token),
+        admin: page.admin,
+        sudo: page.sudo,
         owner_status: owner_account.as_ref().map_or_else(
             || {
                 if owner_token.present {
@@ -428,7 +433,8 @@ pub(super) async fn render_connection(
         stream_status: snapshot.summary(),
         streaming_enabled: app.inner.config.owner_stream_enabled,
         authorize_url: authorize_url.as_deref(),
-        report: connection_report(app, &page, account_id, fleet_token.present, &fleet_token).await,
+        report: connection_report(app, &page, account_id, &fleet_token, fleet_account.as_ref())
+            .await,
     };
     html_page(connection_page(&chrome, &view), page.cookie)
 }
@@ -437,13 +443,13 @@ async fn connection_report(
     app: &AppState,
     page: &Page,
     account_id: i64,
-    fleet_present: bool,
     fleet_token: &TokenPublic,
+    fleet_account: Option<&accounts::TeslaAccount>,
 ) -> crate::connection::Report {
     refresh_partner(app).await;
     let rows = named_vins(&app.inner.db, account_id).await;
-    let vins = rows.iter().map(|(_, vin)| vin.clone()).collect::<Vec<_>>();
-    if fleet_present {
+    let vins = rows.iter().map(|row| row.vin.clone()).collect::<Vec<_>>();
+    if fleet_token.present {
         refresh_pairing(app, &vins).await;
     }
     let (partner, pairing) = {
@@ -452,44 +458,63 @@ async fn connection_report(
     };
     let archive = &app.inner.archive;
     let mut vehicles = Vec::new();
-    for (name, vin) in rows {
+    for row in rows {
         let (skip_reason, config_pushed) = if let Some(target) = archive.telemetry.as_ref() {
             (
-                target.skip_reason(&vin).await,
-                target.is_configured(&vin).await,
+                target.skip_reason(&row.vin).await,
+                target.is_configured(&row.vin).await,
             )
         } else {
             (None, false)
         };
         vehicles.push(crate::connection::VehicleInput {
-            name,
+            id: row.id,
+            name: row.name,
             key: pairing
-                .get(&vin)
+                .get(&row.vin)
                 .copied()
                 .unwrap_or(crate::connection::KeyState::Unknown),
             skip_reason,
             config_pushed,
-            last_message_age: archive.telemetry_age(&vin).await,
+            last_message_age: archive.telemetry_age(&row.vin).await,
         });
     }
+    let secret_set = !tesla_auth::ExposeSecret::expose_secret(&app.inner.config.client_secret)
+        .trim()
+        .is_empty();
     crate::connection::build(&crate::connection::Input {
         now: Utc::now(),
-        fleet_present,
+        fleet_present: fleet_token.present,
         fleet_readable: fleet_token.readable,
         fleet_expires: fleet_token.expires_at,
+        scopes: fleet_token.scopes.clone(),
+        refresh_failed: fleet_account.is_some_and(|account| account.status == "error"),
         partner,
         public_key_published: app.inner.public_key_pem.contains("BEGIN PUBLIC KEY"),
         domain: app.inner.config.domain.clone(),
+        redirect_uri: app.inner.config.redirect_uri.clone(),
+        client_configured: !app.inner.config.client_id.trim().is_empty() && secret_set,
+        client_id: app.inner.config.client_id.clone(),
+        region: app.inner.config.region,
+        fingerprint: public_key_fingerprint(&app.inner.public_key_pem),
         telemetry_enabled: app.inner.config.telemetry_enabled,
+        telemetry_port: app.inner.config.telemetry_port,
         fresh_for: archive.telemetry_fresh_for,
         is_admin: page.admin,
         vehicles,
     })
 }
 
-async fn named_vins(pool: &sqlx::PgPool, account_id: i64) -> Vec<(String, String)> {
+#[derive(sqlx::FromRow)]
+struct NamedVin {
+    id: i64,
+    name: String,
+    vin: String,
+}
+
+async fn named_vins(pool: &sqlx::PgPool, account_id: i64) -> Vec<NamedVin> {
     sqlx::query_as(
-        "SELECT COALESCE(NULLIF(name, ''), 'Véhicule'), vin
+        "SELECT id, COALESCE(NULLIF(name, ''), 'Véhicule') AS name, vin
          FROM vehicles WHERE account_id = $1 ORDER BY id",
     )
     .bind(account_id)
@@ -685,11 +710,11 @@ async fn resend_telemetry(
     let rows = named_vins(&app.inner.db, app.inner.fleet_account_id).await;
     let vehicles = rows
         .into_iter()
-        .map(|(name, vin)| crate::ingest::Summary {
-            vin,
+        .map(|row| crate::ingest::Summary {
+            vin: row.vin,
             tesla_id: 0,
             legacy_vehicle_id: None,
-            name: Some(name),
+            name: Some(row.name),
             presence: crate::state::Presence::Online,
         })
         .collect::<Vec<_>>();
@@ -705,36 +730,6 @@ async fn resend_telemetry(
         .await;
     }
     Redirect::to(&connection_location(form.vehicle_id)).into_response()
-}
-
-fn party(fallback: &str, account: Option<&accounts::TeslaAccount>, token: &TokenPublic) -> Party {
-    let status = if !token.readable {
-        "illisible".to_owned()
-    } else if token.present {
-        account
-            .map(|account| account.status.clone())
-            .filter(|status| status != "unknown")
-            .unwrap_or_else(|| "connecté".to_owned())
-    } else {
-        "déconnecté".to_owned()
-    };
-    let title = account.map_or_else(
-        || fallback.to_owned(),
-        |account| format!("{} · {} #{}", account.label, account.kind, account.id),
-    );
-    Party {
-        title,
-        tone: token_tone(
-            token,
-            account.and_then(|account| account.last_error.as_deref()),
-        ),
-        expires: fmt_time(token.expires_at),
-        scopes: fmt_scopes(&token.scopes),
-        last_refresh: fmt_time(account.and_then(|account| account.last_refresh_at)),
-        last_error: account.and_then(|account| account.last_error.clone()),
-        connected: token.present,
-        status,
-    }
 }
 
 fn token_tone(token: &TokenPublic, error: Option<&str>) -> &'static str {
@@ -1925,19 +1920,179 @@ async fn disconnect(
     headers: HeaderMap,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    let Some(principal) = ui_session(&app, &headers).await else {
+    if ui_session(&app, &headers).await.is_none() || !csrf_ok(&headers, &form.csrf) {
         return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
-    };
-    if !csrf_ok(&headers, &form.csrf) || !principal.sudo_active() {
-        return (StatusCode::FORBIDDEN, "sudo required").into_response();
     }
-    if let Err(err) = app.inner.fleet_store.clear().await {
-        tracing::warn!(
-            error = %crate::logs::redact_line(&err.to_string(), &[]),
-            "could not clear tesla tokens"
-        );
+    if form.confirm != "disconnect" {
+        return render_connection(
+            &app,
+            &headers,
+            form.vehicle_id,
+            Some(
+                "Confirmez la déconnexion pour effacer les jetons. Les données des véhicules sont conservées.",
+            ),
+            None,
+        )
+        .await;
+    }
+    let rows = named_vins(&app.inner.db, app.inner.fleet_account_id).await;
+    stop_telemetry(&app, &rows).await;
+    if let Some(target) = app.inner.archive.telemetry.as_ref() {
+        let vins = rows.iter().map(|row| row.vin.clone()).collect::<Vec<_>>();
+        target.forget(&vins).await;
+    }
+    let fleet_cleared = match app.inner.fleet_store.clear().await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                error = %crate::logs::redact_line(&err.to_string(), &[]),
+                "could not clear fleet tokens"
+            );
+            false
+        }
+    };
+    let owner_cleared = if app.inner.owner_account_id > 0 {
+        match app.inner.owner_store.clear().await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    error = %crate::logs::redact_line(&err.to_string(), &[]),
+                    "could not clear owner tokens"
+                );
+                false
+            }
+        }
+    } else {
+        true
+    };
+    if app.inner.owner_account_id > 0 {
+        app.inner
+            .owner_tokens
+            .send_modify(|value| *value = value.wrapping_add(1));
+    }
+    app.inner.archive.gps.notify();
+    {
+        let mut cache = app.inner.links.lock().await;
+        cache.pairing.clear();
+        cache.pairing_at = None;
+    }
+    if !fleet_cleared || !owner_cleared {
+        return render_connection(
+            &app,
+            &headers,
+            form.vehicle_id,
+            Some(
+                "Les jetons n'ont pas tous été effacés. Les données des véhicules sont toujours là.",
+            ),
+            None,
+        )
+        .await;
     }
     Redirect::to(&connection_location(form.vehicle_id)).into_response()
+}
+
+async fn stop_telemetry(app: &AppState, rows: &[NamedVin]) {
+    if rows.is_empty() {
+        return;
+    }
+    let Ok(token) = app.inner.session.access_token().await else {
+        return;
+    };
+    let exposed = tesla_auth::ExposeSecret::expose_secret(&token);
+    let Ok(client) = tesla_fleet_api::FleetClient::for_region(
+        app.inner.config.region,
+        tesla_fleet_api::BearerToken::new(exposed),
+    ) else {
+        return;
+    };
+    for row in rows {
+        let Ok(tag) = tesla_fleet_api::VehicleTag::new(&row.vin) else {
+            continue;
+        };
+        if let Err(err) = client.delete_fleet_telemetry_config(&tag).await
+            && !matches!(err, tesla_fleet_api::FleetError::NotFound { .. })
+        {
+            tracing::warn!(
+                error = %crate::logs::redact_line(&err.to_string(), &[]),
+                "telemetry config was not removed"
+            );
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteForm {
+    csrf: String,
+    #[serde(default)]
+    confirm: String,
+}
+
+async fn delete_vehicle(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<DeleteForm>,
+) -> Response {
+    let Some(page) = signed_page(&app, &headers).await else {
+        return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
+    };
+    if !csrf_ok(&headers, &form.csrf) {
+        return (StatusCode::BAD_REQUEST, "csrf mismatch").into_response();
+    }
+    if !page.admin || !page.sudo {
+        return (StatusCode::FORBIDDEN, "sudo required").into_response();
+    }
+    if id <= 0 || !page.vehicles.iter().any(|vehicle| vehicle.id == id) {
+        return html_page(
+            missing_page(&chrome(&page, None, None, GlobalTab::None, false)),
+            page.cookie,
+        );
+    }
+    let typed = form.confirm.trim();
+    let stored: Option<(String,)> =
+        sqlx::query_as("SELECT COALESCE(NULLIF(name, ''), 'Véhicule') FROM vehicles WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&app.inner.db)
+            .await
+            .ok()
+            .flatten();
+    let Some((name,)) = stored else {
+        return html_page(
+            missing_page(&chrome(&page, None, None, GlobalTab::None, false)),
+            page.cookie,
+        );
+    };
+    if typed.is_empty() || typed.len() > 120 || name.trim() != typed {
+        return render_connection(
+            &app,
+            &headers,
+            Some(id),
+            Some("Le nom ne correspond pas. Aucune donnée n'a été supprimée."),
+            None,
+        )
+        .await;
+    }
+    match crate::persist::delete_vehicle_data(&app.inner.db, id).await {
+        Ok(true) => Redirect::to("/connection").into_response(),
+        Ok(false) => html_page(
+            missing_page(&chrome(&page, None, None, GlobalTab::None, false)),
+            page.cookie,
+        ),
+        Err(err) => {
+            tracing::warn!(
+                error = %crate::logs::redact_line(&err.to_string(), &[]),
+                "vehicle data was not deleted"
+            );
+            render_connection(
+                &app,
+                &headers,
+                Some(id),
+                Some("La suppression a échoué. Les autres véhicules n'ont pas été touchés."),
+                None,
+            )
+            .await
+        }
+    }
 }
 
 async fn fleet_refresh(
@@ -2145,6 +2300,7 @@ pub(crate) async fn signed_page(app: &AppState, headers: &HeaderMap) -> Option<P
     let remembered = principal.last_vehicle;
     let user_id = principal.user_id;
     let admin = principal.is_admin();
+    let sudo = principal.sudo_active();
     let username = principal.username;
     let csrf = ensure_csrf(app, headers).ok()?;
     let vehicles = match vehicle_rows(app, user_id, admin).await {
@@ -2164,6 +2320,7 @@ pub(crate) async fn signed_page(app: &AppState, headers: &HeaderMap) -> Option<P
         vehicles,
         remembered,
         admin,
+        sudo,
         username,
     })
 }
@@ -2902,5 +3059,152 @@ mod tests {
         let response = get(&app, "/auth/login", Some(&session)).await;
         assert!(response.status().is_redirection());
         assert!(!app.inner.pending.lock().await.contains_key(&expired));
+    }
+
+    async fn post_form(
+        app: &AppState,
+        uri: &str,
+        cookie: &str,
+        body: &str,
+    ) -> axum::response::Response {
+        router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn delete_requires_csrf_and_sudo_and_disconnect_keeps_the_other_car() {
+        let Some(db) = crate::test_util::TestDb::migrated("conn-guard").await else {
+            return;
+        };
+        let app = test_state(db.pool.clone()).await;
+        let login = get(&app, "/", None).await;
+        let csrf = set_cookie(login.headers(), "tl_csrf");
+        let posted = post_form(
+            &app,
+            "/",
+            &format!("tl_csrf={csrf}"),
+            &format!("password=test-password&csrf={csrf}"),
+        )
+        .await;
+        let session = set_cookie(posted.headers(), "__Host-tl_session");
+        sqlx::query("UPDATE users SET must_change_password = false, totp_enabled = true")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let cookie = format!("__Host-tl_session={session}; tl_csrf={csrf}");
+        for (vin, name) in [
+            ("5YJ30000000000D01", "Faucon"),
+            ("5YJ30000000000D02", "Millenium"),
+        ] {
+            let id: (i64,) =
+                sqlx::query_as("INSERT INTO vehicles (vin, name) VALUES ($1, $2) RETURNING id")
+                    .bind(vin)
+                    .bind(name)
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap();
+            sqlx::query("INSERT INTO drives (vehicle_id, start_at) VALUES ($1, now())")
+                .bind(id.0)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        let first: (i64,) = sqlx::query_as("SELECT id FROM vehicles WHERE name = 'Faucon'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let denied = post_form(
+            &app,
+            &format!("/v/{}/delete", first.0),
+            &cookie,
+            "csrf=not-the-cookie&confirm=Faucon",
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        let forbidden = post_form(
+            &app,
+            &format!("/v/{}/delete", first.0),
+            &cookie,
+            &format!("csrf={csrf}&confirm=Faucon"),
+        )
+        .await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        let count: (i64,) = sqlx::query_as("SELECT count(*) FROM drives")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 2);
+
+        sqlx::query("UPDATE sessions SET sudo_until = now() + interval '5 minutes'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let mismatch = post_form(
+            &app,
+            &format!("/v/{}/delete", first.0),
+            &cookie,
+            &format!("csrf={csrf}&confirm=Millenium"),
+        )
+        .await;
+        assert_eq!(mismatch.status(), StatusCode::OK);
+        let mismatch_body = body_string(mismatch).await;
+        assert!(mismatch_body.contains("ne correspond pas"));
+        let still: (i64,) = sqlx::query_as("SELECT count(*) FROM vehicles")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(still.0, 2);
+
+        let removed = post_form(
+            &app,
+            &format!("/v/{}/delete", first.0),
+            &cookie,
+            &format!("csrf={csrf}&confirm=Faucon"),
+        )
+        .await;
+        assert!(removed.status().is_redirection());
+        let names: Vec<(String,)> = sqlx::query_as("SELECT name FROM vehicles ORDER BY name")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].0, "Millenium");
+        let drives: (i64,) = sqlx::query_as("SELECT count(*) FROM drives")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(drives.0, 1);
+
+        let unconfirmed =
+            post_form(&app, "/auth/disconnect", &cookie, &format!("csrf={csrf}")).await;
+        assert_eq!(unconfirmed.status(), StatusCode::OK);
+        let kept: (i64,) = sqlx::query_as("SELECT count(*) FROM vehicles")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.0, 1);
+        let confirmed = post_form(
+            &app,
+            "/auth/disconnect",
+            &cookie,
+            &format!("csrf={csrf}&confirm=disconnect"),
+        )
+        .await;
+        assert!(confirmed.status().is_redirection());
+        let after: (i64,) = sqlx::query_as("SELECT count(*) FROM vehicles")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(after.0, 1);
     }
 }

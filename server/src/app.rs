@@ -218,10 +218,12 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
     let (owner_tokens, _) = watch::channel(0_u64);
     let debug = DebugBoard::new(logs.clone());
     debug.apply_config(&config);
-    let gps = crate::position_mode::GpsBoard::new(debug.clone(), Arc::new(Notify::new()));
+    let gps_wake = Arc::new(Notify::new());
+    let gps = crate::position_mode::GpsBoard::new(debug.clone(), Arc::clone(&gps_wake));
     let debug_saved = debug.clone();
     fleet_store.on_saved(std::sync::Arc::new(move |expires| {
         debug_saved.token_saved("fleet", expires);
+        gps_wake.notify_one();
     }));
     let owner_saved = debug.clone();
     owner_store.on_saved(std::sync::Arc::new(move |expires| {

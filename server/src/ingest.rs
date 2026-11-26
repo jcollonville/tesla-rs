@@ -470,6 +470,14 @@ impl TelemetryTarget {
         self.book.lock().await.last_error.clone()
     }
 
+    pub(crate) async fn forget(&self, vins: &[String]) {
+        self.drop_configured(vins).await;
+        let mut book = self.book.lock().await;
+        for vin in vins {
+            book.skipped.remove(vin);
+        }
+    }
+
     async fn due(&self) -> (bool, bool, std::collections::BTreeSet<String>) {
         let book = self.book.lock().await;
         (
@@ -1449,6 +1457,11 @@ async fn run_cycle(
     {
         return Ok(CycleControl::Pause(wait));
     }
+    if let Some(account_id) = account_id
+        && let Some(wait) = disconnected_account_wait(archive, account_id).await
+    {
+        return Ok(CycleControl::Wait(wait));
+    }
     let now_utc = policy_now(policy);
     let gate = crate::budget::gate(&archive.db, budget_query(policy, now_utc)).await;
     if let Some(wait) = gate.list_wait(now_utc) {
@@ -1578,6 +1591,17 @@ async fn note_rate_limit(archive: &Archive, account_id: Option<i64>, wait: Durat
         &format!("rate limited; retry after {}s", wait.as_secs()),
     )
     .await;
+}
+
+async fn disconnected_account_wait(archive: &Archive, account_id: i64) -> Option<Duration> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT status FROM tesla_accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_optional(&archive.db)
+        .await
+        .ok()
+        .flatten();
+    row.as_ref()
+        .and_then(|row| crate::connection::disconnected_poll_wait(&row.0))
 }
 
 pub(crate) async fn account_pause(archive: &Archive, account_id: i64) -> Option<Duration> {
