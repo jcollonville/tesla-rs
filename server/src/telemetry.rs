@@ -345,16 +345,18 @@ fn fold_datums(obs: &mut Observation, data: &[DecodedDatum], metric: bool) {
     }
     // AC and DC power can arrive together; the charger power is the larger of
     // the two in this payload, not the largest value ever folded.
-    let power = data
-        .iter()
-        .filter(|datum| {
-            matches!(
-                datum.field,
-                FieldKey::Known(Field::AcChargingPower | Field::DcChargingPower)
-            )
-        })
-        .filter_map(|datum| number(&datum.value))
-        .reduce(f64::max);
+    let ac = payload_power(data, Field::AcChargingPower);
+    let dc = payload_power(data, Field::DcChargingPower);
+    let power = match (ac, dc) {
+        (Some(ac), Some(dc)) => Some(ac.max(dc)),
+        (ac, dc) => ac.or(dc),
+    };
+    // Power through the on-board charger is AC; DC power is a fast charger.
+    if dc.is_some_and(|kw| kw > 0.0) {
+        obs.fast_charger = Some(true);
+    } else if ac.is_some_and(|kw| kw > 0.0) {
+        obs.fast_charger = Some(false);
+    }
     if let Some(power) = power {
         obs.charger_power_kw = Some(power);
     } else if !charging_label(obs.charging_state.as_deref()) {
@@ -369,6 +371,14 @@ fn fold_datums(obs: &mut Observation, data: &[DecodedDatum], metric: bool) {
         obs.charge_energy_added_kwh = None;
     }
     refresh_plugged_in(obs);
+}
+
+/// Largest finite value of one power field in this payload.
+fn payload_power(data: &[DecodedDatum], field: Field) -> Option<f64> {
+    data.iter()
+        .filter(|datum| datum.field == FieldKey::Known(field))
+        .filter_map(|datum| number(&datum.value))
+        .reduce(f64::max)
 }
 
 fn charging_label(state: Option<&str>) -> bool {
@@ -404,12 +414,6 @@ fn apply_field(obs: &mut Observation, field: FieldKey, value: &DatumValue, metri
         Field::ChargeState | Field::DetailedChargeState => {
             if let Some(label) = charge_label(value) {
                 obs.charging_state = Some(label.to_owned());
-            }
-        }
-        // Power is folded per payload in `fold_datums`.
-        Field::AcChargingPower | Field::DcChargingPower => {
-            if matches!(field, Field::DcChargingPower) && number(value).is_some_and(|kw| kw > 0.0) {
-                obs.fast_charger = Some(true);
             }
         }
         // AC energy is measured before the charger losses; only the battery-side
@@ -882,6 +886,47 @@ mod tests {
             Some(0.0),
             "power drops when charging stops"
         );
+    }
+
+    #[test]
+    fn charger_power_tells_ac_from_dc() {
+        use super::fold_datums;
+        use tesla_fleet_telemetry::proto::vehicle_data::{DetailedChargeStateValue, Field};
+
+        let mut obs = Observation::at(Utc::now(), Presence::Online);
+        fold_datums(
+            &mut obs,
+            &charge_payload(
+                DetailedChargeStateValue::DetailedChargeStateCharging,
+                &[(Field::AcChargingPower, 7.0)],
+            ),
+            true,
+        );
+        assert_eq!(obs.fast_charger, Some(false), "on-board charger");
+        fold_datums(
+            &mut obs,
+            &charge_payload(
+                DetailedChargeStateValue::DetailedChargeStateCharging,
+                &[
+                    (Field::AcChargingPower, 0.0),
+                    (Field::DcChargingPower, 95.0),
+                ],
+            ),
+            true,
+        );
+        assert_eq!(obs.fast_charger, Some(true), "fast charger");
+        fold_datums(
+            &mut obs,
+            &charge_payload(
+                DetailedChargeStateValue::DetailedChargeStateCharging,
+                &[
+                    (Field::AcChargingPower, 11.0),
+                    (Field::DcChargingPower, 0.0),
+                ],
+            ),
+            true,
+        );
+        assert_eq!(obs.fast_charger, Some(false), "back on AC");
     }
 
     #[test]

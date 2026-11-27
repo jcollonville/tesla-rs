@@ -2733,6 +2733,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(sources, vec![("telemetry".to_owned(),)]);
+        let (is_dc,): (Option<bool>,) = sqlx::query_as(
+            "SELECT c.is_dc FROM charges c JOIN vehicles v ON v.id = c.vehicle_id WHERE v.vin = $1",
+        )
+        .bind(vin)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(is_dc, Some(false), "a 7 kW telemetry charge is AC");
     }
 
     const EXCEEDED_LIMIT_BODY: &str =
