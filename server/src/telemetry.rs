@@ -889,7 +889,7 @@ mod replay_tests {
 
     use super::{Folded, handle_record};
     use crate::ingest::Archive;
-    use crate::persist::{StreamFix, VehicleIdentity};
+    use crate::persist::VehicleIdentity;
     use crate::test_util::TestDb;
 
     const VIN: &str = "TEST00000000VIN02";
@@ -904,13 +904,11 @@ mod replay_tests {
 
     fn archive(pool: sqlx::PgPool) -> Archive {
         let (events, _) = tokio::sync::broadcast::channel(64);
-        let (kick, _) = tokio::sync::broadcast::channel(8);
         Archive::new(
             pool,
             crate::geocode::Geocoder::disabled(),
             events,
-            kick,
-            crate::position_mode::GpsBoard::default(),
+            crate::drive_gps::GpsBoard::default(),
         )
     }
 
@@ -1028,29 +1026,17 @@ mod replay_tests {
                 .unwrap();
         }
 
-        async fn stream(
-            &self,
-            at: DateTime<Utc>,
-            shift: Option<&str>,
-            kmh: f64,
-            km: f64,
-            lat: f64,
-        ) {
-            let fix = StreamFix {
-                at,
-                shift_state: shift.map(str::to_owned),
-                speed_kmh: Some(kmh),
-                power_kw: Some(5.0),
-                odometer_km: Some(km),
-                battery_level: Some(80.0),
-                latitude: Some(lat),
-                longitude: Some(20.0),
-                elevation_m: None,
-                heading_deg: None,
-                rated_range_km: None,
-                est_range_km: None,
-            };
-            crate::ingest::apply_stream_for_vin(&self.archive, VIN, identity(), &fix)
+        /// A Fleet API `vehicle_data` poll while the car is awake.
+        async fn poll(&self, at: DateTime<Utc>, shift: Option<&str>, kmh: f64, km: f64, lat: f64) {
+            let mut obs = crate::state::Observation::at(at, crate::state::Presence::Online);
+            obs.shift_state = shift.map(str::to_owned);
+            obs.speed_kmh = Some(kmh);
+            obs.power_kw = Some(5.0);
+            obs.odometer_km = Some(km);
+            obs.battery_level = Some(80.0);
+            obs.latitude = Some(lat);
+            obs.longitude = Some(20.0);
+            crate::ingest::apply_for_vin(&self.archive, VIN, identity(), obs, true, false)
                 .await
                 .unwrap();
         }
@@ -1102,7 +1088,7 @@ mod replay_tests {
     }
 
     #[tokio::test]
-    async fn telemetry_opener_without_odometer_keeps_the_stream_drive() {
+    async fn telemetry_opener_without_odometer_keeps_the_polled_drive() {
         let Some(db) = TestDb::migrated("tdrop").await else {
             return;
         };
@@ -1124,14 +1110,13 @@ mod replay_tests {
             .await;
         let mut km = 1000.0;
         let mut latitude = 10.0;
-        for secs in 1..=600 {
-            km += 0.011;
-            latitude += 0.0001;
-            let shift = (secs % 60 == 0).then_some("D");
-            replay.stream(at(secs), shift, 40.0, km, latitude).await;
+        for secs in (30..=600).step_by(30) {
+            km += 0.33;
+            latitude += 0.003;
+            replay.poll(at(secs), Some("D"), 40.0, km, latitude).await;
         }
-        for secs in 601..=680 {
-            replay.stream(at(secs), Some("P"), 0.0, km, latitude).await;
+        for secs in (630..=720).step_by(30) {
+            replay.poll(at(secs), Some("P"), 0.0, km, latitude).await;
         }
         assert_eq!(
             drive_counts(&db.pool).await,
@@ -1145,9 +1130,9 @@ mod replay_tests {
         assert!(distance.0.is_some_and(|km| km > 6.0), "{distance:?}");
     }
 
-    /// Stream at 1 Hz and telemetry side by side, the car driving north.
-    /// A speed-only telemetry message must not store the 30 s old `Location`
-    /// at its own time: the track would jump back between two stream fixes.
+    /// Telemetry only, the car driving north: speed every 10 s, `Location`
+    /// every 30 s. A speed-only message must not store the 30 s old
+    /// `Location` at its own time.
     #[tokio::test]
     async fn telemetry_without_location_stores_no_stale_coordinates() {
         let Some(db) = TestDb::migrated("tstale").await else {
@@ -1159,10 +1144,6 @@ mod replay_tests {
         let latitude = |secs: i32| 10.0 + 0.0001 * f64::from(secs);
         replay.send(connected(at(0))).await;
         for secs in 0..=120_i32 {
-            let km = 1_000.0 + 0.011 * f64::from(secs);
-            replay
-                .stream(at(secs.into()), Some("D"), 40.0, km, latitude(secs))
-                .await;
             if secs % 10 == 0 {
                 let mut signals = vec![Signal::Gear(ShiftState::D), Signal::Speed(25.0)];
                 if secs % 30 == 0 {
@@ -1179,8 +1160,21 @@ mod replay_tests {
         .fetch_all(&db.pool)
         .await
         .unwrap();
-        let telemetry = track.iter().filter(|(_, source)| source == "telemetry");
-        assert!(telemetry.count() >= 8, "telemetry points are kept");
+        assert_eq!(
+            drive_counts(&db.pool).await,
+            (1, 0),
+            "telemetry opens the drive"
+        );
+        let located: Vec<f64> = track
+            .iter()
+            .filter(|(_, source)| source == "telemetry")
+            .filter_map(|(lat, _)| *lat)
+            .collect();
+        let expected: Vec<f64> = (0..=4).map(|step| latitude(step * 30)).collect();
+        assert_eq!(
+            located, expected,
+            "one point per Location message, none in between"
+        );
         let mut previous = f64::MIN;
         for (lat, source) in &track {
             let Some(lat) = lat else { continue };

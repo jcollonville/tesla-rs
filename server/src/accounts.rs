@@ -3,7 +3,7 @@
 
 //! Tesla accounts and the database token store.
 //!
-//! Phase 1 keeps a single Fleet row and a single Owner row. Callers still pass
+//! Phase 1 keeps a single Fleet row. Callers still pass
 //! an account id. Token files are imported once and then left untouched.
 
 use std::path::Path;
@@ -25,7 +25,6 @@ const IMPORT_LOCK: i64 = 842_175;
 
 pub(crate) struct ImportedAccounts {
     pub fleet_id: i64,
-    pub owner_id: i64,
 }
 
 #[derive(Clone, sqlx::FromRow)]
@@ -37,8 +36,6 @@ pub(crate) struct TeslaAccount {
     #[allow(dead_code)]
     pub kind: String,
     pub status: String,
-    pub last_refresh_at: Option<DateTime<Utc>>,
-    pub last_error: Option<String>,
 }
 
 #[derive(Clone, sqlx::FromRow)]
@@ -256,20 +253,12 @@ pub(crate) async fn import_token_files(
         key.as_ref(),
     )
     .await?;
-    let owner_id = import_one(
-        &mut tx,
-        "owner",
-        "Owner",
-        &config.owner_token_store_path,
-        key.as_ref(),
-    )
-    .await?;
     sqlx::query("UPDATE vehicles SET account_id = $1 WHERE account_id IS NULL")
         .bind(fleet_id)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(ImportedAccounts { fleet_id, owner_id })
+    Ok(ImportedAccounts { fleet_id })
 }
 
 pub(crate) async fn load_account(
@@ -280,7 +269,7 @@ pub(crate) async fn load_account(
         return Ok(None);
     }
     let row = sqlx::query_as::<_, TeslaAccount>(
-        "SELECT id, label, kind, status, last_refresh_at, last_error
+        "SELECT id, label, kind, status
          FROM tesla_accounts WHERE id = $1",
     )
     .bind(account_id)
@@ -550,10 +539,6 @@ mod tests {
             dir.join("tokens.json").display().to_string(),
         );
         map.insert(
-            "TESLA_OWNER_TOKEN_STORE_PATH".to_owned(),
-            dir.join("owner-tokens.json").display().to_string(),
-        );
-        map.insert(
             "TESLA_LOGGER_UI_PASSWORD".to_owned(),
             "ui-secret".to_owned(),
         );
@@ -592,7 +577,6 @@ mod tests {
         let config = config_for(&dir);
         let imported = import_token_files(&db.pool, &config).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert!(!dir.join("owner-tokens.json").exists());
 
         let fleet_count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM tesla_accounts WHERE kind = 'fleet'")
@@ -605,7 +589,10 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(fleet_count.0, 1);
-        assert_eq!(owner_count.0, 1);
+        assert_eq!(
+            owner_count.0, 0,
+            "the removed Owner stream no longer imports an account"
+        );
 
         let stored: (Vec<u8>,) = sqlx::query_as("SELECT tokens FROM tesla_accounts WHERE id = $1")
             .bind(imported.fleet_id)
@@ -627,7 +614,6 @@ mod tests {
         std::fs::write(&path, b"{\"access_token\":\"other-secret-access\"}").unwrap();
         let again = import_token_files(&db.pool, &config).await.unwrap();
         assert_eq!(again.fleet_id, imported.fleet_id);
-        assert_eq!(again.owner_id, imported.owner_id);
         let fleet_count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM tesla_accounts WHERE kind = 'fleet'")
                 .fetch_one(&db.pool)

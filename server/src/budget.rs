@@ -5,7 +5,7 @@
 //!
 //! Tesla bills that endpoint at $1 per 500 calls. HTTP 408 and other 4xx
 //! responses are billed too. The daily and monthly caps stop further
-//! `vehicle_data` calls. The vehicle list and the Owner stream are not capped.
+//! `vehicle_data` calls. The vehicle list and Fleet Telemetry are not capped.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -78,10 +78,10 @@ impl PauseKind {
     pub(crate) const fn debug_banner(self) -> &'static str {
         match self {
             Self::DailyCap => {
-                "vehicle_data is paused: the daily Fleet API cap is reached. The vehicle list and the Owner stream keep running."
+                "vehicle_data is paused: the daily Fleet API cap is reached. The vehicle list and Fleet Telemetry keep running."
             }
             Self::MonthlyCap => {
-                "vehicle_data is paused: the monthly Fleet API cap is reached. The vehicle list and the Owner stream keep running."
+                "vehicle_data is paused: the monthly Fleet API cap is reached. The vehicle list and Fleet Telemetry keep running."
             }
             Self::Billing => {
                 "vehicle_data is paused: Tesla billing limit. A periodic probe checks whether the block has lifted."
@@ -93,10 +93,10 @@ impl PauseKind {
     pub(crate) const fn system_banner(self) -> &'static str {
         match self {
             Self::DailyCap => {
-                "vehicle_data est suspendu : plafond journalier atteint. La liste des véhicules et le stream Owner continuent."
+                "vehicle_data est suspendu : plafond journalier atteint. La liste des véhicules et Fleet Telemetry continuent."
             }
             Self::MonthlyCap => {
-                "vehicle_data est suspendu : plafond mensuel atteint. La liste des véhicules et le stream Owner continuent."
+                "vehicle_data est suspendu : plafond mensuel atteint. La liste des véhicules et Fleet Telemetry continuent."
             }
             Self::Billing => {
                 "vehicle_data est suspendu : limite de facturation Tesla. Un test périodique vérifie si le blocage est levé."

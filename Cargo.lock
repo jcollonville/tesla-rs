@@ -3196,7 +3196,6 @@ dependencies = [
  "tesla-auth",
  "tesla-fleet-api",
  "tesla-fleet-telemetry",
- "tesla-owner-api",
  "tesla-vehicle-command",
  "thiserror 2.0.21",
  "tokio",

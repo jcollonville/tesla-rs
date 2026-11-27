@@ -2,14 +2,14 @@
 
 Unofficial Rust libraries for Tesla's [Fleet API](https://developer.tesla.com/docs/fleet-api), plus a self-hosted logger. This project is not affiliated with, endorsed by, or sponsored by Tesla, Inc.
 
-The library crates are written to be reused by other programs. They do not depend on the logger. The example binaries call those crates and read the process environment. `tesla-logger` (`server/`) is a separate program: it stores drives, charges, and vehicle state in Postgres, polls the Fleet API, and can optionally receive Fleet Telemetry, publish MQTT, and open the unofficial Owner API stream.
+The library crates are written to be reused by other programs. They do not depend on the logger. The example binaries call those crates and read the process environment. `tesla-logger` (`server/`) is a separate program: it stores drives, charges, and vehicle state in Postgres, polls the Fleet API, and can optionally receive Fleet Telemetry, and publish MQTT.
 
 ## Crates
 
 | Path | Crate | Status | License |
 | --- | --- | --- | --- |
 | `crates/tesla-auth` | OAuth 2.0 authorization code with PKCE, refresh, partner tokens, token storage | implemented | MIT OR Apache-2.0 |
-| `crates/tesla-owner-api` | Unofficial Owner API login and the legacy streaming websocket | implemented | MIT OR Apache-2.0 |
+| `crates/tesla-owner-api` | Unofficial Owner API login and the legacy streaming websocket. The logger no longer uses it | implemented | MIT OR Apache-2.0 |
 | `crates/tesla-fleet-api` | Async Fleet API client (vehicles, live and cached data, wake, fleet status, telemetry config, charging history, partner registration) | implemented | MIT OR Apache-2.0 |
 | `crates/tesla-vehicle-command` | Virtual key, session handshake, and signed vehicle commands | implemented | MIT OR Apache-2.0 |
 | `crates/tesla-fleet-telemetry` | Fleet Telemetry protobuf decoding and mutual-TLS websocket receiver | implemented | MIT OR Apache-2.0 |
@@ -97,8 +97,6 @@ Register every redirect URI you will actually use. The examples and the logger u
 | `tesla-logger` Fleet login | `https://<TESLA_DOMAIN>/auth/callback` |
 
 The logger always builds that Fleet redirect as `https://` plus `TESLA_DOMAIN` plus `/auth/callback`. `TESLA_PUBLIC_BASE_URL` does not change it.
-
-Owner API streaming does not use this application. It uses Tesla's public `ownerapi` client, whose redirect is `tesla://auth/callback` on both `auth.tesla.com` and `auth.tesla.cn`. You do not register that URI on your Fleet application.
 
 Copy the application's client id and client secret into the environment variables below. Use your own values. Do not commit them, and do not paste them into chat or tickets.
 
@@ -225,19 +223,17 @@ Optional:
 | --- | --- | --- |
 | `TESLA_PUBLIC_BASE_URL` | `https://<TESLA_DOMAIN>` | `https://` origin, or `http://` on `localhost`, `127.0.0.1`, or `::1`. The UI session cookie is marked `Secure` when this starts with `https://` |
 | `TESLA_LISTEN_ADDR` | `0.0.0.0:4000` | HTTP listen socket |
-| `TESLA_TOKEN_ENCRYPTION_KEY` | unset | Encrypts the Fleet token file and the Owner token file with AES-256-GCM. 64 hex characters are the raw key. Any other value is hashed with SHA-256 |
+| `TESLA_TOKEN_ENCRYPTION_KEY` | unset | Encrypts the Fleet token file with AES-256-GCM. 64 hex characters are the raw key. Any other value is hashed with SHA-256 |
 | `TESLA_LOGGER_ENV_FILE` | `.env` | Dotenv path. Relative to the current directory |
-| `TESLA_OWNER_TOKEN_STORE_PATH` | `owner-tokens.json` next to `TESLA_TOKEN_STORE_PATH` | Owner API token file. Same encryption key |
-| `OWNER_STREAM_ENABLED` | `true` | `true`/`false`, `1`/`0`, `yes`/`no`, or `on`/`off`. `false` keeps a saved Owner token and does not connect |
-| `POLL_DRIVE_FALLBACK_SECS` | `120` | `vehicle_data` interval while driving if the Owner stream is down or the last `data:update` is older than 90 seconds. 60–3600. The old 15 second drive cadence is not used |
+| `POLL_DRIVE_FALLBACK_SECS` | `120` | `vehicle_data` interval while driving without fresh Fleet Telemetry. 60–3600. The old 15 second drive cadence is not used |
 | `POLL_CHARGE_SECS` | `900` | Poll interval while charging, and only in polling mode. 60–86400. Telemetry mode does not poll `vehicle_data` on this interval |
 | `POLL_PARKED_SECS` | `1800` | Kept for compatibility. Parked `vehicle_data` is not scheduled from this value |
 | `POLL_ASLEEP_SECS` | `1800` | How often to read asleep/offline presence from the vehicle list. 1800–86400. The list does not wake the car |
 | `POLL_BACKOFF_SECS` | `1800` | Idle gap after a parked `vehicle_data` snapshot, and between later presence checks. 1800–86400. A live `vehicle_data` call resets Tesla's sleep timer, so this stays at least 30 minutes |
 | `POLL_PARKED_LIVE_LIMIT` | `1` | Live `vehicle_data` snapshots after the car is parked, or after it comes back online. Further cycles only list the vehicle |
-| `POLL_GPS_FALLBACK_SECS` | `300` | Minimum gap between `source=poll` drive positions while the Owner stream is down or stale. The `vehicle_data` call itself follows `POLL_DRIVE_FALLBACK_SECS` and counts toward the caps |
+| `POLL_GPS_FALLBACK_SECS` | `300` | Minimum gap between `source=poll` drive positions without fresh Fleet Telemetry. The `vehicle_data` call itself follows `POLL_DRIVE_FALLBACK_SECS` and counts toward the caps |
 | `POLL_TELEMETRY_FALLBACK_SECS` | `3600` | One `vehicle_data` read when telemetry mode is on but no fresh record has arrived, and only while the car is online. 1800–86400 |
-| `FLEET_DATA_DAILY_CAP` | `160` | UTC-day cap on `vehicle_data`, including HTTP 408 and other 4xx. 0–160. At the cap, `vehicle_data` stops; the vehicle list and the Owner stream continue. `charge_status` becomes `unknown` instead of `unplugged` |
+| `FLEET_DATA_DAILY_CAP` | `160` | UTC-day cap on `vehicle_data`, including HTTP 408 and other 4xx. 0–160. At the cap, `vehicle_data` stops; the vehicle list and Fleet Telemetry continue. `charge_status` becomes `unknown` instead of `unplugged` |
 | `FLEET_DATA_MONTHLY_CAP` | `5000` | UTC-month cap. 0–1000000, and at least `FLEET_DATA_DAILY_CAP`. 5000 calls is the $10 credit at 500 calls per dollar |
 | `FLEET_DATA_DYNAMIC_BUDGET` | `true` | When true, the effective daily cap is the remaining monthly credit divided by the days left in the UTC month, and never above `FLEET_DATA_DAILY_CAP` |
 | `FLEET_DATA_MONTH_SEED` | `0` | Calls added to the stored month total. Use this for usage from before `fleet_usage` existed. It is added to the rows already stored, so count only the missing calls |
@@ -310,7 +306,6 @@ TESLA_PRIVATE_KEY_PATH=server/private-key.pem
 TESLA_TOKEN_STORE_PATH=server/tokens.json
 TESLA_LOGGER_UI_PASSWORD='choose-a-password'
 TESLA_LISTEN_ADDR=127.0.0.1:4000
-OWNER_STREAM_ENABLED=true
 NOMINATIM_ENABLED=true
 MQTT_ENABLED=false
 TELEMETRY_ENABLED=false
@@ -330,7 +325,7 @@ That is the `serve` command. `cargo run -p tesla-logger -- serve` is the same. T
 
 Leave `TELEMETRY_ENABLED=false` to stay on the sleep-safe polling schedule. Polling never calls `wake_up`. After the car parks it takes at most `POLL_PARKED_LIVE_LIMIT` (default 1) `vehicle_data` snapshots, then only `GET /api/1/vehicles`, at `POLL_BACKOFF_SECS` (default 30 minutes). A live `vehicle_data` call resets Tesla's sleep timer. The `endpoints` query is still that live call, so it is billed and can wake the car. Tesla documents `vehicle_data_cached` as a non-waking cache, and does not list it as free, so the idle path does not use it.
 
-To switch to telemetry, set `TELEMETRY_ENABLED=true`, `TELEMETRY_CERT_PATH`, and `TELEMETRY_KEY_PATH`. Put the certificate's hostname in `TELEMETRY_HOSTNAME` (default `TESLA_DOMAIN`) and publish `TELEMETRY_PORT` (default the bind port) so the car can reach the receiver. The car dials that port with mutual TLS. Do not put an HTTP reverse proxy in front of it. On startup the logger signs and posts a fleet telemetry config for the account vehicles: charge state (`DetailedChargeState` and `ChargeState`), the charge schedule fields, gear, location, speed, odometer, and state of charge, with `minimum_delta` on the numeric signals. Signing uses `TELEMETRY_PROXY_URL` when set (the official `tesla-http-proxy`, which holds the application private key). Otherwise the logger signs a `Tesla.SS256` JWS with `TESLA_PRIVATE_KEY_PATH` and posts `fleet_telemetry_config_jws`. A VIN is remembered only when Tesla accepts it. `skipped_vehicles` is logged and returned as `telemetry_skip_reason` on the state API. If a later read shows the config is gone, it is sent again with backoff, and not while the Fleet data budget is paused. While records are fresher than `TELEMETRY_FRESH_SECS`, `vehicle_data` is not polled, including during a charge. If the stream goes quiet and the car is online, one `vehicle_data` read runs every `POLL_TELEMETRY_FALLBACK_SECS` (default 1 hour) and counts toward the caps. `data_source` is `telemetry` only after a message inside `TELEMETRY_FRESH_SECS`, and `polling` otherwise. Owner streaming is unchanged.
+To switch to telemetry, set `TELEMETRY_ENABLED=true`, `TELEMETRY_CERT_PATH`, and `TELEMETRY_KEY_PATH`. Put the certificate's hostname in `TELEMETRY_HOSTNAME` (default `TESLA_DOMAIN`) and publish `TELEMETRY_PORT` (default the bind port) so the car can reach the receiver. The car dials that port with mutual TLS. Do not put an HTTP reverse proxy in front of it. On startup the logger signs and posts a fleet telemetry config for the account vehicles: charge state (`DetailedChargeState` and `ChargeState`), the charge schedule fields, gear, location, speed, odometer, and state of charge, with `minimum_delta` on the numeric signals. Signing uses `TELEMETRY_PROXY_URL` when set (the official `tesla-http-proxy`, which holds the application private key). Otherwise the logger signs a `Tesla.SS256` JWS with `TESLA_PRIVATE_KEY_PATH` and posts `fleet_telemetry_config_jws`. A VIN is remembered only when Tesla accepts it. `skipped_vehicles` is logged and returned as `telemetry_skip_reason` on the state API. If a later read shows the config is gone, it is sent again with backoff, and not while the Fleet data budget is paused. While records are fresher than `TELEMETRY_FRESH_SECS`, `vehicle_data` is not polled, including during a charge. If the stream goes quiet and the car is online, one `vehicle_data` read runs every `POLL_TELEMETRY_FALLBACK_SECS` (default 1 hour) and counts toward the caps. `data_source` is `telemetry` only after a message inside `TELEMETRY_FRESH_SECS`, and `polling` otherwise.
 
 Plugged and charging status comes from `vehicle_data` `charge_state` in polling mode and from `DetailedChargeState` (with `ChargeState` as a fallback) in telemetry mode. If `vehicle_data` is paused and telemetry is not fresh, `charge_status` is `unknown` and `charge_status_stale` is true.
 
@@ -344,28 +339,9 @@ A missing required variable exits with `error: missing environment variable <NAM
 
 The status page can also create an API token. It is shown once and has the form `tl_...`. Send it as `Authorization: Bearer tl_...`. The WebSocket also accepts `access_token` in the query string; prefer the header so proxy logs do not store it.
 
-#### Owner API streaming
+#### Owner API stream (removed)
 
-Fleet polling does not use the Owner API token. The stream is optional and unofficial. The socket is `wss://streaming.vn.teslamotors.com/streaming/`, or `wss://streaming.vn.cloud.tesla.cn/streaming/` when `TESLA_FLEET_AUDIENCE` is the China Fleet URL. Tesla can change or remove it. When it is disconnected, the logger keeps polling.
-
-The public Owner API client redirects to `tesla://auth/callback`. It does not use `https://auth.tesla.com/void/callback`. A normal browser cannot open `tesla://`.
-
-1. Sign in to the logger.
-2. Open **Set up streaming**.
-3. Choose **Prepare Tesla sign-in** once. Open the Tesla link and sign in with the account that owns the car. China accounts (`TESLA_FLEET_AUDIENCE` on `fleet-api.prd.cn.vn.cloud.tesla.cn`) use `auth.tesla.cn`. Every other audience uses `auth.tesla.com`.
-4. The browser may say the address is not understood, the site cannot be reached, or offer to open the Tesla app. Do not open the Tesla app.
-5. Copy the full URL from the address bar, the browser console, or the failed navigation in the Network tab. It starts with `tesla://auth/callback?code=…&state=…`. A bare `code=…&state=…` query string is also accepted.
-6. Paste that URL into **Redirect URL** on the logger page and choose **Save sign-in**. The field is a password field so the authorization code is not displayed. The code in that URL is a secret: paste it only into this form.
-
-**Prepare Tesla sign-in** stores a single pending login for 10 minutes. Choosing it again replaces that login. Pasting the URL from the first attempt then fails with "Owner API sign-in failed. Prepare it again and paste the full redirect URL." Prepare once, finish that sign-in, and prepare again only after the page tells you to.
-
-A refresh token created for this logger can be pasted into **Owner API refresh token** instead. Do not reuse a TeslaMate refresh token. Tesla rotates refresh tokens, and using TeslaMate's token here can sign TeslaMate out. The Fleet API login is a separate token.
-
-Cars for the stream come from `GET /api/1/products`. Products without a vehicle id (Powerwall, solar) are skipped. `GET /api/1/vehicles` returns HTTP 412 for this client and is not used. If the products call fails, cars already stored with a legacy vehicle id are used.
-
-The stream chip, and `stream_status` on `GET /api/v1/vehicles/{id}/state`, become `connected` once the subscribe frame has been written, including while the car is parked and Tesla sends only hello or ping frames. They are `error` while a car is still connecting or reconnecting, and `disabled` when `OWNER_STREAM_ENABLED` is false or no Owner token is stored. `stream_error` is a short class such as `timeout` or `auth` and does not contain a token.
-
-No restart is required after saving or disconnecting. `OWNER_STREAM_ENABLED=false` stops connecting and keeps the token file.
+The logger no longer opens the unofficial Owner API stream. Drive GPS comes from Fleet Telemetry (`Location` every 3 seconds, after a 5 metre move) or, without fresh telemetry, from `vehicle_data` polls. Drives recorded with the stream keep their `source = 'stream'` positions and are still drawn. `OWNER_STREAM_ENABLED` and `TESLA_OWNER_TOKEN_STORE_PATH` are ignored with a startup warning; remove them from `.env`.
 
 `/logs` shows recent lines from this process after you are signed in. Passwords, tokens, authorization headers, and subscribe frames are redacted. The list is in memory (400 lines) and is empty after a restart.
 
@@ -386,7 +362,6 @@ Compose reads `server/.env` (the `env_file` path is relative to the compose file
 | `DATABASE_URL` | `postgres://tesla_logger:<POSTGRES_PASSWORD>@postgres:5432/tesla_logger` |
 | `TESLA_LISTEN_ADDR` | `0.0.0.0:4000` |
 | `TESLA_TOKEN_STORE_PATH` | `/data/tokens.json` |
-| `TESLA_OWNER_TOKEN_STORE_PATH` | `/data/owner-tokens.json` |
 | `TESLA_PRIVATE_KEY_PATH` | `/keys/private-key.pem` |
 
 `POSTGRES_PASSWORD` in `server/.env` is the Postgres role password. It defaults to `change-me` when unset. The `DATABASE_URL` line in that file is not the URL the container uses; the override above is. The host port is `4000`. Postgres is not published to the host.
@@ -480,9 +455,6 @@ A successful run prints one line per vehicle (`name`, VIN, state) or `no vehicle
 | UI password submits and the sign-in form comes back, with no "Incorrect password" | `TESLA_PUBLIC_BASE_URL` is `https://…`, so the session cookie is `Secure`, and you opened the plain HTTP listener. For `http://127.0.0.1:4000` set `TESLA_PUBLIC_BASE_URL=http://127.0.0.1:4000`. |
 | `sign in to the logger first` on `/auth/callback` | The Fleet callback arrived without a logger UI session. |
 | `unknown oauth state` on `/auth/callback` | This process did not start that login, or it has restarted since. Use **Connect Tesla** again. |
-| Owner page: "Prepare the Tesla sign-in again, then paste the redirect URL." | **Save sign-in** ran with no pending login. |
-| Owner page: "That sign-in expired. Prepare it again." | The pending login is older than 10 minutes. |
-| Owner page: "Owner API sign-in failed. Prepare it again and paste the full redirect URL." | The pasted URL's `state` does not match the pending login (including a second click of **Prepare Tesla sign-in**), or the URL is not the full redirect. Prepare once more and paste the URL from that attempt. |
 | `token file is encrypted; set TESLA_TOKEN_ENCRYPTION_KEY` | The token file was written with an encryption key and the current process has none. |
 | `/logs` returns you to the sign-in page | There is no UI session. Sign in on `/` first. |
 | Telemetry log: `telemetry is enabled but TELEMETRY_CERT_PATH or TELEMETRY_KEY_PATH is missing` | `TELEMETRY_ENABLED` is true and one path is unset. The HTTP server still runs; the telemetry listener does not. |

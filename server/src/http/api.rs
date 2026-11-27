@@ -116,11 +116,6 @@ pub(crate) async fn vehicle_state(
                 .to_owned(),
         );
     }
-    let snapshot = app.inner.stream_board.snapshot().await;
-    let (status, error) = snapshot.for_vehicle(id);
-    row.stream_status = status;
-    row.stream_error = error;
-    row.position_mode = app.inner.archive.gps.mode_name(id).await;
     Ok(Json(row))
 }
 
@@ -461,8 +456,6 @@ pub(crate) async fn ws(
     let events = app.inner.events.subscribe();
     let live = LiveSocket {
         db: app.inner.db.clone(),
-        board: app.inner.stream_board.clone(),
-        gps: app.inner.archive.gps.clone(),
         archive: std::sync::Arc::clone(&app.inner.archive),
         budget_blocked: crate::budget::gate(&app.inner.db, budget_query(&app, Utc::now()))
             .await
@@ -474,8 +467,6 @@ pub(crate) async fn ws(
 
 struct LiveSocket {
     db: sqlx::PgPool,
-    board: crate::owner_stream::StreamBoard,
-    gps: crate::position_mode::GpsBoard,
     archive: std::sync::Arc<crate::ingest::Archive>,
     budget_blocked: bool,
     allowed: Option<Vec<i64>>,
@@ -488,8 +479,6 @@ async fn handle_socket(
 ) {
     let LiveSocket {
         db,
-        board,
-        gps,
         archive,
         budget_blocked,
         allowed,
@@ -510,8 +499,6 @@ async fn handle_socket(
             rows.retain(|row| ids.contains(&row.state.vehicle_id));
         }
         for mut row in rows {
-            let snapshot = board.snapshot().await;
-            let (status, error) = snapshot.for_vehicle(row.state.vehicle_id);
             let fresh = !budget_blocked || telemetry_fresh(&archive, row.state.vehicle_id).await;
             annotate_charge_status(&mut row.state, fresh);
             row.state.data_source = archive.reported_data_source(&row.vin).await.to_owned();
@@ -533,9 +520,6 @@ async fn handle_socket(
                     .code()
                     .to_owned(),
             );
-            row.state.stream_status = status;
-            row.state.stream_error = error;
-            row.state.position_mode = gps.mode_name(row.state.vehicle_id).await;
             let payload = serde_json::json!({
                 "type": "state",
                 "vin": row.vin,
@@ -584,25 +568,7 @@ async fn handle_socket(
                         let Ok(mut value) = serde_json::to_value(&event) else {
                             continue;
                         };
-                        let snapshot = board.snapshot().await;
-                        let (status, error) = snapshot.for_vehicle(event.vehicle_id);
-                        let position_mode = gps.mode_name(event.vehicle_id).await;
                         if let Some(object) = value.as_object_mut() {
-                            object.insert(
-                                "stream_status".to_owned(),
-                                serde_json::Value::String(status),
-                            );
-                            object.insert(
-                                "position_mode".to_owned(),
-                                serde_json::Value::String(position_mode),
-                            );
-                            object.insert(
-                                "stream_error".to_owned(),
-                                match error {
-                                    Some(text) => serde_json::Value::String(text),
-                                    None => serde_json::Value::Null,
-                                },
-                            );
                             object.insert(
                                 "data_source".to_owned(),
                                 serde_json::Value::String(
@@ -914,17 +880,6 @@ pub(crate) struct StateJson {
     pub elevation_m: Option<f64>,
     pub battery_heater_on: Option<bool>,
     pub is_preconditioning: Option<bool>,
-    /// Owner API streaming socket: `connected`, `disabled`, or `error`.
-    #[sqlx(default)]
-    #[serde(default = "default_stream_status")]
-    pub stream_status: String,
-    /// Short error class when [`Self::stream_status`] is `error`. Never a token.
-    #[sqlx(default)]
-    pub stream_error: Option<String>,
-    /// `hybrid` when the Owner stream is writing drive GPS, otherwise `fallback`.
-    #[sqlx(default)]
-    #[serde(default = "default_position_mode")]
-    pub position_mode: String,
 }
 
 fn annotate_charge_status(state: &mut StateJson, reading_fresh: bool) {
@@ -975,14 +930,6 @@ async fn vehicle_vin(pool: &sqlx::PgPool, id: i64) -> Option<String> {
         .await
         .ok()
         .flatten()
-}
-
-fn default_stream_status() -> String {
-    "disabled".to_owned()
-}
-
-fn default_position_mode() -> String {
-    "fallback".to_owned()
 }
 
 impl StateJson {
@@ -1053,9 +1000,6 @@ impl StateJson {
             elevation_m: None,
             battery_heater_on: None,
             is_preconditioning: None,
-            stream_status: default_stream_status(),
-            stream_error: None,
-            position_mode: default_position_mode(),
         }
     }
 }
