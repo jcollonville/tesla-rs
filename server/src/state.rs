@@ -1555,6 +1555,20 @@ pub(crate) struct ChargeSummary {
     pub outside_temp_avg_c: Option<f64>,
 }
 
+/// Highest charger power, in kW, an on-board (AC) charger can draw.
+///
+/// Tesla on-board chargers top out at 22 kW (three-phase, some Model S/X).
+const AC_MAX_POWER_KW: f64 = 22.0;
+
+/// AC when the charge drew power and never more than an on-board charger can.
+///
+/// Used only when no sample says whether a fast charger was present, as with
+/// telemetry charges recorded before the AC/DC flag was folded.
+fn on_board_power(samples: &[Sample]) -> Option<bool> {
+    let peak = max_finite(samples.iter().filter_map(|sample| sample.charger_power_kw))?;
+    (peak > 0.0 && peak <= AC_MAX_POWER_KW).then_some(false)
+}
+
 pub(crate) fn summarize_charge(samples: &[Sample]) -> Option<ChargeSummary> {
     let first = samples.first()?;
     let last = samples.last()?;
@@ -1570,7 +1584,7 @@ pub(crate) fn summarize_charge(samples: &[Sample]) -> Option<ChargeSummary> {
     {
         Some(false)
     } else {
-        None
+        on_board_power(samples)
     };
     let charger_type = samples
         .iter()
@@ -2487,6 +2501,33 @@ mod tests {
         let (closed, events) = reduce(&open, &Observation::at(at(5), Presence::Asleep));
         assert_eq!(events, vec![Transition::ChargeEnded]);
         assert!(!closed.charge_open);
+    }
+
+    #[test]
+    fn charge_type_falls_back_to_the_charger_power() {
+        // Telemetry AC charge: power only, no fast-charger flag.
+        let ac = [
+            charging(0, 59.0, 7.0).sample(),
+            charging(5, 60.0, 7.2).sample(),
+        ];
+        assert_eq!(summarize_charge(&ac).unwrap().is_dc, Some(false));
+        // Above any on-board charger: not called AC without a flag.
+        let fast = [
+            charging(0, 20.0, 120.0).sample(),
+            charging(5, 30.0, 90.0).sample(),
+        ];
+        assert_eq!(summarize_charge(&fast).unwrap().is_dc, None);
+        // No power at all: unknown.
+        let mut idle = charging(0, 59.0, 0.0);
+        idle.charger_power_kw = None;
+        assert_eq!(summarize_charge(&[idle.sample()]).unwrap().is_dc, None);
+        // An explicit flag wins.
+        let mut flagged = charging(0, 20.0, 15.0);
+        flagged.fast_charger = Some(true);
+        assert_eq!(
+            summarize_charge(&[flagged.sample()]).unwrap().is_dc,
+            Some(true)
+        );
     }
 
     #[test]

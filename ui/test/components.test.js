@@ -241,6 +241,26 @@ test("a closed charge without energy is not shown as in progress", () => {
   assert.match(open.shadowRoot.textContent, /En cours/);
 });
 
+test("a closed charge of unknown type is never labelled as charging", () => {
+  const closed = mount("tl-charge-row", {
+    attrs: { href: "/charges/5", locale: "fr", "time-zone": "UTC" },
+    data: {
+      id: 5,
+      start_at: "2026-11-27T01:30:00Z",
+      end_at: "2026-11-27T03:48:00Z",
+      energy_added_kwh: 16.1,
+      is_dc: null,
+      source: "telemetry",
+    },
+  });
+  assert.doesNotMatch(closed.shadowRoot.textContent, /En charge/);
+  const open = mount("tl-charge-row", {
+    attrs: { href: "/charges/6", locale: "fr", "time-zone": "UTC" },
+    data: { id: 6, start_at: "2026-11-27T01:30:00Z", end_at: null, is_dc: null, source: "telemetry" },
+  });
+  assert.match(open.shadowRoot.textContent, /En charge/);
+});
+
 test("period chips and tabs are data driven", () => {
   const chips = mount("tl-period-chips", {
     attrs: { label: "Période" },

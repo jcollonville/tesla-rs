@@ -165,7 +165,7 @@ export class TlChargeRow extends TlElement {
     if (where?.detail) stop.title = where.detail;
     const kind = h("span", { class: "muted kind" }, route);
     if (dc) h("span", { class: "chip dc", text: "DC" }, kind);
-    const charger = data.charger_type || (data.is_dc === false ? "AC" : data.is_dc == null ? fmt.strings.charging : "");
+    const charger = data.charger_type || (data.is_dc === false ? "AC" : data.is_dc == null && !data.end_at ? fmt.strings.charging : "");
     if (charger) kind.append(document.createTextNode(dc ? ` ${charger}` : charger));
     const figures = h("span", { class: "trip-figures" }, row);
     h("span", { class: "figure", text: figure }, figures);

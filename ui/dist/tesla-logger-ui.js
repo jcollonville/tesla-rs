@@ -1558,7 +1558,7 @@ class Le extends A {
     n != null && n.detail && (g.title = n.detail);
     const f = u("span", { class: "muted kind" }, h);
     s && u("span", { class: "chip dc", text: "DC" }, f);
-    const _ = i.charger_type || (i.is_dc === !1 ? "AC" : i.is_dc == null ? r.strings.charging : "");
+    const _ = i.charger_type || (i.is_dc === !1 ? "AC" : i.is_dc == null && !i.end_at ? r.strings.charging : "");
     _ && f.append(document.createTextNode(s ? ` ${_}` : _));
     const b = u("span", { class: "trip-figures" }, d);
     u("span", { class: "figure", text: c }, b);

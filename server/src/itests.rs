@@ -2288,10 +2288,31 @@ async fn rebuild_charge_merges_a_split_charge_once() {
     .await
     .unwrap();
     assert_eq!(trashed, 8, "merged rows are soft-deleted, not removed");
+    let (is_dc,): (Option<bool>,) = sqlx::query_as("SELECT is_dc FROM charges WHERE id = $1")
+        .bind(ids[0])
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(is_dc, Some(false), "the merged 7 kW charge is AC");
 
+    sqlx::query("UPDATE charges SET is_dc = NULL WHERE id = $1")
+        .bind(ids[0])
+        .execute(&db.pool)
+        .await
+        .unwrap();
     let (again, _) = crate::persist::rebuild_charge(&db.pool, vehicle_id, from, to, true)
         .await
         .unwrap();
+    let (is_dc,): (Option<bool>,) = sqlx::query_as("SELECT is_dc FROM charges WHERE id = $1")
+        .bind(ids[0])
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        is_dc,
+        Some(false),
+        "a re-run fills the type of a merged charge"
+    );
     assert_eq!(again.charge_ids, vec![ids[0]]);
     assert_eq!(again.energy_added_kwh, applied.energy_added_kwh);
     assert_eq!(live_charges_by_id(&db.pool, vehicle_id).await, vec![ids[0]]);
