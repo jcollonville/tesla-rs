@@ -634,7 +634,46 @@ pub(crate) async fn apply_for_vin(
 ) -> Result<(), AppError> {
     let vehicle_id = upsert_vehicle(&archive.db, identity, archive.fleet_account_id).await?;
     let slot = ensure_runtime(archive, vin, vehicle_id).await?;
-    write_observation(archive, &slot, &obs, live, true, from_telemetry).await
+    let feed = if from_telemetry {
+        Feed::Telemetry {
+            fresh_location: true,
+        }
+    } else {
+        Feed::Poll
+    };
+    write_observation(archive, &slot, &obs, live, true, feed).await
+}
+
+/// Writes one folded telemetry observation.
+///
+/// `fresh_location` says whether this payload carried a `Location`. When it did
+/// not, the stored point keeps speed and gear but no coordinates, so a stale
+/// location is never drawn at the new timestamp.
+pub(crate) async fn apply_telemetry_for_vin(
+    archive: &Archive,
+    vin: &str,
+    identity: VehicleIdentity<'_>,
+    obs: Observation,
+    fresh_location: bool,
+) -> Result<(), AppError> {
+    let vehicle_id = upsert_vehicle(&archive.db, identity, archive.fleet_account_id).await?;
+    let slot = ensure_runtime(archive, vin, vehicle_id).await?;
+    write_observation(
+        archive,
+        &slot,
+        &obs,
+        true,
+        true,
+        Feed::Telemetry { fresh_location },
+    )
+    .await
+}
+
+/// Where an observation written by [`write_observation`] comes from.
+#[derive(Clone, Copy)]
+enum Feed {
+    Poll,
+    Telemetry { fresh_location: bool },
 }
 
 /// Writes one Owner API streaming sample onto the current drive.
@@ -694,8 +733,15 @@ async fn write_observation(
     obs: &Observation,
     live: bool,
     store_position: bool,
-    from_telemetry: bool,
+    feed: Feed,
 ) -> Result<(), AppError> {
+    let from_telemetry = matches!(feed, Feed::Telemetry { .. });
+    let fresh_location = !matches!(
+        feed,
+        Feed::Telemetry {
+            fresh_location: false
+        }
+    );
     let fences = archive.fences.get(&archive.db).await?;
     let jobs = {
         let mut runtime = slot.lock().await;
@@ -726,6 +772,7 @@ async fn write_observation(
                 live,
                 store_position,
                 source: if from_telemetry { "telemetry" } else { "poll" },
+                fresh_location,
             },
         )
         .await?
@@ -2047,7 +2094,7 @@ async fn apply_existing(
     let Some(slot) = archive.runtimes.lock().await.get(vin).cloned() else {
         return Ok(());
     };
-    write_observation(archive, &slot, &obs, live, store_position, false).await
+    write_observation(archive, &slot, &obs, live, store_position, Feed::Poll).await
 }
 
 #[cfg(test)]

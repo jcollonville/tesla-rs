@@ -499,7 +499,17 @@ type TrackPoint = (
     Option<f64>,
     Option<f64>,
     Option<f64>,
+    String,
 );
+
+/// Drops the points a denser stream already covers, see [`viz::one_source_mask`].
+fn one_source(rows: Vec<TrackPoint>) -> Vec<TrackPoint> {
+    let keys: Vec<_> = rows.iter().map(|row| (row.0, row.7 == "stream")).collect();
+    rows.into_iter()
+        .zip(viz::one_source_mask(&keys))
+        .filter_map(|(row, keep)| keep.then_some(row))
+        .collect()
+}
 
 pub(super) async fn drive_detail(
     State(app): State<AppState>,
@@ -546,11 +556,12 @@ pub(super) async fn drive_detail(
     };
     let tz = format::zone(&app, Some(id)).await;
     let end = drive.end_at.unwrap_or_else(Utc::now);
-    let points: Vec<TrackPoint> = sqlx::query_as(
-        "SELECT recorded_at, latitude, longitude, speed_kmh, power_kw, elevation_m, battery_level
+    let rows: Vec<TrackPoint> = sqlx::query_as(
+        "SELECT recorded_at, latitude, longitude, speed_kmh, power_kw, elevation_m, battery_level,
+                source
          FROM positions
          WHERE drive_id = $1 AND recorded_at >= $2 AND recorded_at <= $3
-         ORDER BY recorded_at",
+         ORDER BY recorded_at, id",
     )
     .bind(drive_id)
     .bind(drive.start_at)
@@ -558,6 +569,7 @@ pub(super) async fn drive_detail(
     .fetch_all(&app.inner.db)
     .await
     .unwrap_or_default();
+    let points = one_source(rows);
     let located: Vec<(f64, f64)> = points
         .iter()
         .filter_map(|point| Some((point.1?, point.2?)))

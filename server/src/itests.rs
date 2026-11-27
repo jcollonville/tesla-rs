@@ -4026,3 +4026,74 @@ async fn rebuild_drive_reattaches_detached_positions_once() {
     let backwards = crate::persist::rebuild_drive(&db.pool, vehicle_id, to, from, false).await;
     assert!(backwards.is_err());
 }
+
+/// A drive fed by the stream and by telemetry at once draws one track.
+#[tokio::test]
+async fn drive_detail_draws_the_stream_where_it_covers_telemetry() {
+    let Some(db) = TestDb::migrated("onetrack").await else {
+        return;
+    };
+    let state = test_state(db.pool.clone()).await;
+    let token = "tl_onetrack-token";
+    sqlx::query("INSERT INTO api_tokens (name, token_hash) VALUES ('one', $1)")
+        .bind(sha256_hex(token))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let vehicle: i64 = sqlx::query_scalar(
+        "INSERT INTO vehicles (vin, name) VALUES ('TEST0000000TRACK1', 'Track') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let drive: i64 = sqlx::query_scalar(
+        "INSERT INTO drives (vehicle_id, start_at, end_at, source)
+         VALUES ($1, '2024-06-01T10:00:00Z', '2024-06-01T10:03:00Z', 'stream') RETURNING id",
+    )
+    .bind(vehicle)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO positions (vehicle_id, recorded_at, latitude, longitude, speed_kmh, drive_id, source)
+         SELECT $1, '2024-06-01T10:00:00Z'::timestamptz + make_interval(secs => s),
+                0.001 * s, 0.0, 40, $2, 'stream'
+         FROM generate_series(0, 120) s
+         UNION ALL
+         SELECT $1, '2024-06-01T10:00:00.5Z'::timestamptz + make_interval(secs => s),
+                0.001 * s, 0.0005, 38, $2, 'telemetry'
+         FROM generate_series(0, 180, 10) s",
+    )
+    .bind(vehicle)
+    .bind(drive)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let body = authed(
+        &state,
+        "GET",
+        &format!("/api/v1/drives/{drive}?max_points=1000"),
+        token,
+    )
+    .await;
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let route = parsed["route"].as_array().unwrap();
+    let telemetry: Vec<f64> = route
+        .iter()
+        .filter(|point| point["longitude"].as_f64().is_some_and(|lon| lon > 0.0))
+        .filter_map(|point| point["latitude"].as_f64())
+        .collect();
+    assert!(!telemetry.is_empty(), "the telemetry-only tail still draws");
+    assert!(
+        telemetry.iter().all(|lat| *lat > 0.135),
+        "no telemetry point inside the stream span: {telemetry:?}"
+    );
+    let latitudes: Vec<f64> = route
+        .iter()
+        .filter_map(|point| point["latitude"].as_f64())
+        .collect();
+    assert!(
+        latitudes.windows(2).all(|pair| pair[0] <= pair[1]),
+        "{latitudes:?}"
+    );
+}
