@@ -50,7 +50,7 @@ pub(crate) fn subscription(
         .field_with("DetailedChargeState", pace(60, None, Some(900)))
         .field_with("ChargeState", pace(60, None, Some(900)))
         .field_with("Gear", pace(5, None, None))
-        .field_with("Location", pace(30, Some(25.0), None))
+        .field_with("Location", pace(3, Some(5.0), None))
         .field_with("Odometer", pace(60, Some(0.1), Some(300)))
         .field_with("Soc", pace(60, Some(1.0), Some(300)))
         .field_with("VehicleSpeed", pace(10, Some(1.0), None))
@@ -303,7 +303,7 @@ fn clip_label(value: &str) -> String {
 }
 
 /// The payload itself carries a `Location`. The folded observation keeps the
-/// last one, which can be 30 s old on a speed- or gear-only message.
+/// last one, which is stale on a speed- or gear-only message.
 fn carries_location(data: &VehicleData) -> bool {
     data.iter().any(|datum| {
         datum.field == FieldKey::Known(Field::Location)
@@ -640,7 +640,9 @@ mod tests {
         assert!(fields.contains_key("Gear"));
         assert!(fields.contains_key("ScheduledChargingMode"));
         assert!(fields.contains_key("ScheduledDepartureTime"));
-        assert_eq!(fields["Location"].minimum_delta, Some(25.0));
+        // About one fix every 3 s while driving; nothing from a parked car.
+        assert_eq!(fields["Location"].interval_seconds, 3);
+        assert_eq!(fields["Location"].minimum_delta, Some(5.0));
         assert_eq!(fields["Soc"].minimum_delta, Some(1.0));
         // Re-sent so a reconnect or a logger restart gets them back without a change.
         assert_eq!(fields["Odometer"].resend_interval_seconds, Some(300));
