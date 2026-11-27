@@ -83,6 +83,8 @@ pub(crate) struct Observation {
     pub charger_power_kw: Option<f64>,
     pub charger_voltage: Option<f64>,
     pub charger_current: Option<f64>,
+    /// Battery pack voltage from telemetry, held to turn `PackCurrent` into power.
+    pub pack_voltage: Option<f64>,
     pub fast_charger: Option<bool>,
     pub fast_charger_type: Option<String>,
     pub charge_limit_soc: Option<f64>,
@@ -157,6 +159,7 @@ impl Observation {
             charger_power_kw: None,
             charger_voltage: None,
             charger_current: None,
+            pack_voltage: None,
             fast_charger: None,
             fast_charger_type: None,
             charge_limit_soc: None,
@@ -604,8 +607,14 @@ pub(crate) const CONTINUITY_JOIN_SECS: i64 = 900;
 /// A 0 km/h sample this long before the `P` transition may be the stored end.
 pub(crate) const ZERO_BEFORE_PARK_SECS: i64 = 120;
 
-/// Speed at or below this, with shift `P`, is a confirmed park.
+/// Speed at or below this is a standstill.
 const STANDSTILL_KMH: f64 = 1.0;
+/// Shift `P` with a speed at or below this is a park.
+///
+/// Telemetry publishes Gear and VehicleSpeed separately and late, so the only
+/// `P` of a trip can arrive with the last few km/h of the approach. A car
+/// cannot shift into `P` faster than walking pace.
+const PARK_CREEP_KMH: f64 = 8.0;
 /// End or start speed above this counts as motion across a gap.
 const GAP_MOTION_KMH: f64 = 5.0;
 /// Odometer change above this is motion, not a parked stop.
@@ -624,7 +633,7 @@ pub(crate) struct DriveGrace {
     pub end: chrono::Duration,
     /// Exact 0 km/h when the gear is unknown.
     pub park: chrono::Duration,
-    /// Shift `P` with speed at or below 1 km/h, or unknown.
+    /// Shift `P` with speed at or below [`PARK_CREEP_KMH`], or unknown.
     pub p_confirm: chrono::Duration,
     /// Stopped in `D`, `R`, or `N`. Does not apply to a confirmed park.
     pub stop_in_gear: chrono::Duration,
@@ -665,7 +674,7 @@ impl DriveGrace {
 pub(crate) enum DriveMotion {
     /// Shift `D`/`R`/`N` while moving or with unknown speed, or speed above 1 km/h.
     Driving,
-    /// Shift `P` and speed at or below 1 km/h, or unknown.
+    /// Shift `P` and speed at or below [`PARK_CREEP_KMH`], or unknown.
     Park,
     /// Shift `D`/`R`/`N` with a known speed at or below 1 km/h.
     StoppedInGear,
@@ -803,10 +812,10 @@ pub(crate) fn telemetry_drive_needs_fallback(
         && age.is_some_and(|age| age >= std::time::Duration::from_secs(90))
 }
 
-/// Speed is present and about zero, or missing next to an explicit park shift.
-pub(crate) fn speed_is_standstill(speed: Option<f64>) -> bool {
+/// Speed missing or within [`PARK_CREEP_KMH`], next to shift `P`.
+fn park_speed(speed: Option<f64>) -> bool {
     match speed {
-        Some(speed) if speed.is_finite() => speed <= STANDSTILL_KMH,
+        Some(speed) if speed.is_finite() => speed <= PARK_CREEP_KMH,
         Some(_) => false,
         None => true,
     }
@@ -831,7 +840,7 @@ pub(crate) fn observation_motion(obs: &Observation) -> DriveMotion {
                 return DriveMotion::StoppedInGear;
             }
             Some("D" | "R" | "N") => return DriveMotion::Driving,
-            Some("P") if speed_is_standstill(obs.speed_kmh) => return DriveMotion::Park,
+            Some("P") if park_speed(obs.speed_kmh) => return DriveMotion::Park,
             Some("P") => return DriveMotion::Gap,
             _ if obs
                 .speed_kmh
@@ -851,12 +860,13 @@ pub(crate) fn observation_motion(obs: &Observation) -> DriveMotion {
 
 /// Decides whether the open drive should close at `at`.
 ///
-/// `at` is a car timestamp. Charging closes immediately. Shift `P` at standstill
-/// (speed missing counts) starts [`DriveGrace::p_confirm`]. `D`/`R`/`N` at a
+/// `at` is a car timestamp. Charging closes immediately. Shift `P` at walking
+/// pace or less (speed missing counts) starts [`DriveGrace::p_confirm`]. `D`/`R`/`N` at a
 /// known standstill uses [`DriveGrace::stop_in_gear`] and does not start the
 /// park timer. Unknown gear at exact 0 km/h keeps [`DriveGrace::park`]. A sample
 /// older than the last accepted message does not move `park_since` backward.
-/// Signal loss uses [`DriveGrace::end`] from the previous car timestamp.
+/// Signal loss, or a sample with neither gear nor speed, uses [`DriveGrace::end`]
+/// from the last driving sample.
 /// Row `end_at` is chosen later by [`drive_end_cutoff`].
 pub(crate) fn plan_drive_close(
     motion: DriveMotion,
@@ -938,7 +948,10 @@ fn plan_drive_close_at(
         return ClosePlan::Continue { clock };
     }
     if motion == DriveMotion::Gap {
-        let proof = clock.last_message_at.max(clock.last_driving_at);
+        // A message with neither gear nor speed proves the car is awake, not
+        // that it still drives: telemetry keeps sending Soc and Odometer from a
+        // parked car whose Gear came back invalid or was never resent.
+        let proof = clock.last_driving_at;
         if record_message && at > clock.last_message_at {
             clock.last_message_at = at;
         }
@@ -1017,7 +1030,7 @@ fn tail_stop(cues: &[PositionCue]) -> (Option<DateTime<Utc>>, Option<StopKind>, 
             break;
         }
         let sample_kind = match normalized_shift(cue.shift_state.as_deref()) {
-            Some("P") if speed_is_standstill(cue.speed_kmh) => Some(StopKind::Park),
+            Some("P") if park_speed(cue.speed_kmh) => Some(StopKind::Park),
             Some("D" | "R" | "N") if known_standstill(cue.speed_kmh) => Some(StopKind::InGear),
             _ if speed_is_exact_zero(cue.speed_kmh) => Some(StopKind::Unknown),
             _ => None,
@@ -1065,6 +1078,9 @@ fn position_is_later_movement(cue: &PositionCue) -> bool {
     if speed_is_exact_zero(cue.speed_kmh) {
         return false;
     }
+    if normalized_shift(cue.shift_state.as_deref()) == Some("P") && park_speed(cue.speed_kmh) {
+        return false;
+    }
     match cue.speed_kmh {
         Some(speed) if speed.is_finite() => true,
         _ => matches!(
@@ -1095,7 +1111,8 @@ pub(crate) fn final_zero_run_start(cues: &[PositionCue]) -> Option<DateTime<Utc>
 ///
 /// `cues` are newest first. The cutoff is the first exact 0 km/h sample of the
 /// final zero run. Positions after that instant are detached, not deleted.
-/// When that run has no exact 0 km/h sample, the cutoff is the newest sample.
+/// When that run has no exact 0 km/h sample, the cutoff is the newest sample
+/// that reports a gear or a speed, else the newest sample.
 /// [`DriveGrace`] is not consulted: it only decides when the drive closes.
 pub(crate) fn drive_end_cutoff(cues: &[PositionCue], drive_start: DateTime<Utc>) -> DateTime<Utc> {
     let Some(newest) = cues.first() else {
@@ -1117,7 +1134,21 @@ pub(crate) fn drive_end_cutoff(cues: &[PositionCue], drive_start: DateTime<Utc>)
         }
         return zero.unwrap_or(park_at);
     }
-    final_zero_run_start(cues).unwrap_or(newest.at)
+    final_zero_run_start(cues)
+        .or_else(|| last_sample_with_motion_data(cues))
+        .unwrap_or(newest.at)
+}
+
+/// Newest cue that reports a gear or a speed, newest cue first.
+///
+/// Telemetry keeps storing gearless, speedless points from a parked, awake car;
+/// they must not stretch the trip.
+fn last_sample_with_motion_data(cues: &[PositionCue]) -> Option<DateTime<Utc>> {
+    cues.iter()
+        .find(|cue| {
+            cue.speed_kmh.is_some() || normalized_shift(cue.shift_state.as_deref()).is_some()
+        })
+        .map(|cue| cue.at)
 }
 
 /// Earliest confirmed `P` in the final non-moving tail, newest cue first.
@@ -1129,7 +1160,7 @@ fn confirmed_park_transition(cues: &[PositionCue]) -> Option<DateTime<Utc>> {
             break;
         }
         match normalized_shift(cue.shift_state.as_deref()) {
-            Some("P") if speed_is_standstill(cue.speed_kmh) => {
+            Some("P") if park_speed(cue.speed_kmh) => {
                 saw_park = true;
                 start = Some(cue.at);
             }
@@ -2250,6 +2281,62 @@ mod tests {
             !matches!(unknown, super::ClosePlan::Continue { clock: held } if held.park_since.is_none()),
             "P with unknown speed must not ignore the park timer"
         );
+    }
+
+    #[test]
+    fn park_reported_while_still_rolling_is_a_park() {
+        // Telemetry lags: the only Gear=P can arrive with a few km/h.
+        for speed in [5.0, 1.609, 8.0] {
+            let mut obs = online(0);
+            obs.shift_state = Some("P".to_owned());
+            obs.speed_kmh = Some(speed);
+            assert_eq!(
+                super::observation_motion(&obs),
+                super::DriveMotion::Park,
+                "{speed}"
+            );
+        }
+        let mut fast = online(0);
+        fast.shift_state = Some("P".to_owned());
+        fast.speed_kmh = Some(30.0);
+        assert_eq!(super::observation_motion(&fast), super::DriveMotion::Gap);
+    }
+
+    #[test]
+    fn online_messages_without_gear_or_speed_do_not_hold_a_drive_open() {
+        // Telemetry after the car stopped: Gear and VehicleSpeed come back
+        // invalid (or never come back after a reconnect), yet Soc and Odometer
+        // keep arriving while the car stays awake.
+        let grace = super::DriveGrace::standard();
+        let mut clock = super::DriveClock::moving_at(at(0));
+        let mut closed_at = None;
+        for minute in 1..=30 {
+            let quiet = online(minute);
+            let motion = super::observation_motion(&quiet);
+            assert_eq!(motion, super::DriveMotion::Gap);
+            match super::plan_drive_close(motion, quiet.at, clock, grace, None) {
+                super::ClosePlan::Close { .. } => {
+                    closed_at = Some(minute);
+                    break;
+                }
+                super::ClosePlan::Continue { clock: next }
+                | super::ClosePlan::Wait { clock: next, .. } => {
+                    clock = next;
+                }
+            }
+        }
+        assert_eq!(
+            closed_at,
+            Some(5),
+            "closes one grace after the last driving sample"
+        );
+        // The expiry tick uses the same rule when nothing else arrives.
+        let mut quiet_clock = super::DriveClock::moving_at(at(0));
+        quiet_clock.last_message_at = at(4);
+        assert!(matches!(
+            super::plan_drive_expire(super::DriveMotion::Gap, at(5), quiet_clock, grace),
+            super::ClosePlan::Close { .. }
+        ));
     }
 
     #[test]

@@ -51,7 +51,7 @@ pub(crate) fn subscription(
     let config = FleetTelemetryConfig::builder(hostname, port, ca)
         .field_with("DetailedChargeState", pace(60, None, Some(900)))
         .field_with("ChargeState", pace(60, None, Some(900)))
-        .field_with("Gear", pace(5, None, None))
+        .field_with("Gear", pace(5, None, Some(60)))
         .field_with("Location", pace(3, Some(5.0), None))
         .field_with("Odometer", pace(60, Some(0.1), Some(300)))
         .field_with("Soc", pace(60, Some(1.0), Some(300)))
@@ -67,6 +67,8 @@ pub(crate) fn subscription(
         .field_with("ACChargingPower", pace(60, Some(0.5), None))
         .field_with("DCChargingPower", pace(60, Some(0.5), None))
         .field_with("DCChargingEnergyIn", pace(60, Some(0.1), Some(300)))
+        .field_with("PackVoltage", pace(60, Some(2.0), None))
+        .field_with("PackCurrent", pace(10, Some(5.0), None))
         .build()
         .map_err(|err| AppError::message(err.to_string()))?;
     let value = config
@@ -366,11 +368,23 @@ fn fold_datums(obs: &mut Observation, data: &[DecodedDatum], metric: bool) {
             obs.charger_power_kw = Some(0.0);
         }
     }
+    if data
+        .iter()
+        .any(|datum| datum.field == FieldKey::Known(Field::PackCurrent))
+    {
+        obs.power_kw = pack_power_kw(obs.pack_voltage, payload_power(data, Field::PackCurrent));
+    }
     if obs.charging_state.as_deref() == Some("Disconnected") {
         // The session counter belongs to the plug-in that just ended.
         obs.charge_energy_added_kwh = None;
     }
     refresh_plugged_in(obs);
+}
+
+/// Pack power in kW: positive while discharging, negative on regeneration or charge.
+fn pack_power_kw(voltage: Option<f64>, current: Option<f64>) -> Option<f64> {
+    let power = voltage? * current? / 1_000.0;
+    power.is_finite().then_some(power)
 }
 
 /// Largest finite value of one power field in this payload.
@@ -425,7 +439,8 @@ fn apply_field(obs: &mut Observation, field: FieldKey, value: &DatumValue, metri
         }
         Field::ChargeLimitSoc => obs.charge_limit_soc = number(value),
         Field::ChargeAmps => obs.charger_current = number(value),
-        Field::PackVoltage | Field::ChargerVoltage => obs.charger_voltage = number(value),
+        Field::ChargerVoltage => obs.charger_voltage = number(value),
+        Field::PackVoltage => obs.pack_voltage = number(value),
         Field::InsideTemp => obs.inside_temp_c = number(value),
         Field::OutsideTemp => obs.outside_temp_c = number(value),
         Field::Locked => obs.locked = boolean(value),
@@ -677,6 +692,15 @@ mod tests {
         // Re-sent so a reconnect or a logger restart gets them back without a change.
         assert_eq!(fields["Odometer"].resend_interval_seconds, Some(300));
         assert_eq!(fields["Soc"].resend_interval_seconds, Some(300));
+        // A reconnect or restart learns the gear again well within the drive grace.
+        assert!(
+            fields["Gear"]
+                .resend_interval_seconds
+                .is_some_and(|secs| secs <= 60)
+        );
+        // Drive power is pack voltage times pack current.
+        assert!(fields.contains_key("PackVoltage"));
+        assert!(fields.contains_key("PackCurrent"));
         assert!(fields.values().all(|field| field.interval_seconds > 0));
         assert_eq!(request.config.hostname, "logger.example");
         assert!(request.config.ca.contains("MIIB"));
@@ -886,6 +910,40 @@ mod tests {
             Some(0.0),
             "power drops when charging stops"
         );
+    }
+
+    #[test]
+    fn pack_voltage_and_current_give_the_drive_power() {
+        use super::{DecodedDatum, fold_datums};
+        use tesla_fleet_telemetry::proto::vehicle_data::Field;
+        use tesla_fleet_telemetry::{DatumValue, FieldKey};
+
+        let payload = |values: &[(Field, f64)]| -> Vec<DecodedDatum> {
+            values
+                .iter()
+                .map(|(field, value)| DecodedDatum {
+                    field: FieldKey::Known(*field),
+                    value: DatumValue::Double(*value),
+                })
+                .collect()
+        };
+        let mut obs = Observation::at(Utc::now(), Presence::Online);
+        fold_datums(
+            &mut obs,
+            &payload(&[(Field::PackVoltage, 400.0), (Field::PackCurrent, 50.0)]),
+            true,
+        );
+        assert_eq!(obs.power_kw, Some(20.0), "discharging: positive kW");
+        assert_eq!(
+            obs.charger_voltage, None,
+            "pack voltage is not the charger voltage"
+        );
+        // Current changes far more often than voltage: the held voltage is reused.
+        fold_datums(&mut obs, &payload(&[(Field::PackCurrent, -25.0)]), true);
+        assert_eq!(obs.power_kw, Some(-10.0), "regeneration: negative kW");
+        // A payload without pack data keeps the last power.
+        fold_datums(&mut obs, &payload(&[(Field::Soc, 60.0)]), true);
+        assert_eq!(obs.power_kw, Some(-10.0));
     }
 
     #[test]
