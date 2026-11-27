@@ -2743,6 +2743,255 @@ mod tests {
         assert_eq!(is_dc, Some(false), "a 7 kW telemetry charge is AC");
     }
 
+    #[tokio::test]
+    async fn telemetry_drive_closes_when_gear_and_speed_go_quiet_and_keeps_its_power() {
+        use crate::ingest::apply_telemetry_for_vin;
+        use crate::persist::VehicleIdentity;
+
+        let Some(db) = crate::test_util::TestDb::migrated("teldriveend").await else {
+            return;
+        };
+        let vin = "5YJ3E1EA7KF000128";
+        let identity = || VehicleIdentity {
+            vin,
+            tesla_id: Some(1),
+            legacy_vehicle_id: None,
+            name: Some(vin),
+        };
+        let archive = super::Archive::new(
+            db.pool.clone(),
+            crate::geocode::Geocoder::disabled(),
+            tokio::sync::broadcast::channel(64).0,
+            crate::drive_gps::GpsBoard::default(),
+        );
+        // Only a fresh telemetry sample may open a drive.
+        let start = chrono::Utc::now();
+        // Ten minutes of driving, one folded telemetry message a minute.
+        for minute in 0..=10_i32 {
+            let mut obs = crate::state::Observation::at(
+                start + chrono::Duration::minutes(i64::from(minute)),
+                Presence::Online,
+            );
+            obs.shift_state = Some("D".to_owned());
+            obs.speed_kmh = Some(50.0);
+            obs.power_kw = Some(12.0);
+            obs.odometer_km = Some(1_000.0 + f64::from(minute) * 0.8);
+            obs.latitude = Some(10.0 + f64::from(minute) * 0.001);
+            obs.longitude = Some(20.0);
+            apply_telemetry_for_vin(&archive, vin, identity(), obs, true)
+                .await
+                .unwrap();
+        }
+        // Parked and awake: Gear and VehicleSpeed come back invalid, Soc keeps coming.
+        for minute in 11..=40_i64 {
+            let mut obs = crate::state::Observation::at(
+                start + chrono::Duration::minutes(minute),
+                Presence::Online,
+            );
+            obs.battery_level = Some(70.0);
+            obs.odometer_km = Some(1_008.0);
+            apply_telemetry_for_vin(&archive, vin, identity(), obs, false)
+                .await
+                .unwrap();
+        }
+        let drives: Vec<(Option<chrono::DateTime<chrono::Utc>>, Option<f64>)> = sqlx::query_as(
+            "SELECT d.end_at, d.max_power_kw FROM drives d
+             JOIN vehicles v ON v.id = d.vehicle_id
+             WHERE v.vin = $1 AND d.deleted_at IS NULL",
+        )
+        .bind(vin)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(drives.len(), 1, "{drives:?}");
+        let (end_at, max_power) = drives[0];
+        let end_at = end_at.expect("the drive is closed");
+        assert_eq!(
+            end_at.timestamp_millis(),
+            (start + chrono::Duration::minutes(10)).timestamp_millis(),
+            "ends at the last driving sample, not at the parked messages"
+        );
+        assert_eq!(max_power, Some(12.0));
+    }
+
+    #[tokio::test]
+    async fn sentry_pings_after_a_rolling_park_do_not_keep_the_drive_open() {
+        // Production sequence of drive 5145 (27/11, Paris time), neutral coordinates:
+        // driving from 11:47:29, the only Gear=P arrives with VehicleSpeed 5 km/h at
+        // 11:53:30, speed 1 mph at 11:53:35, then Sentry sends Location pings with no
+        // Gear and no speed; the folded observation still holds P and the last speed.
+        use crate::ingest::apply_telemetry_for_vin;
+        use crate::persist::VehicleIdentity;
+
+        let Some(db) = crate::test_util::TestDb::migrated("telsentry").await else {
+            return;
+        };
+        let vin = "5YJ3E1EA7KF000129";
+        let identity = || VehicleIdentity {
+            vin,
+            tesla_id: Some(1),
+            legacy_vehicle_id: None,
+            name: Some(vin),
+        };
+        let archive = super::Archive::new(
+            db.pool.clone(),
+            crate::geocode::Geocoder::disabled(),
+            tokio::sync::broadcast::channel(64).0,
+            crate::drive_gps::GpsBoard::default(),
+        );
+        let start = chrono::Utc::now();
+        let secs = |n: i64| start + chrono::Duration::seconds(n);
+        let send = |at, shift: &str, speed: f64, step: f64| {
+            let mut obs = crate::state::Observation::at(at, Presence::Online);
+            obs.shift_state = Some(shift.to_owned());
+            obs.speed_kmh = Some(speed);
+            obs.odometer_km = Some(1_000.0 + step * 0.05);
+            obs.latitude = Some(10.0 + step * 0.0005);
+            obs.longitude = Some(20.0);
+            obs
+        };
+        // 11:47:29 → 11:53:29, one fix every 10 s.
+        for step in 0..=36_i32 {
+            let obs = send(secs(i64::from(step) * 10), "D", 30.0, f64::from(step));
+            apply_telemetry_for_vin(&archive, vin, identity(), obs, true)
+                .await
+                .unwrap();
+        }
+        let park_at = secs(361); // 11:53:30
+        for (at, speed) in [(park_at, 5.0), (secs(366), 1.609)] {
+            let obs = send(at, "P", speed, 37.0);
+            apply_telemetry_for_vin(&archive, vin, identity(), obs, true)
+                .await
+                .unwrap();
+        }
+        // Sentry pings every 3 min 33 s until 13:27:30; P and 1 mph are held.
+        let mut at = secs(366);
+        while at < secs(5_999) {
+            at += chrono::Duration::seconds(213);
+            let mut obs = send(at, "P", 1.609, 37.0);
+            obs.longitude = Some(20.00001);
+            apply_telemetry_for_vin(&archive, vin, identity(), obs, true)
+                .await
+                .unwrap();
+        }
+        let drives: Vec<(Option<chrono::DateTime<chrono::Utc>>,)> = sqlx::query_as(
+            "SELECT d.end_at FROM drives d JOIN vehicles v ON v.id = d.vehicle_id
+             WHERE v.vin = $1 AND d.deleted_at IS NULL",
+        )
+        .bind(vin)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(drives.len(), 1, "{drives:?}");
+        let end_at = drives[0].0.expect("the drive is closed");
+        assert_eq!(end_at.timestamp_millis(), park_at.timestamp_millis());
+        let (attached_after,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM positions p JOIN drives d ON d.id = p.drive_id
+             JOIN vehicles v ON v.id = d.vehicle_id
+             WHERE v.vin = $1 AND p.recorded_at > d.end_at",
+        )
+        .bind(vin)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(attached_after, 0, "the ping tail is detached");
+    }
+
+    #[tokio::test]
+    async fn a_drive_left_open_by_sentry_pings_closes_after_a_restart() {
+        // Drive 5145 as stored by 8d9d175: P at 5 km/h then 1 mph, followed by
+        // gearless, speedless Sentry pings still attached. The new binary must
+        // close it on its own at the first P and detach the pings.
+        use crate::ingest::apply_telemetry_for_vin;
+        use crate::persist::VehicleIdentity;
+
+        let Some(db) = crate::test_util::TestDb::migrated("telrestart").await else {
+            return;
+        };
+        let vin = "5YJ3E1EA7KF000130";
+        let identity = || VehicleIdentity {
+            vin,
+            tesla_id: Some(1),
+            legacy_vehicle_id: None,
+            name: Some(vin),
+        };
+        let archive = super::Archive::new(
+            db.pool.clone(),
+            crate::geocode::Geocoder::disabled(),
+            tokio::sync::broadcast::channel(64).0,
+            crate::drive_gps::GpsBoard::default(),
+        );
+        let start = chrono::Utc::now();
+        let secs = |n: i64| start + chrono::Duration::seconds(n);
+        for (step, shift, speed) in (0..=36_i32)
+            .map(|step| (step, "D", 30.0))
+            .chain([(37, "P", 5.0)])
+        {
+            let mut obs = crate::state::Observation::at(
+                if step == 37 {
+                    secs(361)
+                } else {
+                    secs(i64::from(step) * 10)
+                },
+                Presence::Online,
+            );
+            obs.shift_state = Some(shift.to_owned());
+            obs.speed_kmh = Some(speed);
+            obs.odometer_km = Some(1_000.0 + f64::from(step) * 0.05);
+            obs.latitude = Some(10.0 + f64::from(step) * 0.0005);
+            obs.longitude = Some(20.0);
+            apply_telemetry_for_vin(&archive, vin, identity(), obs, true)
+                .await
+                .unwrap();
+        }
+        let (vehicle_id, drive_id): (i64, i64) = sqlx::query_as(
+            "SELECT d.vehicle_id, d.id FROM drives d JOIN vehicles v ON v.id = d.vehicle_id
+             WHERE v.vin = $1 AND d.end_at IS NULL",
+        )
+        .bind(vin)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        // What 8d9d175 stored after the park: 1 mph in P, then bare pings.
+        let mut rows = vec![(secs(366), Some("P"), Some(1.609))];
+        rows.extend((1..=27_i64).map(|n| (secs(366 + n * 213), None, None)));
+        for (at, shift, speed) in rows {
+            sqlx::query(
+                "INSERT INTO positions (vehicle_id, recorded_at, latitude, longitude, speed_kmh,
+                                        shift_state, drive_id, source)
+                 VALUES ($1, $2, 10.0185, 20.0, $3, $4, $5, 'telemetry')",
+            )
+            .bind(vehicle_id)
+            .bind(at)
+            .bind(speed)
+            .bind(shift)
+            .bind(drive_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        // Restart: no runtime in memory, then the expiry tick.
+        archive.runtimes.lock().await.clear();
+        super::expire_drives(&archive, secs(6_100)).await.unwrap();
+        let (end_at,): (Option<chrono::DateTime<chrono::Utc>>,) =
+            sqlx::query_as("SELECT end_at FROM drives WHERE id = $1")
+                .bind(drive_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let end_at = end_at.expect("closed by the expiry tick");
+        assert_eq!(end_at.timestamp_millis(), secs(361).timestamp_millis());
+        let (attached_after,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM positions WHERE drive_id = $1 AND recorded_at > $2",
+        )
+        .bind(drive_id)
+        .bind(end_at)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(attached_after, 0, "the ping tail is detached");
+    }
+
     const EXCEEDED_LIMIT_BODY: &str =
         r#"{"response":null,"error":"account disabled: EXCEEDED_LIMIT","error_description":""}"#;
 

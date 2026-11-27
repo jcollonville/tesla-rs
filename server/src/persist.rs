@@ -358,7 +358,8 @@ pub(crate) async fn load_runtime(
                 d.id AS drive_id, c.id AS charge_id
          FROM vehicles v
          LEFT JOIN vehicle_state s ON s.vehicle_id = v.id
-         LEFT JOIN drives d ON d.vehicle_id = v.id AND d.end_at IS NULL AND d.source IN ('poll', 'stream')
+         LEFT JOIN drives d ON d.vehicle_id = v.id AND d.end_at IS NULL AND d.deleted_at IS NULL
+                           AND d.source IN ('poll', 'stream', 'telemetry')
          LEFT JOIN charges c ON c.vehicle_id = v.id AND c.end_at IS NULL AND c.source IN ('poll', 'telemetry')
          WHERE v.id = $1",
     )
