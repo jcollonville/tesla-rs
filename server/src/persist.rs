@@ -14,9 +14,9 @@ use crate::state::{
     Activity, CONTINUITY_JOIN_SECS, ClosePlan, ClosedDrive, DriveClock, DriveGrace, DriveMotion,
     DriveSummary, GapFacts, MOVEMENT_GUARD_KMH, Observation, PARK_REOPEN_SECS, PositionCue,
     Presence, Sample, StopKind, Tracker, Transition, clock_from_tail, drive_end_cutoff,
-    gap_close_suppressed, gate_live_sample, keep_closed_drive, merge_clock, observation_motion,
-    plan_drive_close, plan_drive_end_repair, plan_drive_expire, should_reopen_drive, soc_level,
-    summarize_charge, summarize_drive, window_shows_movement,
+    gap_close_suppressed, gate_live_sample, keep_closed_drive, merge_clock, net_power_kwh,
+    observation_motion, plan_drive_close, plan_drive_end_repair, plan_drive_expire,
+    should_reopen_drive, soc_level, summarize_charge, summarize_drive, window_shows_movement,
 };
 
 /// Identity fields learned from a vehicle list response.
@@ -2228,6 +2228,162 @@ pub(crate) fn format_charge_rebuild(report: &ChargeRebuildReport) -> String {
         report
             .geofence_id
             .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+    )
+}
+
+/// What [`recompute_drive`] found, or wrote. No coordinates, VIN, or secrets.
+#[derive(Debug)]
+pub(crate) struct DriveRecomputeReport {
+    /// `true` when `--apply` wrote rows.
+    pub applied: bool,
+    /// The drive.
+    pub drive_id: i64,
+    /// Positions attached to the drive.
+    pub positions: usize,
+    /// Telemetry `power_kw` was stored with the inverted sign and is negated.
+    pub power_flipped: bool,
+    /// Energy stored before the recompute.
+    pub previous_energy_used_kwh: Option<f64>,
+    /// Energy after the recompute.
+    pub energy_used_kwh: Option<f64>,
+    /// Highest power after the recompute.
+    pub max_power_kw: Option<f64>,
+    /// Lowest power after the recompute.
+    pub min_power_kw: Option<f64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SourcedSample {
+    #[sqlx(flatten)]
+    sample: PositionSample,
+    source: String,
+}
+
+/// Recomputes the summary of one closed drive from its attached positions.
+///
+/// With `flip_telemetry_power`, telemetry `power_kw` stored by 1224370 (pack
+/// current sign not inverted) is negated first, but only while the telemetry
+/// points still integrate to a net regeneration. A second run therefore leaves
+/// the sign alone. `start_at` and `end_at` are kept. Refuses an open or deleted
+/// drive. Dry-run (`apply` false) runs in a read-only transaction.
+pub(crate) async fn recompute_drive(
+    pool: &PgPool,
+    drive_id: i64,
+    flip_telemetry_power: bool,
+    apply: bool,
+) -> Result<DriveRecomputeReport, AppError> {
+    let mut tx = pool.begin().await?;
+    if !apply {
+        sqlx::query("SET TRANSACTION READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+    }
+    // A read-only transaction cannot take a row lock.
+    let query = if apply {
+        "SELECT d.start_at, d.end_at, d.deleted_at, d.energy_used_kwh, v.efficiency_kwh_per_km
+         FROM drives d JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE d.id = $1 FOR UPDATE OF d"
+    } else {
+        "SELECT d.start_at, d.end_at, d.deleted_at, d.energy_used_kwh, v.efficiency_kwh_per_km
+         FROM drives d JOIN vehicles v ON v.id = d.vehicle_id
+         WHERE d.id = $1"
+    };
+    let drive: Option<StoredDriveEnds> = sqlx::query_as(query)
+        .bind(drive_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(drive) = drive else {
+        return Err(AppError::message("drive not found"));
+    };
+    let Some(end_at) = drive.end_at.filter(|_| drive.deleted_at.is_none()) else {
+        return Err(AppError::message("drive is open or deleted"));
+    };
+    let rows: Vec<SourcedSample> = sqlx::query_as(
+        "SELECT recorded_at, latitude, longitude, speed_kmh, power_kw, odometer_km, elevation_m,
+                battery_level, rated_range_km, ideal_range_km, inside_temp_c, outside_temp_c,
+                source
+         FROM positions
+         WHERE drive_id = $1
+         ORDER BY recorded_at, id",
+    )
+    .bind(drive_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let telemetry: Vec<bool> = rows.iter().map(|row| row.source == "telemetry").collect();
+    let mut samples: Vec<Sample> = rows
+        .into_iter()
+        .map(|row| row.sample.into_sample())
+        .collect();
+    let telemetry_samples: Vec<Sample> = samples
+        .iter()
+        .zip(&telemetry)
+        .filter(|(_, telemetry)| **telemetry)
+        .map(|(sample, _)| sample.clone())
+        .collect();
+    let power_flipped =
+        flip_telemetry_power && net_power_kwh(&telemetry_samples).is_some_and(|kwh| kwh < 0.0);
+    if power_flipped {
+        for (sample, telemetry) in samples.iter_mut().zip(&telemetry) {
+            if *telemetry {
+                sample.power_kw = sample.power_kw.map(|power| -power);
+            }
+        }
+    }
+    let Some(mut summary) = summarize_drive(&samples, drive.efficiency_kwh_per_km) else {
+        return Err(AppError::message("drive has no positions"));
+    };
+    summary.start = drive.start_at;
+    summary.end = end_at;
+    if apply {
+        if power_flipped {
+            sqlx::query(
+                "UPDATE positions SET power_kw = -power_kw
+                 WHERE drive_id = $1 AND source = 'telemetry' AND power_kw IS NOT NULL",
+            )
+            .bind(drive_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        update_drive(&mut tx, drive_id, &summary, summary.end_battery_level, None).await?;
+    }
+    tx.commit().await?;
+    Ok(DriveRecomputeReport {
+        applied: apply,
+        drive_id,
+        positions: samples.len(),
+        power_flipped,
+        previous_energy_used_kwh: drive.energy_used_kwh,
+        energy_used_kwh: summary.energy_used_kwh,
+        max_power_kw: summary.max_power_kw,
+        min_power_kw: summary.min_power_kw,
+    })
+}
+
+#[derive(sqlx::FromRow)]
+struct StoredDriveEnds {
+    start_at: DateTime<Utc>,
+    end_at: Option<DateTime<Utc>>,
+    deleted_at: Option<DateTime<Utc>>,
+    energy_used_kwh: Option<f64>,
+    efficiency_kwh_per_km: Option<f64>,
+}
+
+/// Plain-text report for `recompute-drive`.
+pub(crate) fn format_drive_recompute(report: &DriveRecomputeReport) -> String {
+    let mode = if report.applied { "apply" } else { "dry-run" };
+    let number = |value: Option<f64>, digits: usize| {
+        value.map_or_else(|| "unknown".to_owned(), |value| format!("{value:.digits$}"))
+    };
+    format!(
+        "mode={mode}\ndrive={}\npositions={}\npower_flipped={}\nenergy_used_kwh={}->{}\n\
+         max_power_kw={}\nmin_power_kw={}\n",
+        report.drive_id,
+        report.positions,
+        report.power_flipped,
+        number(report.previous_energy_used_kwh, 3),
+        number(report.energy_used_kwh, 3),
+        number(report.max_power_kw, 1),
+        number(report.min_power_kw, 1),
     )
 }
 
