@@ -359,7 +359,7 @@ pub(crate) async fn load_runtime(
          FROM vehicles v
          LEFT JOIN vehicle_state s ON s.vehicle_id = v.id
          LEFT JOIN drives d ON d.vehicle_id = v.id AND d.end_at IS NULL AND d.source IN ('poll', 'stream')
-         LEFT JOIN charges c ON c.vehicle_id = v.id AND c.end_at IS NULL AND c.source = 'poll'
+         LEFT JOIN charges c ON c.vehicle_id = v.id AND c.end_at IS NULL AND c.source IN ('poll', 'telemetry')
          WHERE v.id = $1",
     )
     .bind(vehicle_id)
@@ -610,9 +610,20 @@ pub(crate) async fn apply_observation(
             }
         }
     }
+    let mut address_jobs = Vec::new();
     if starting_charge {
-        runtime.open_charge_id =
-            Some(insert_charge(&mut tx, runtime.vehicle_id, obs, fence_id).await?);
+        let (charge_id, created) =
+            open_charge(&mut tx, runtime.vehicle_id, obs, fences, record_source).await?;
+        runtime.open_charge_id = Some(charge_id);
+        if let Some((latitude, longitude)) = created {
+            address_jobs.push(AddressJob {
+                drive_id: None,
+                charge_id: Some(charge_id),
+                which: "start",
+                latitude,
+                longitude,
+            });
+        }
     }
 
     let attach_drive = if previous.drive_open || starting_drive {
@@ -652,7 +663,7 @@ pub(crate) async fn apply_observation(
         && obs.charging_state.is_some()
         && let Some(charge_id) = runtime.open_charge_id
     {
-        insert_charge_sample(&mut tx, charge_id, obs).await?;
+        insert_charge_sample(&mut tx, charge_id, obs, record_source).await?;
         if obs.fast_charger == Some(true) {
             sqlx::query("UPDATE charges SET is_dc = TRUE WHERE id = $1")
                 .bind(charge_id)
@@ -661,7 +672,6 @@ pub(crate) async fn apply_observation(
         }
     }
 
-    let mut address_jobs = Vec::new();
     if created_drive && let Some(drive_id) = runtime.open_drive_id {
         push_address(&mut address_jobs, Some(drive_id), None, "start", obs);
     }
@@ -703,8 +713,26 @@ pub(crate) async fn apply_observation(
         next.drive_open = false;
     }
     if ending_charge && let Some(charge_id) = runtime.open_charge_id {
-        close_charge(&mut tx, charge_id, obs, fence_id).await?;
-        push_address(&mut address_jobs, None, Some(charge_id), "end", obs);
+        let fallback = last_known_position(&mut tx, runtime.vehicle_id, obs).await?;
+        let fallback_fence = fallback
+            .and_then(|(latitude, longitude)| matching_geofence(latitude, longitude, fences));
+        let place = close_charge(
+            &mut tx,
+            charge_id,
+            obs,
+            fallback,
+            fence_id.or(fallback_fence),
+        )
+        .await?;
+        if let Some((latitude, longitude)) = place {
+            address_jobs.push(AddressJob {
+                drive_id: None,
+                charge_id: Some(charge_id),
+                which: "end",
+                latitude,
+                longitude,
+            });
+        }
         runtime.open_charge_id = None;
     }
 
@@ -816,32 +844,161 @@ async fn insert_drive(
     Ok(row)
 }
 
-async fn insert_charge(
+/// Longest pause between two charging readings that still continues one charge.
+///
+/// The car can publish a short `Stopped` or `NoPower` while it keeps charging,
+/// and a poll can land between two telemetry messages. The night of 27/11/2026
+/// showed pauses of 26 s to 247 s inside one AC charge.
+pub(crate) const CHARGE_RESUME_GRACE_SECS: i64 = 600;
+
+/// State-of-charge drop, in percent, still read as the same charge.
+const CHARGE_RESUME_SOC_SLACK: f64 = 1.0;
+
+/// Opens a charge, or resumes the vehicle's last one when it ended at most
+/// [`CHARGE_RESUME_GRACE_SECS`] ago, no drive started since, and the state of
+/// charge did not fall. Returns the charge and, for a new row, its position.
+async fn open_charge(
     tx: &mut Transaction<'_, Postgres>,
     vehicle_id: i64,
     obs: &Observation,
-    geofence_id: Option<i64>,
-) -> Result<i64, AppError> {
+    fences: &[Fence],
+    source: &str,
+) -> Result<(i64, Option<(f64, f64)>), AppError> {
+    if let Some(charge_id) = resume_charge(tx, vehicle_id, obs).await? {
+        return Ok((charge_id, None));
+    }
+    let place = last_known_position(tx, vehicle_id, obs).await?;
+    let fence =
+        place.and_then(|(latitude, longitude)| matching_geofence(latitude, longitude, fences));
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO charges (
             vehicle_id, start_at, latitude, longitude, start_battery_level,
             start_rated_range_km, start_ideal_range_km, geofence_id, is_dc, charger_type, source
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'poll')
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          RETURNING id",
     )
     .bind(vehicle_id)
     .bind(obs.at)
-    .bind(obs.latitude)
-    .bind(obs.longitude)
+    .bind(place.map(|(latitude, _)| latitude))
+    .bind(place.map(|(_, longitude)| longitude))
     .bind(obs.battery_level)
     .bind(obs.rated_range_km)
     .bind(obs.ideal_range_km)
-    .bind(geofence_id)
+    .bind(fence)
     .bind(obs.fast_charger)
     .bind(&obs.fast_charger_type)
+    .bind(live_source(source))
     .fetch_one(&mut **tx)
     .await?;
-    Ok(row.0)
+    Ok((row.0, place))
+}
+
+/// Source stored on a charge row and its samples.
+fn live_source(source: &str) -> &'static str {
+    if source == "telemetry" {
+        "telemetry"
+    } else {
+        "poll"
+    }
+}
+
+async fn resume_charge(
+    tx: &mut Transaction<'_, Postgres>,
+    vehicle_id: i64,
+    obs: &Observation,
+) -> Result<Option<i64>, AppError> {
+    let last: Option<(i64, DateTime<Utc>, Option<f64>)> = sqlx::query_as(
+        "SELECT c.id, c.end_at, c.end_battery_level
+         FROM charges c
+         WHERE c.vehicle_id = $1 AND c.deleted_at IS NULL AND c.end_at IS NOT NULL
+           AND c.source IN ('poll', 'telemetry')
+         ORDER BY c.end_at DESC
+         LIMIT 1",
+    )
+    .bind(vehicle_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((charge_id, end_at, end_level)) = last else {
+        return Ok(None);
+    };
+    if !charge_resumes(end_at, end_level, obs) {
+        return Ok(None);
+    }
+    let (drove,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (
+             SELECT 1 FROM drives
+             WHERE vehicle_id = $1 AND deleted_at IS NULL AND start_at >= $2
+         )",
+    )
+    .bind(vehicle_id)
+    .bind(end_at)
+    .fetch_one(&mut **tx)
+    .await?;
+    if drove {
+        return Ok(None);
+    }
+    sqlx::query("UPDATE charges SET end_at = NULL WHERE id = $1")
+        .bind(charge_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(Some(charge_id))
+}
+
+/// Whether a new charging reading continues a charge that ended at `end_at`.
+pub(crate) fn charge_resumes(
+    end_at: DateTime<Utc>,
+    end_level: Option<f64>,
+    obs: &Observation,
+) -> bool {
+    let gap = obs.at.signed_duration_since(end_at).num_seconds();
+    if !(0..=CHARGE_RESUME_GRACE_SECS).contains(&gap) {
+        return false;
+    }
+    match (end_level, obs.battery_level) {
+        (Some(end), Some(now)) if end.is_finite() && now.is_finite() => {
+            now >= end - CHARGE_RESUME_SOC_SLACK
+        }
+        _ => true,
+    }
+}
+
+/// Where the car is: the reading's own fix, else the last fix stored for it.
+///
+/// A parked car on Fleet Telemetry publishes no `Location`, and a logger restart
+/// empties the folded reading, so a charge falls back to the stored state and
+/// then to the latest stored position.
+async fn last_known_position(
+    tx: &mut Transaction<'_, Postgres>,
+    vehicle_id: i64,
+    obs: &Observation,
+) -> Result<Option<(f64, f64)>, AppError> {
+    if let Some(place) = finite_place(obs.latitude, obs.longitude) {
+        return Ok(Some(place));
+    }
+    let state: Option<(Option<f64>, Option<f64>)> =
+        sqlx::query_as("SELECT latitude, longitude FROM vehicle_state WHERE vehicle_id = $1")
+            .bind(vehicle_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if let Some(place) = state.and_then(|(latitude, longitude)| finite_place(latitude, longitude)) {
+        return Ok(Some(place));
+    }
+    let position: Option<(f64, f64)> = sqlx::query_as(
+        "SELECT latitude, longitude FROM positions
+         WHERE vehicle_id = $1 AND latitude IS NOT NULL AND longitude IS NOT NULL
+         ORDER BY recorded_at DESC
+         LIMIT 1",
+    )
+    .bind(vehicle_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(position.and_then(|(latitude, longitude)| finite_place(Some(latitude), Some(longitude))))
+}
+
+fn finite_place(latitude: Option<f64>, longitude: Option<f64>) -> Option<(f64, f64)> {
+    latitude
+        .zip(longitude)
+        .filter(|(latitude, longitude)| latitude.is_finite() && longitude.is_finite())
 }
 
 async fn insert_position(
@@ -931,13 +1088,14 @@ async fn insert_charge_sample(
     tx: &mut Transaction<'_, Postgres>,
     charge_id: i64,
     obs: &Observation,
+    source: &str,
 ) -> Result<(), AppError> {
     sqlx::query(
         "INSERT INTO charge_samples (
             charge_id, recorded_at, battery_level, usable_battery_level, charger_power_kw,
             charger_voltage, charger_current, charge_energy_added_kwh, ideal_range_km,
             rated_range_km, outside_temp_c, source
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'poll')
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          ON CONFLICT (charge_id, recorded_at, source) DO NOTHING",
     )
     .bind(charge_id)
@@ -951,6 +1109,7 @@ async fn insert_charge_sample(
     .bind(obs.ideal_range_km)
     .bind(obs.rated_range_km)
     .bind(obs.outside_temp_c)
+    .bind(live_source(source))
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1827,6 +1986,250 @@ pub(crate) fn format_drive_rebuild(report: &DriveRebuildReport) -> String {
     )
 }
 
+/// What [`rebuild_charge`] found, or wrote. No coordinates, VIN, or secrets.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChargeRebuildReport {
+    /// `true` when `--apply` wrote rows.
+    pub applied: bool,
+    /// Live charges of the window, oldest first. The first one is kept.
+    pub charge_ids: Vec<i64>,
+    /// Samples of those charges.
+    pub samples: usize,
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+    pub energy_added_kwh: Option<f64>,
+    pub energy_used_kwh: Option<f64>,
+    pub start_battery_level: Option<f64>,
+    pub end_battery_level: Option<f64>,
+    /// A position is known for the merged charge.
+    pub located: bool,
+    pub geofence_id: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct WindowCharge {
+    id: i64,
+    start_at: DateTime<Utc>,
+    end_at: Option<DateTime<Utc>>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    geofence_id: Option<i64>,
+}
+
+/// Merges the live charges that start in `[from, to]` into the oldest one.
+///
+/// Refuses a window longer than a day, one without a charge, an open charge,
+/// a pause between two charges longer than [`CHARGE_RESUME_GRACE_SECS`], and a
+/// drive inside the merged span. The other charges are soft-deleted, not
+/// removed: their samples are copied and their positions re-attached. The
+/// summary comes from the code that closes live charges. Dry-run (`apply`
+/// false) runs in a read-only transaction. Running it again on the merged
+/// window only recomputes the summary.
+pub(crate) async fn rebuild_charge(
+    pool: &PgPool,
+    vehicle_id: i64,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    apply: bool,
+) -> Result<(ChargeRebuildReport, Vec<AddressJob>), AppError> {
+    if to <= from || to - from > REBUILD_MAX_WINDOW {
+        return Err(AppError::message(
+            "rebuild window must be positive and at most 24 hours",
+        ));
+    }
+    let fences = fetch_fences(pool).await?;
+    let mut tx = pool.begin().await?;
+    if !apply {
+        sqlx::query("SET TRANSACTION READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+    }
+    let charges: Vec<WindowCharge> = sqlx::query_as(
+        "SELECT id, start_at, end_at, latitude, longitude, geofence_id
+         FROM charges
+         WHERE vehicle_id = $1 AND deleted_at IS NULL
+           AND source IN ('poll', 'telemetry')
+           AND start_at BETWEEN $2 AND $3
+         ORDER BY start_at, id",
+    )
+    .bind(vehicle_id)
+    .bind(from)
+    .bind(to)
+    .fetch_all(&mut *tx)
+    .await?;
+    let Some(first) = charges.first() else {
+        return Err(AppError::message("no live charge starts in the window"));
+    };
+    let mut ends = Vec::with_capacity(charges.len());
+    for charge in &charges {
+        let Some(end_at) = charge.end_at else {
+            return Err(AppError::message("a charge in the window is still open"));
+        };
+        ends.push(end_at);
+    }
+    for (pair, previous_end) in charges.windows(2).zip(&ends) {
+        let pause = pair[1]
+            .start_at
+            .signed_duration_since(*previous_end)
+            .num_seconds();
+        if pause > CHARGE_RESUME_GRACE_SECS {
+            return Err(AppError::message(
+                "the charges are not contiguous; nothing to merge",
+            ));
+        }
+    }
+    let span_end = ends.iter().copied().max().unwrap_or(first.start_at);
+    let (drove,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (
+             SELECT 1 FROM drives
+             WHERE vehicle_id = $1 AND deleted_at IS NULL
+               AND start_at BETWEEN $2 AND $3
+         )",
+    )
+    .bind(vehicle_id)
+    .bind(first.start_at)
+    .bind(span_end)
+    .fetch_one(&mut *tx)
+    .await?;
+    if drove {
+        return Err(AppError::message("a drive starts inside the charges"));
+    }
+    let ids: Vec<i64> = charges.iter().map(|charge| charge.id).collect();
+    let rows = sqlx::query_as::<_, ChargeSampleRow>(
+        "SELECT recorded_at, battery_level, charger_power_kw, charge_energy_added_kwh,
+                ideal_range_km, rated_range_km, outside_temp_c
+         FROM charge_samples
+         WHERE charge_id = ANY($1)
+         ORDER BY recorded_at, id",
+    )
+    .bind(&ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    let samples: Vec<Sample> = rows.into_iter().map(ChargeSampleRow::into_sample).collect();
+    let summary = summarize_charge(&samples)
+        .ok_or_else(|| AppError::message("the charges have no samples"))?;
+    // The car's position then, not now: the last fix up to the end of the charge.
+    let own = charges
+        .iter()
+        .find_map(|charge| finite_place(charge.latitude, charge.longitude));
+    let place = if let Some(place) = own {
+        Some(place)
+    } else {
+        let fix: Option<(f64, f64)> = sqlx::query_as(
+            "SELECT latitude, longitude FROM positions
+             WHERE vehicle_id = $1 AND recorded_at <= $2
+               AND latitude IS NOT NULL AND longitude IS NOT NULL
+             ORDER BY recorded_at DESC
+             LIMIT 1",
+        )
+        .bind(vehicle_id)
+        .bind(span_end)
+        .fetch_optional(&mut *tx)
+        .await?;
+        fix.and_then(|(latitude, longitude)| finite_place(Some(latitude), Some(longitude)))
+    };
+    let geofence_id = charges
+        .iter()
+        .find_map(|charge| charge.geofence_id)
+        .or_else(|| place.and_then(|(lat, lon)| matching_geofence(lat, lon, &fences)));
+    let report = ChargeRebuildReport {
+        applied: apply,
+        charge_ids: ids.clone(),
+        samples: samples.len(),
+        start_at: summary.start,
+        end_at: summary.end,
+        energy_added_kwh: summary.energy_added_kwh,
+        energy_used_kwh: summary.energy_used_kwh,
+        start_battery_level: summary.start_battery_level,
+        end_battery_level: summary.end_battery_level,
+        located: place.is_some(),
+        geofence_id,
+    };
+    if !apply {
+        tx.rollback().await?;
+        return Ok((report, Vec::new()));
+    }
+    let keep = first.id;
+    let others = &ids[1..];
+    sqlx::query(
+        "INSERT INTO charge_samples (
+            charge_id, recorded_at, battery_level, usable_battery_level, charger_power_kw,
+            charger_voltage, charger_current, charge_energy_added_kwh, ideal_range_km,
+            rated_range_km, outside_temp_c, source
+         )
+         SELECT $1, recorded_at, battery_level, usable_battery_level, charger_power_kw,
+                charger_voltage, charger_current, charge_energy_added_kwh, ideal_range_km,
+                rated_range_km, outside_temp_c, source
+         FROM charge_samples WHERE charge_id = ANY($2)
+         ON CONFLICT (charge_id, recorded_at, source) DO NOTHING",
+    )
+    .bind(keep)
+    .bind(others)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE positions SET charge_id = $1
+         WHERE vehicle_id = $2 AND drive_id IS NULL
+           AND (charge_id = ANY($3)
+                OR (charge_id IS NULL AND recorded_at BETWEEN $4 AND $5))",
+    )
+    .bind(keep)
+    .bind(vehicle_id)
+    .bind(others)
+    .bind(summary.start)
+    .bind(summary.end)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE charges SET deleted_at = now(),
+                note = COALESCE(note, 'merged into charge ' || $2::text)
+         WHERE id = ANY($1)",
+    )
+    .bind(others)
+    .bind(keep)
+    .execute(&mut *tx)
+    .await?;
+    let located = write_charge_summary(&mut tx, keep, &summary, place, geofence_id).await?;
+    tx.commit().await?;
+    let jobs = located
+        .map(|(latitude, longitude)| AddressJob {
+            drive_id: None,
+            charge_id: Some(keep),
+            which: "end",
+            latitude,
+            longitude,
+        })
+        .into_iter()
+        .collect();
+    Ok((report, jobs))
+}
+
+/// Text report for the `rebuild-charge` command.
+pub(crate) fn format_charge_rebuild(report: &ChargeRebuildReport) -> String {
+    let mode = if report.applied { "apply" } else { "dry-run" };
+    let number = |value: Option<f64>, digits: usize| {
+        value.map_or_else(|| "unknown".to_owned(), |value| format!("{value:.digits$}"))
+    };
+    let ids: Vec<String> = report.charge_ids.iter().map(ToString::to_string).collect();
+    format!(
+        "mode={mode}\ncharges={}\nkept={}\nsamples={}\nstart_at={}\nend_at={}\n\
+         energy_added_kwh={}\nenergy_used_kwh={}\nbattery={}->{}\nlocated={}\ngeofence_id={}\n",
+        ids.join(","),
+        ids.first().map_or("none", String::as_str),
+        report.samples,
+        report.start_at.to_rfc3339(),
+        report.end_at.to_rfc3339(),
+        number(report.energy_added_kwh, 3),
+        number(report.energy_used_kwh, 3),
+        number(report.start_battery_level, 1),
+        number(report.end_battery_level, 1),
+        report.located,
+        report
+            .geofence_id
+            .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+    )
+}
+
 /// Connects and runs [`repair_drive_ends`]. The URL is not logged.
 pub(crate) async fn repair_drive_ends_at(
     database_url: &str,
@@ -1993,12 +2396,17 @@ async fn update_drive(
     Ok(())
 }
 
+/// Closes a charge from its stored samples and returns where it took place.
+///
+/// `fallback` is the last known car position, used when neither the charge row
+/// nor the closing reading carries one.
 async fn close_charge(
     tx: &mut Transaction<'_, Postgres>,
     charge_id: i64,
     obs: &Observation,
+    fallback: Option<(f64, f64)>,
     geofence_id: Option<i64>,
-) -> Result<(), AppError> {
+) -> Result<Option<(f64, f64)>, AppError> {
     let rows = sqlx::query_as::<_, ChargeSampleRow>(
         "SELECT recorded_at, battery_level, charger_power_kw, charge_energy_added_kwh,
                 ideal_range_km, rated_range_km, outside_temp_c
@@ -2019,10 +2427,6 @@ async fn close_charge(
         if last.fast_charger_type.is_none() {
             last.fast_charger_type.clone_from(&obs.fast_charger_type);
         }
-        if last.latitude.is_none() {
-            last.latitude = obs.latitude;
-            last.longitude = obs.longitude;
-        }
     }
     let Some(summary) = summarize_charge(&samples) else {
         sqlx::query("UPDATE charges SET end_at = $2 WHERE id = $1 AND end_at IS NULL")
@@ -2030,9 +2434,21 @@ async fn close_charge(
             .bind(obs.at)
             .execute(&mut **tx)
             .await?;
-        return Ok(());
+        return Ok(None);
     };
-    sqlx::query(
+    write_charge_summary(tx, charge_id, &summary, fallback, geofence_id).await
+}
+
+/// Stores a charge summary. The charge keeps its own position when it has one.
+async fn write_charge_summary(
+    tx: &mut Transaction<'_, Postgres>,
+    charge_id: i64,
+    summary: &crate::state::ChargeSummary,
+    fallback: Option<(f64, f64)>,
+    geofence_id: Option<i64>,
+) -> Result<Option<(f64, f64)>, AppError> {
+    let place = finite_place(summary.latitude, summary.longitude).or(fallback);
+    let row: (Option<f64>, Option<f64>) = sqlx::query_as(
         "UPDATE charges SET
             start_at = $2,
             end_at = $3,
@@ -2043,8 +2459,8 @@ async fn close_charge(
             end_rated_range_km = $8,
             start_ideal_range_km = $9,
             end_ideal_range_km = $10,
-            latitude = COALESCE($11, latitude),
-            longitude = COALESCE($12, longitude),
+            latitude = COALESCE(latitude, $11),
+            longitude = COALESCE(longitude, $12),
             is_dc = COALESCE(is_dc, $13),
             charger_type = COALESCE(
                 CASE
@@ -2059,8 +2475,10 @@ async fn close_charge(
             max_power_kw = $15,
             duration_s = $16,
             outside_temp_avg_c = $17,
-            geofence_id = COALESCE($18, geofence_id)
-         WHERE id = $1",
+            geofence_id = COALESCE(geofence_id, $18),
+            energy_used_kwh = COALESCE($19, energy_used_kwh)
+         WHERE id = $1
+         RETURNING latitude, longitude",
     )
     .bind(charge_id)
     .bind(summary.start)
@@ -2072,17 +2490,18 @@ async fn close_charge(
     .bind(summary.end_rated_range_km)
     .bind(summary.start_ideal_range_km)
     .bind(summary.end_ideal_range_km)
-    .bind(summary.latitude)
-    .bind(summary.longitude)
+    .bind(place.map(|(latitude, _)| latitude))
+    .bind(place.map(|(_, longitude)| longitude))
     .bind(summary.is_dc)
     .bind(&summary.charger_type)
     .bind(summary.max_power_kw)
     .bind(summary.duration_s)
     .bind(summary.outside_temp_avg_c)
     .bind(geofence_id)
-    .execute(&mut **tx)
+    .bind(summary.energy_used_kwh)
+    .fetch_one(&mut **tx)
     .await?;
-    Ok(())
+    Ok(finite_place(row.0, row.1))
 }
 
 async fn update_vehicle_meta(

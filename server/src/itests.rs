@@ -2029,6 +2029,337 @@ async fn charge_start_closes_the_drive_immediately() {
     assert_eq!(charges.0, 1);
 }
 
+/// The pauses measured between the nine rows of the 27/11/2026 charge, in seconds.
+const CHARGE_NIGHT_GAPS: [i64; 8] = [117, 68, 60, 96, 247, 146, 26, 26];
+
+fn charge_reading(at: DateTime<Utc>, state: &str, soc: f64) -> Observation {
+    let mut obs = Observation::at(at, Presence::Online);
+    obs.charging_state = Some(state.to_owned());
+    obs.charger_power_kw = Some(if state == "Charging" { 7.0 } else { 0.0 });
+    obs.battery_level = Some(soc);
+    obs.shift_state = Some("P".to_owned());
+    obs
+}
+
+async fn live_charges(pool: &sqlx::PgPool, vin: &str) -> Vec<(i64, Option<DateTime<Utc>>)> {
+    sqlx::query_as(
+        "SELECT c.id, c.end_at FROM charges c JOIN vehicles v ON v.id = c.vehicle_id
+         WHERE v.vin = $1 AND c.deleted_at IS NULL ORDER BY c.start_at",
+    )
+    .bind(vin)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn short_charge_pauses_resume_one_charge() {
+    let Some(db) = TestDb::migrated("chargegap").await else {
+        return;
+    };
+    let archive = test_archive(db.pool.clone());
+    let vin = "5YJ3E1EA7KF000131";
+    let send = |obs: Observation| {
+        crate::ingest::apply_telemetry_for_vin(&archive, vin, car(vin), obs, false)
+    };
+    let mut at = Utc.with_ymd_and_hms(2026, 11, 27, 1, 30, 0).unwrap();
+    let mut soc = 59.0;
+    for gap in CHARGE_NIGHT_GAPS {
+        for _ in 0..10 {
+            send(charge_reading(at, "Charging", soc)).await.unwrap();
+            at += chrono::Duration::minutes(1);
+            soc += 0.15;
+        }
+        // The car reports a pause; charging resumes `gap` seconds later.
+        send(charge_reading(at, "Stopped", soc)).await.unwrap();
+        at += chrono::Duration::seconds(gap);
+    }
+    send(charge_reading(at, "Charging", soc)).await.unwrap();
+    send(charge_reading(
+        at + chrono::Duration::minutes(5),
+        "Complete",
+        soc + 0.5,
+    ))
+    .await
+    .unwrap();
+    let rows = live_charges(&db.pool, vin).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].1.is_some(), "closed on Complete");
+
+    // A pause longer than the grace starts a second charge.
+    let later = at
+        + chrono::Duration::minutes(5)
+        + chrono::Duration::seconds(crate::persist::CHARGE_RESUME_GRACE_SECS + 1);
+    send(charge_reading(later, "Charging", soc + 0.5))
+        .await
+        .unwrap();
+    assert_eq!(live_charges(&db.pool, vin).await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_drive_between_two_charges_keeps_them_apart() {
+    let Some(db) = TestDb::migrated("chargedrive").await else {
+        return;
+    };
+    let archive = test_archive(db.pool.clone());
+    let vin = "5YJ3E1EA7KF000137";
+    let base = Utc.with_ymd_and_hms(2026, 11, 27, 1, 30, 0).unwrap();
+    let send = |obs: Observation| apply_for_vin(&archive, vin, car(vin), obs, true, false);
+    send(charge_reading(base, "Charging", 50.0)).await.unwrap();
+    send(charge_reading(
+        base + chrono::Duration::minutes(1),
+        "Disconnected",
+        51.0,
+    ))
+    .await
+    .unwrap();
+    send(shifted(
+        base + chrono::Duration::minutes(2),
+        "D",
+        Some(10.0),
+        10.0,
+        20.0,
+    ))
+    .await
+    .unwrap();
+    send(charge_reading(
+        base + chrono::Duration::minutes(4),
+        "Charging",
+        50.0,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(live_charges(&db.pool, vin).await.len(), 2);
+}
+
+/// Seeds the nine closed rows a split night charge left behind: power and SoC
+/// on every sample, no energy counter and no position.
+async fn seed_split_charge(pool: &sqlx::PgPool, vehicle_id: i64, start: DateTime<Utc>) -> Vec<i64> {
+    let mut ids = Vec::new();
+    let mut at = start;
+    let mut soc = 59.0;
+    for gap in CHARGE_NIGHT_GAPS.iter().copied().chain([0]) {
+        let begin = at;
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO charges (vehicle_id, start_at, source) VALUES ($1, $2, 'poll') RETURNING id",
+        )
+        .bind(vehicle_id)
+        .bind(begin)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        for _ in 0..=10 {
+            sqlx::query(
+                "INSERT INTO charge_samples (charge_id, recorded_at, battery_level, charger_power_kw, source)
+                 VALUES ($1, $2, $3, 7.0, 'poll')",
+            )
+            .bind(id)
+            .bind(at)
+            .bind(soc)
+            .execute(pool)
+            .await
+            .unwrap();
+            at += chrono::Duration::minutes(1);
+            soc += 0.15;
+        }
+        at -= chrono::Duration::minutes(1);
+        sqlx::query("UPDATE charges SET end_at = $2 WHERE id = $1")
+            .bind(id)
+            .bind(at)
+            .execute(pool)
+            .await
+            .unwrap();
+        ids.push(id);
+        at += chrono::Duration::seconds(gap);
+    }
+    ids
+}
+
+#[tokio::test]
+async fn rebuild_charge_merges_a_split_charge_once() {
+    let Some(db) = TestDb::migrated("rebuildcharge").await else {
+        return;
+    };
+    let vin = "5YJ3E1EA7KF000139";
+    let (vehicle_id,): (i64,) =
+        sqlx::query_as("INSERT INTO vehicles (vin, name) VALUES ($1, 'Test') RETURNING id")
+            .bind(vin)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let (home,): (i64,) = sqlx::query_as(
+        "INSERT INTO geofences (name, latitude, longitude, radius_m)
+         VALUES ('Home', 10.0, 20.0, 50) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let start = Utc.with_ymd_and_hms(2026, 11, 27, 1, 30, 0).unwrap();
+    // The last fix before the night, then a later one somewhere else.
+    for (at, latitude) in [
+        (start - chrono::Duration::hours(2), 10.0),
+        (start + chrono::Duration::hours(6), 11.0),
+    ] {
+        sqlx::query(
+            "INSERT INTO positions (vehicle_id, recorded_at, latitude, longitude, source)
+             VALUES ($1, $2, $3, 20.0, 'poll')",
+        )
+        .bind(vehicle_id)
+        .bind(at)
+        .bind(latitude)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let ids = seed_split_charge(&db.pool, vehicle_id, start).await;
+    assert_eq!(ids.len(), 9);
+    // A telemetry point left in a pause between two rows.
+    sqlx::query(
+        "INSERT INTO positions (vehicle_id, recorded_at, battery_level, source)
+         VALUES ($1, $2, 60.7, 'telemetry')",
+    )
+    .bind(vehicle_id)
+    .bind(start + chrono::Duration::seconds(10 * 60 + 30))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let from = start - chrono::Duration::minutes(5);
+    let to = start + chrono::Duration::hours(3);
+
+    let (dry, jobs) = crate::persist::rebuild_charge(&db.pool, vehicle_id, from, to, false)
+        .await
+        .unwrap();
+    assert!(!dry.applied);
+    assert!(jobs.is_empty());
+    assert_eq!(dry.charge_ids, ids);
+    assert_eq!(dry.samples, 99);
+    assert_eq!(dry.start_at, start);
+    assert!(dry.located);
+    assert_eq!(dry.geofence_id, Some(home));
+    let kwh = dry.energy_added_kwh.unwrap();
+    assert!(kwh > 11.0 && kwh < 12.5, "{kwh}");
+    let text = crate::persist::format_charge_rebuild(&dry);
+    assert!(text.contains("mode=dry-run"));
+    assert!(!text.contains("10.0") && !text.contains(vin), "{text}");
+    assert_eq!(
+        live_charges_by_id(&db.pool, vehicle_id).await.len(),
+        9,
+        "a dry run writes nothing"
+    );
+
+    let (applied, jobs) = crate::persist::rebuild_charge(&db.pool, vehicle_id, from, to, true)
+        .await
+        .unwrap();
+    assert!(applied.applied);
+    assert_eq!(jobs.len(), 1);
+    let live = live_charges_by_id(&db.pool, vehicle_id).await;
+    assert_eq!(live, vec![ids[0]]);
+    type Merged = (
+        Option<f64>,
+        Option<f64>,
+        Option<i64>,
+        Option<DateTime<Utc>>,
+        Option<f64>,
+    );
+    let row: Merged = sqlx::query_as(
+        "SELECT energy_added_kwh, latitude, geofence_id, end_at, end_battery_level
+             FROM charges WHERE id = $1",
+    )
+    .bind(ids[0])
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, applied.energy_added_kwh);
+    assert_eq!(row.1, Some(10.0), "position before the charge, not after");
+    assert_eq!(row.2, Some(home));
+    assert_eq!(row.3, Some(applied.end_at));
+    assert_eq!(row.4, applied.end_battery_level);
+    let (attached,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM positions WHERE charge_id = $1")
+        .bind(ids[0])
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(attached, 1, "the point in the pause joins the charge");
+    let (trashed,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM charges WHERE vehicle_id = $1 AND deleted_at IS NOT NULL",
+    )
+    .bind(vehicle_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(trashed, 8, "merged rows are soft-deleted, not removed");
+
+    let (again, _) = crate::persist::rebuild_charge(&db.pool, vehicle_id, from, to, true)
+        .await
+        .unwrap();
+    assert_eq!(again.charge_ids, vec![ids[0]]);
+    assert_eq!(again.energy_added_kwh, applied.energy_added_kwh);
+    assert_eq!(live_charges_by_id(&db.pool, vehicle_id).await, vec![ids[0]]);
+
+    assert!(
+        crate::persist::rebuild_charge(&db.pool, vehicle_id, to, from, false)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn rebuild_charge_refuses_a_drive_or_a_long_pause() {
+    let Some(db) = TestDb::migrated("rebuildchargeno").await else {
+        return;
+    };
+    let (vehicle_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO vehicles (vin, name) VALUES ('5YJ3E1EA7KF000141', 'T') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let start = Utc.with_ymd_and_hms(2026, 11, 27, 1, 30, 0).unwrap();
+    let ids = seed_split_charge(&db.pool, vehicle_id, start).await;
+    let from = start - chrono::Duration::minutes(5);
+    let to = start + chrono::Duration::hours(3);
+    sqlx::query(
+        "INSERT INTO drives (vehicle_id, start_at, end_at, source) VALUES ($1, $2, $3, 'poll')",
+    )
+    .bind(vehicle_id)
+    .bind(start + chrono::Duration::minutes(30))
+    .bind(start + chrono::Duration::minutes(31))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let Err(err) = crate::persist::rebuild_charge(&db.pool, vehicle_id, from, to, true).await
+    else {
+        panic!("a drive inside the charges is refused");
+    };
+    assert!(err.to_string().contains("drive"), "{err}");
+    sqlx::query("DELETE FROM drives WHERE vehicle_id = $1")
+        .bind(vehicle_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE charges SET start_at = start_at + interval '20 minutes' WHERE id = $1")
+        .bind(ids[8])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let Err(err) = crate::persist::rebuild_charge(&db.pool, vehicle_id, from, to, true).await
+    else {
+        panic!("a long pause is refused");
+    };
+    assert!(err.to_string().contains("contiguous"), "{err}");
+    assert_eq!(live_charges_by_id(&db.pool, vehicle_id).await.len(), 9);
+}
+
+async fn live_charges_by_id(pool: &sqlx::PgPool, vehicle_id: i64) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT id FROM charges WHERE vehicle_id = $1 AND deleted_at IS NULL ORDER BY start_at",
+    )
+    .bind(vehicle_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn reopen_joins_a_closed_drive_when_the_gap_was_still_moving() {
     let Some(db) = TestDb::migrated("reopen").await else {

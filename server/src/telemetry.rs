@@ -38,6 +38,8 @@ use crate::units::{miles_to_km, speed_to_kmh};
 /// plugged-in status are included. `ChargeState` stays for older firmware.
 /// `Odometer` and `Soc` are re-sent every five minutes: the car only publishes a
 /// change, so a reconnect or a logger restart would otherwise leave them empty.
+/// `DCChargingEnergyIn` is the battery-side session counter, the telemetry
+/// equivalent of `charge_energy_added`, for AC and DC charging alike.
 pub(crate) fn subscription(
     hostname: &str,
     port: u16,
@@ -64,6 +66,7 @@ pub(crate) fn subscription(
         .field_with("TimeToFullCharge", pace(300, Some(0.1), None))
         .field_with("ACChargingPower", pace(60, Some(0.5), None))
         .field_with("DCChargingPower", pace(60, Some(0.5), None))
+        .field_with("DCChargingEnergyIn", pace(60, Some(0.1), Some(300)))
         .build()
         .map_err(|err| AppError::message(err.to_string()))?;
     let value = config
@@ -340,7 +343,36 @@ fn fold_datums(obs: &mut Observation, data: &[DecodedDatum], metric: bool) {
     }) {
         obs.charging_state = Some(state.to_owned());
     }
+    // AC and DC power can arrive together; the charger power is the larger of
+    // the two in this payload, not the largest value ever folded.
+    let power = data
+        .iter()
+        .filter(|datum| {
+            matches!(
+                datum.field,
+                FieldKey::Known(Field::AcChargingPower | Field::DcChargingPower)
+            )
+        })
+        .filter_map(|datum| number(&datum.value))
+        .reduce(f64::max);
+    if let Some(power) = power {
+        obs.charger_power_kw = Some(power);
+    } else if !charging_label(obs.charging_state.as_deref()) {
+        // Power is published on change only. Once the car reports it is no
+        // longer charging, a held value would be stale.
+        if obs.charger_power_kw.is_some() {
+            obs.charger_power_kw = Some(0.0);
+        }
+    }
+    if obs.charging_state.as_deref() == Some("Disconnected") {
+        // The session counter belongs to the plug-in that just ended.
+        obs.charge_energy_added_kwh = None;
+    }
     refresh_plugged_in(obs);
+}
+
+fn charging_label(state: Option<&str>) -> bool {
+    matches!(state, None | Some("Charging" | "Starting"))
 }
 
 fn apply_field(obs: &mut Observation, field: FieldKey, value: &DatumValue, metric: bool) {
@@ -374,23 +406,17 @@ fn apply_field(obs: &mut Observation, field: FieldKey, value: &DatumValue, metri
                 obs.charging_state = Some(label.to_owned());
             }
         }
+        // Power is folded per payload in `fold_datums`.
         Field::AcChargingPower | Field::DcChargingPower => {
-            if let Some(power) = number(value) {
-                obs.charger_power_kw = Some(
-                    obs.charger_power_kw
-                        .map_or(power, |current| current.max(power)),
-                );
-                if matches!(field, Field::DcChargingPower) && power > 0.0 {
-                    obs.fast_charger = Some(true);
-                }
+            if matches!(field, Field::DcChargingPower) && number(value).is_some_and(|kw| kw > 0.0) {
+                obs.fast_charger = Some(true);
             }
         }
-        Field::AcChargingEnergyIn | Field::DcChargingEnergyIn => {
-            if let Some(energy) = number(value) {
-                obs.charge_energy_added_kwh = Some(
-                    obs.charge_energy_added_kwh
-                        .map_or(energy, |current| current.max(energy)),
-                );
+        // AC energy is measured before the charger losses; only the battery-side
+        // counter matches `charge_energy_added`.
+        Field::DcChargingEnergyIn => {
+            if let Some(energy) = nonneg(number(value)) {
+                obs.charge_energy_added_kwh = Some(energy);
             }
         }
         Field::ChargeLimitSoc => obs.charge_limit_soc = number(value),
@@ -809,6 +835,110 @@ mod tests {
         refresh_plugged_in(&mut obs);
         assert_eq!(obs.charging_state.as_deref(), Some("Stopped"));
         assert_eq!(obs.plugged_in, Some(true));
+    }
+
+    fn charge_payload(
+        state: tesla_fleet_telemetry::proto::vehicle_data::DetailedChargeStateValue,
+        values: &[(tesla_fleet_telemetry::proto::vehicle_data::Field, f64)],
+    ) -> Vec<super::DecodedDatum> {
+        use tesla_fleet_telemetry::proto::vehicle_data::Field;
+        use tesla_fleet_telemetry::{DatumValue, FieldKey, TypedEnum};
+        let mut data = vec![super::DecodedDatum {
+            field: FieldKey::Known(Field::DetailedChargeState),
+            value: DatumValue::DetailedChargeState(TypedEnum::Known(state)),
+        }];
+        data.extend(values.iter().map(|(field, value)| super::DecodedDatum {
+            field: FieldKey::Known(*field),
+            value: DatumValue::Double(*value),
+        }));
+        data
+    }
+
+    #[test]
+    fn charger_power_follows_the_latest_payload_instead_of_the_highest_ever() {
+        use super::fold_datums;
+        use tesla_fleet_telemetry::proto::vehicle_data::{DetailedChargeStateValue, Field};
+
+        let mut obs = Observation::at(Utc::now(), Presence::Online);
+        fold_datums(
+            &mut obs,
+            &charge_payload(
+                DetailedChargeStateValue::DetailedChargeStateCharging,
+                &[(Field::AcChargingPower, 7.2), (Field::DcChargingPower, 0.0)],
+            ),
+            true,
+        );
+        assert_eq!(obs.charger_power_kw, Some(7.2));
+        fold_datums(
+            &mut obs,
+            &charge_payload(
+                DetailedChargeStateValue::DetailedChargeStateComplete,
+                &[(Field::AcChargingPower, 0.0)],
+            ),
+            true,
+        );
+        assert_eq!(
+            obs.charger_power_kw,
+            Some(0.0),
+            "power drops when charging stops"
+        );
+    }
+
+    #[test]
+    fn charge_energy_comes_from_the_battery_side_counter() {
+        use super::fold_datums;
+        use tesla_fleet_telemetry::proto::vehicle_data::{DetailedChargeStateValue, Field};
+
+        let mut obs = Observation::at(Utc::now(), Presence::Online);
+        fold_datums(
+            &mut obs,
+            &charge_payload(
+                DetailedChargeStateValue::DetailedChargeStateCharging,
+                &[
+                    (Field::AcChargingEnergyIn, 17.4),
+                    (Field::DcChargingEnergyIn, 16.1),
+                ],
+            ),
+            true,
+        );
+        // DCChargingEnergyIn is the vehicle_data charge_energy_added equivalent.
+        assert_eq!(obs.charge_energy_added_kwh, Some(16.1));
+        fold_datums(
+            &mut obs,
+            &charge_payload(
+                DetailedChargeStateValue::DetailedChargeStateDisconnected,
+                &[],
+            ),
+            true,
+        );
+        assert_eq!(
+            obs.charge_energy_added_kwh, None,
+            "an unplugged cable ends the session counter"
+        );
+        fold_datums(
+            &mut obs,
+            &charge_payload(
+                DetailedChargeStateValue::DetailedChargeStateCharging,
+                &[(Field::DcChargingEnergyIn, 0.4)],
+            ),
+            true,
+        );
+        assert_eq!(obs.charge_energy_added_kwh, Some(0.4));
+    }
+
+    #[test]
+    fn subscription_streams_the_charge_energy_counter() {
+        let request = subscription(
+            "logger.example",
+            4443,
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+            &["TEST00000000VIN01".to_owned()],
+        )
+        .unwrap();
+        let fields = &request.config.fields;
+        let energy = &fields["DCChargingEnergyIn"];
+        assert_eq!(energy.minimum_delta, Some(0.1));
+        assert_eq!(energy.resend_interval_seconds, Some(300));
     }
 
     #[test]
