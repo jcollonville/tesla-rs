@@ -220,6 +220,27 @@ test("charge row shows energy, power and cost", () => {
   assert.equal(el.shadowRoot.querySelector("svg.car"), null);
 });
 
+test("a closed charge without energy is not shown as in progress", () => {
+  const base = {
+    id: 3,
+    start_at: "2026-11-27T01:30:00Z",
+    energy_added_kwh: null,
+    is_dc: false,
+    source: "telemetry",
+  };
+  const closed = mount("tl-charge-row", {
+    attrs: { href: "/charges/3", locale: "fr", "time-zone": "UTC" },
+    data: { ...base, end_at: "2026-11-27T01:40:00Z", duration_s: 600 },
+  });
+  assert.doesNotMatch(closed.shadowRoot.textContent, /en cours/i);
+  assert.match(closed.shadowRoot.textContent, /—/);
+  const open = mount("tl-charge-row", {
+    attrs: { href: "/charges/4", locale: "fr", "time-zone": "UTC" },
+    data: { ...base, id: 4, end_at: null },
+  });
+  assert.match(open.shadowRoot.textContent, /En cours/);
+});
+
 test("period chips and tabs are data driven", () => {
   const chips = mount("tl-period-chips", {
     attrs: { label: "Période" },

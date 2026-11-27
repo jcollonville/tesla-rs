@@ -463,8 +463,10 @@ pub(crate) enum Transition {
 /// or when speed is above 1 km/h and no park shift is reported. Charging closes an
 /// open drive immediately. Park, sleep, offline, and an incomplete poll do not:
 /// [`plan_drive_close`] keeps the drive open until the matching grace has elapsed.
-/// A charge starts on `Charging` or `Starting` and ends on any other charging state,
-/// including sleep. The reducer never asks the car to wake.
+/// A charge starts on `Charging` or `Starting` and ends on any other known charging
+/// state, on sleep, or when a drive starts. A reading without a charging state (a
+/// vehicle-list cycle, a telemetry disconnect) says nothing about the cable, so an
+/// open charge stays open. The reducer never asks the car to wake.
 pub(crate) fn reduce(tracker: &Tracker, obs: &Observation) -> (Tracker, Vec<Transition>) {
     let driving = is_driving(obs);
     let charging = is_charging(obs);
@@ -501,6 +503,14 @@ pub(crate) fn reduce(tracker: &Tracker, obs: &Observation) -> (Tracker, Vec<Tran
     }
 
     if tracker.charge_open {
+        if charge_continues(obs) {
+            next.activity = match obs.presence {
+                Presence::Online => Activity::Charging,
+                Presence::Asleep => Activity::Asleep,
+                Presence::Offline => Activity::Offline,
+            };
+            return (next, events);
+        }
         events.push(Transition::ChargeEnded);
         next.charge_open = false;
     }
@@ -541,6 +551,13 @@ fn is_charging(obs: &Observation) -> bool {
             .as_deref(),
         Some("charging" | "starting")
     )
+}
+
+/// An open charge survives a reading that does not report a charging state.
+///
+/// A car does not sleep while it charges, so `Asleep` ends the charge.
+fn charge_continues(obs: &Observation) -> bool {
+    obs.presence != Presence::Asleep && nonempty(obs.charging_state.as_deref()).is_none()
 }
 
 fn is_updating(obs: &Observation) -> bool {
@@ -1518,7 +1535,11 @@ pub(crate) fn summarize_drive(
 pub(crate) struct ChargeSummary {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
+    /// Battery-side counter (`charge_energy_added`, telemetry
+    /// `DCChargingEnergyIn`). Without one, the integrated charger power.
     pub energy_added_kwh: Option<f64>,
+    /// Integrated charger input power. AC only: DC power is not metered here.
+    pub energy_used_kwh: Option<f64>,
     pub start_battery_level: Option<f64>,
     pub end_battery_level: Option<f64>,
     pub start_rated_range_km: Option<f64>,
@@ -1554,14 +1575,21 @@ pub(crate) fn summarize_charge(samples: &[Sample]) -> Option<ChargeSummary> {
     let charger_type = samples
         .iter()
         .find_map(|sample| sanitize_charger_type(sample.fast_charger_type.as_deref()));
+    let counter = max_finite(
+        samples
+            .iter()
+            .filter_map(|sample| sample.charge_energy_added_kwh),
+    );
+    let integrated = integrated_power_kwh(samples);
     Some(ChargeSummary {
         start: first.at,
         end: last.at,
-        energy_added_kwh: max_finite(
-            samples
-                .iter()
-                .filter_map(|sample| sample.charge_energy_added_kwh),
-        ),
+        energy_added_kwh: counter.or(integrated),
+        energy_used_kwh: if is_dc == Some(true) {
+            None
+        } else {
+            integrated
+        },
         start_battery_level: first_finite(samples.iter().filter_map(|sample| sample.battery_level)),
         end_battery_level: last_finite(samples.iter().filter_map(|sample| sample.battery_level)),
         start_rated_range_km: first_finite(
@@ -1580,6 +1608,37 @@ pub(crate) fn summarize_charge(samples: &[Sample]) -> Option<ChargeSummary> {
         duration_s: duration_s(first.at, last.at),
         outside_temp_avg_c: mean(samples.iter().filter_map(|sample| sample.outside_temp_c)),
     })
+}
+
+/// Longest pause between two charge samples that is still integrated.
+///
+/// Telemetry re-sends the state of charge every five minutes, so a longer
+/// silence is a gap in the data, not a steady charge.
+pub(crate) const CHARGE_POWER_GAP_MAX_SECS: i64 = 1_800;
+
+/// Charger power integrated over time, holding each reading until the next.
+///
+/// `ACChargingPower` is published on change only, so the last value holds.
+/// `None` when no interval could be integrated.
+pub(crate) fn integrated_power_kwh(samples: &[Sample]) -> Option<f64> {
+    let mut total = None;
+    let mut held: Option<(DateTime<Utc>, f64)> = None;
+    for sample in samples {
+        if let Some((since, power)) = held {
+            let millis = sample.at.signed_duration_since(since).num_milliseconds();
+            if millis > 0 && millis <= CHARGE_POWER_GAP_MAX_SECS * 1_000 {
+                #[allow(clippy::cast_precision_loss)]
+                let hours = millis as f64 / 3_600_000.0;
+                total = Some(total.unwrap_or(0.0) + power.max(0.0) * hours);
+            }
+        }
+        let power = sample
+            .charger_power_kw
+            .filter(|power| power.is_finite())
+            .or(held.map(|(_, power)| power));
+        held = power.map(|power| (sample.at, power));
+    }
+    total
 }
 
 pub(crate) fn range_energy(
@@ -2384,6 +2443,77 @@ mod tests {
         };
         assert!(!super::split_candidate(&parked, 300));
         assert!(!super::should_reopen_drive(&parked, 300));
+    }
+
+    fn charging(minute: i64, soc: f64, power_kw: f64) -> Observation {
+        let mut obs = online(minute);
+        obs.charging_state = Some("Charging".to_owned());
+        obs.charger_power_kw = Some(power_kw);
+        obs.battery_level = Some(soc);
+        obs
+    }
+
+    #[test]
+    fn a_charge_stays_open_on_a_reading_without_a_charging_state() {
+        let tracker = Tracker::default();
+        let (open, events) = reduce(&tracker, &charging(0, 59.0, 7.0));
+        assert_eq!(events, vec![Transition::ChargeStarted]);
+        // The vehicle list says online and telemetry is fresh, so the poller
+        // records a bare resting reading. It carries no charging state.
+        let (still, events) = reduce(&open, &online(12));
+        assert_eq!(events, [], "a list-only cycle must not end the charge");
+        assert!(still.charge_open);
+        assert_eq!(still.activity, Activity::Charging);
+        let offline = Observation::at(at(13), Presence::Offline);
+        let (still, events) = reduce(&still, &offline);
+        assert_eq!(events, [], "a dropped connection must not end the charge");
+        assert!(still.charge_open);
+        let (again, events) = reduce(&still, &charging(14, 61.0, 7.0));
+        assert_eq!(events, [], "no second charge is opened");
+        assert!(again.charge_open);
+    }
+
+    #[test]
+    fn a_charge_ends_on_a_known_state_or_sleep() {
+        for state in ["Complete", "Stopped", "Disconnected", "NoPower"] {
+            let (open, _) = reduce(&Tracker::default(), &charging(0, 59.0, 7.0));
+            let mut done = online(5);
+            done.charging_state = Some(state.to_owned());
+            let (closed, events) = reduce(&open, &done);
+            assert_eq!(events, vec![Transition::ChargeEnded], "{state}");
+            assert!(!closed.charge_open);
+        }
+        let (open, _) = reduce(&Tracker::default(), &charging(0, 59.0, 7.0));
+        let (closed, events) = reduce(&open, &Observation::at(at(5), Presence::Asleep));
+        assert_eq!(events, vec![Transition::ChargeEnded]);
+        assert!(!closed.charge_open);
+    }
+
+    #[test]
+    fn charge_energy_comes_from_power_when_no_counter_is_reported() {
+        // Telemetry: ACChargingPower at 7 kW for two hours, one reading every
+        // five minutes, no charge_energy_added.
+        let samples: Vec<Sample> = (0..=24)
+            .map(|step| {
+                charging(step * 5, 59.0 + f64::from(u8::try_from(step).unwrap()), 7.0).sample()
+            })
+            .collect();
+        let charge = summarize_charge(&samples).unwrap();
+        let kwh = charge.energy_added_kwh.expect("energy from power");
+        assert!((kwh - 14.0).abs() < 1e-6, "{kwh}");
+        // A gap longer than the cap is not integrated.
+        let gapped = [
+            charging(0, 59.0, 7.0).sample(),
+            charging(120, 80.0, 7.0).sample(),
+        ];
+        assert_eq!(summarize_charge(&gapped).unwrap().energy_added_kwh, None);
+        // A reported counter still wins.
+        let mut with_counter = samples.clone();
+        if let Some(last) = with_counter.last_mut() {
+            last.charge_energy_added_kwh = Some(13.2);
+        }
+        let kwh = summarize_charge(&with_counter).unwrap().energy_added_kwh;
+        assert_eq!(kwh, Some(13.2));
     }
 
     #[test]

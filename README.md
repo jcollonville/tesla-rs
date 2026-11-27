@@ -396,6 +396,13 @@ cargo run -p tesla-logger -- rebuild-drive --vehicle-id 1 --from 2026-01-01T10:0
 cargo run -p tesla-logger -- rebuild-drive --vehicle-id 1 --from 2026-01-01T10:00:00Z --to 2026-01-01T10:20:00Z --apply
 ```
 
+Merge the live charges that start in a window into the oldest one, for a charge that an earlier version split into several rows. The window is RFC 3339 and at most 24 hours. The command refuses an open charge, a pause between two charges longer than 10 minutes, and a drive inside the charges. The other rows are soft-deleted (`deleted_at`, with a note naming the kept charge): their samples are copied to the kept charge and their positions, plus the detached points in the pauses, are attached to it. Energy comes from the charge energy counter, or else from the charger power integrated over time; the position is the last fix up to the end of the charge. Without `--apply` it runs in a read-only transaction and only prints ids, times, energy and state of charge (no coordinates, VIN, or secrets). A second `--apply` only recomputes the summary.
+
+```bash
+cargo run -p tesla-logger -- rebuild-charge --vehicle-id 1 --from 2026-01-01T01:25:00Z --to 2026-01-01T03:55:00Z
+cargo run -p tesla-logger -- rebuild-charge --vehicle-id 1 --from 2026-01-01T01:25:00Z --to 2026-01-01T03:55:00Z --apply
+```
+
 ### Check the setup
 
 These checks assume the listener is on port 4000, as in the example file and Compose.

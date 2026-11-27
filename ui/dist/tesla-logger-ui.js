@@ -1552,7 +1552,7 @@ class Le extends A {
     return this.getAttribute("href");
   }
   paint(e) {
-    const r = I(this), i = j(this) || {}, a = this.getAttribute("href") || i.href || "", n = H(i.address, i.geofence), o = n ? n.name : r.strings.unknownPlace, s = i.is_dc === !0, l = i.energy_added_kwh, c = l == null ? r.strings.inProgress.replace(/^./, (M) => M.toLocaleUpperCase(r.locale)) : `+${r.energy(l)}`, d = Dt(a);
+    const r = I(this), i = j(this) || {}, a = this.getAttribute("href") || i.href || "", n = H(i.address, i.geofence), o = n ? n.name : r.strings.unknownPlace, s = i.is_dc === !0, l = i.energy_added_kwh, c = l != null ? `+${r.energy(l)}` : i.end_at ? "—" : r.strings.inProgress.replace(/^./, (M) => M.toLocaleUpperCase(r.locale)), d = Dt(a);
     d.classList.add("charge"), s && d.classList.add("dc"), d.setAttribute("aria-label", `${i.start_at ? r.clock(i.start_at) : ""} ${o} ${c}`.trim()), Ft(d, i, r);
     const h = u("span", { class: "route single" }, d), g = u("span", { class: "route-stop charge-stop", text: o }, h);
     n != null && n.detail && (g.title = n.detail);

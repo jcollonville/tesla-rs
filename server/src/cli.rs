@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Process entry points for `serve`, `import-teslamate`, `repair-drive-ends`,
-//! `rebuild-drive`, `register-partner`, and `healthcheck`.
+//! `rebuild-drive`, `rebuild-charge`, `register-partner`, and `healthcheck`.
 
 use std::time::Duration;
 
@@ -51,6 +51,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             to,
             apply,
         } => rebuild_drive(vehicle_id, from, to, apply).await?,
+        Command::RebuildCharge {
+            vehicle_id,
+            from,
+            to,
+            apply,
+        } => rebuild_charge(vehicle_id, from, to, apply).await?,
         Command::RegisterPartner => {
             let config = Config::load()?;
             crate::partner::register(&config).await?;
@@ -118,6 +124,26 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Merge the live charges that start in a window into one charge.
+    ///
+    /// Prints a dry-run unless `--apply` is set. Refuses an open charge, a pause
+    /// longer than the charge resume grace, or a drive in between. The merged
+    /// rows are soft-deleted. Never run by `serve`.
+    #[command(name = "rebuild-charge")]
+    RebuildCharge {
+        /// `vehicles.id` of the car.
+        #[arg(long)]
+        vehicle_id: i64,
+        /// Window start, RFC 3339 (for example `2026-01-01T10:00:00Z`).
+        #[arg(long)]
+        from: chrono::DateTime<chrono::Utc>,
+        /// Window end, RFC 3339. At most 24 hours after `--from`.
+        #[arg(long)]
+        to: chrono::DateTime<chrono::Utc>,
+        /// Write the merge. Without this flag the command only prints the plan.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Register `TESLA_DOMAIN` with Tesla (`POST /api/1/partner_accounts`).
     ///
     /// The public key must already be reachable at
@@ -147,6 +173,33 @@ async fn rebuild_drive(
     print!("{}", crate::persist::format_drive_rebuild(&report));
     if !jobs.is_empty() {
         // Addresses are best effort: the drive is already committed.
+        match geocoder(&pool).await {
+            Ok(geocoder) => {
+                crate::persist::settle_addresses(&pool, &geocoder, jobs).await;
+                println!("addresses=requested");
+            }
+            Err(_) => println!("addresses=skipped"),
+        }
+    }
+    pool.close().await;
+    Ok(())
+}
+
+async fn rebuild_charge(
+    vehicle_id: i64,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+    apply: bool,
+) -> Result<(), AppError> {
+    let url = Config::database_url()?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await?;
+    let (report, jobs) = crate::persist::rebuild_charge(&pool, vehicle_id, from, to, apply).await?;
+    print!("{}", crate::persist::format_charge_rebuild(&report));
+    if !jobs.is_empty() {
+        // Addresses are best effort: the merge is already committed.
         match geocoder(&pool).await {
             Ok(geocoder) => {
                 crate::persist::settle_addresses(&pool, &geocoder, jobs).await;
@@ -231,6 +284,7 @@ mod tests {
                 | Command::Healthcheck { .. }
                 | Command::RepairDriveEnds { .. }
                 | Command::RebuildDrive { .. }
+                | Command::RebuildCharge { .. }
                 | Command::RegisterPartner => {
                     panic!("{name} parsed as a different command");
                 }
@@ -247,6 +301,7 @@ mod tests {
             | Command::ImportTeslaMate { .. }
             | Command::Healthcheck { .. }
             | Command::RebuildDrive { .. }
+            | Command::RebuildCharge { .. }
             | Command::RegisterPartner => {
                 panic!("dry-run parsed as a different command");
             }
@@ -258,6 +313,7 @@ mod tests {
             | Command::ImportTeslaMate { .. }
             | Command::Healthcheck { .. }
             | Command::RebuildDrive { .. }
+            | Command::RebuildCharge { .. }
             | Command::RegisterPartner => {
                 panic!("apply parsed as a different command");
             }
@@ -294,6 +350,30 @@ mod tests {
             Cli::try_parse_from(["tesla-logger", "rebuild-drive", "--vehicle-id", "7"]).is_err(),
             "the window is required"
         );
+    }
+
+    #[test]
+    fn rebuild_charge_defaults_to_a_dry_run() {
+        let cli = Cli::try_parse_from([
+            "tesla-logger",
+            "rebuild-charge",
+            "--vehicle-id",
+            "7",
+            "--from",
+            "2026-11-27T01:25:00Z",
+            "--to",
+            "2026-11-27T03:50:00Z",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::RebuildCharge {
+                vehicle_id, apply, ..
+            }) => {
+                assert_eq!(vehicle_id, 7);
+                assert!(!apply);
+            }
+            _ => panic!("parsed as a different command"),
+        }
     }
 
     #[test]

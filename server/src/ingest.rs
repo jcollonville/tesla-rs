@@ -2585,6 +2585,156 @@ mod tests {
         assert!(elapsed >= Duration::from_secs(3_600), "{elapsed:?}");
     }
 
+    /// Vehicle list that always reports the car online and never expects a
+    /// `vehicle_data` call: telemetry is fresh, so the poller only lists.
+    struct ListOnly {
+        vin: &'static str,
+        observed: std::sync::atomic::AtomicUsize,
+    }
+
+    impl IngestSource for ListOnly {
+        async fn discover(&self) -> Result<Vec<super::Summary>, crate::error::AppError> {
+            std::future::ready(Ok(vec![summary(self.vin, 1)])).await
+        }
+
+        async fn observe(
+            &self,
+            _vin: &str,
+        ) -> Result<super::ObserveResult, crate::error::AppError> {
+            self.observed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(Err(crate::error::AppError::message(
+                "unexpected vehicle_data",
+            )))
+            .await
+        }
+    }
+
+    /// Replay of the night of 27/11/2026: an AC home charge at 7 kW, 59 -> 80 %,
+    /// streamed by Fleet Telemetry only. A parked car sends no `Location`, no
+    /// charge energy counter is subscribed, and the free vehicle-list cycle
+    /// keeps running while telemetry is fresh.
+    #[tokio::test]
+    async fn telemetry_charge_with_list_polls_is_one_closed_located_session() {
+        use crate::ingest::apply_telemetry_for_vin;
+        use crate::persist::VehicleIdentity;
+
+        let Some(db) = crate::test_util::TestDb::migrated("telcharge").await else {
+            return;
+        };
+        let vin = "5YJ3E1EA7KF000127";
+        let identity = || VehicleIdentity {
+            vin,
+            tesla_id: Some(1),
+            legacy_vehicle_id: None,
+            name: Some(vin),
+        };
+        let (home,): (i64,) = sqlx::query_as(
+            "INSERT INTO geofences (name, latitude, longitude, radius_m)
+             VALUES ('Home', 10.0, 20.0, 50) RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let archive = super::Archive::new(
+            db.pool.clone(),
+            crate::geocode::Geocoder::disabled(),
+            tokio::sync::broadcast::channel(64).0,
+            crate::drive_gps::GpsBoard::default(),
+        );
+        let start = chrono::Utc::now() - chrono::Duration::hours(3);
+        // The car parked at home before the logger last restarted.
+        let mut parked =
+            crate::state::Observation::at(start - chrono::Duration::minutes(30), Presence::Online);
+        parked.shift_state = Some("P".to_owned());
+        parked.speed_kmh = Some(0.0);
+        parked.latitude = Some(10.0);
+        parked.longitude = Some(20.0);
+        parked.battery_level = Some(59.0);
+        super::apply_for_vin(&archive, vin, identity(), parked, true, false)
+            .await
+            .unwrap();
+        archive.runtimes.lock().await.clear();
+
+        let source = ListOnly {
+            vin,
+            observed: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let minutes = 138_i64;
+        for minute in 0..=minutes {
+            let mut obs = crate::state::Observation::at(
+                start + chrono::Duration::minutes(minute),
+                Presence::Online,
+            );
+            let done = minute == minutes;
+            obs.charging_state = Some(if done { "Complete" } else { "Charging" }.to_owned());
+            obs.charger_power_kw = Some(if done { 0.0 } else { 7.0 });
+            obs.shift_state = Some("P".to_owned());
+            let step = f64::from(u32::try_from(minute).unwrap());
+            obs.battery_level = Some((59.0 + 21.0 * step / 138.0).round());
+            apply_telemetry_for_vin(&archive, vin, identity(), obs, false)
+                .await
+                .unwrap();
+            if minute % 12 == 6 {
+                if let Some(slot) = archive.runtimes.lock().await.get(vin).cloned() {
+                    slot.lock().await.next_due = tokio::time::Instant::now();
+                }
+                super::run_cycle(&source, &archive, &policy(), None)
+                    .await
+                    .expect("list cycle");
+            }
+        }
+        assert_eq!(
+            source.observed.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "fresh telemetry skips vehicle_data"
+        );
+        type ChargeRow = (
+            chrono::DateTime<chrono::Utc>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<i64>,
+        );
+        let rows: Vec<ChargeRow> = sqlx::query_as(
+            "SELECT c.start_at, c.end_at, c.energy_added_kwh, c.start_battery_level,
+                    c.end_battery_level, c.latitude, c.geofence_id
+             FROM charges c JOIN vehicles v ON v.id = c.vehicle_id
+             WHERE v.vin = $1 AND c.deleted_at IS NULL
+             ORDER BY c.start_at",
+        )
+        .bind(vin)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "one continuous charge, got {rows:?}");
+        let (start_at, end_at, energy, start_soc, end_soc, latitude, fence) = rows[0];
+        let ms = |at: chrono::DateTime<chrono::Utc>| at.timestamp_millis();
+        assert_eq!(ms(start_at), ms(start));
+        let end_at = end_at.expect("closed on Complete");
+        assert_eq!(ms(end_at), ms(start + chrono::Duration::minutes(minutes)));
+        let kwh = energy.expect("energy from ACChargingPower");
+        assert!((kwh - 7.0 * 138.0 / 60.0).abs() < 0.05, "{kwh}");
+        assert_eq!((start_soc, end_soc), (Some(59.0), Some(80.0)));
+        assert_eq!(latitude, Some(10.0), "last known car position");
+        assert_eq!(fence, Some(home));
+        let sources: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT c.source FROM charges c
+             JOIN vehicles v ON v.id = c.vehicle_id WHERE v.vin = $1
+             UNION
+             SELECT DISTINCT s.source FROM charge_samples s
+             JOIN charges c ON c.id = s.charge_id
+             JOIN vehicles v ON v.id = c.vehicle_id WHERE v.vin = $1",
+        )
+        .bind(vin)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(sources, vec![("telemetry".to_owned(),)]);
+    }
+
     const EXCEEDED_LIMIT_BODY: &str =
         r#"{"response":null,"error":"account disabled: EXCEEDED_LIMIT","error_description":""}"#;
 

@@ -154,7 +154,7 @@ export class TlChargeRow extends TlElement {
     const name = where ? where.name : fmt.strings.unknownPlace;
     const dc = data.is_dc === true;
     const added = data.energy_added_kwh;
-    const figure = added == null ? fmt.strings.inProgress.replace(/^./, (ch) => ch.toLocaleUpperCase(fmt.locale)) : `+${fmt.energy(added)}`;
+    const figure = added != null ? `+${fmt.energy(added)}` : data.end_at ? "—" : fmt.strings.inProgress.replace(/^./, (ch) => ch.toLocaleUpperCase(fmt.locale));
     const row = rowShell(href);
     row.classList.add("charge");
     if (dc) row.classList.add("dc");
