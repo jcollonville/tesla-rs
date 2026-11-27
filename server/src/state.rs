@@ -1549,7 +1549,8 @@ pub(crate) fn summarize_drive(
             samples.iter().filter_map(|sample| sample.ideal_range_km),
         ),
         end_ideal_range_km: last_finite(samples.iter().filter_map(|sample| sample.ideal_range_km)),
-        energy_used_kwh: range_energy(start_rated, end_rated, efficiency_kwh_per_km),
+        energy_used_kwh: range_energy(start_rated, end_rated, efficiency_kwh_per_km)
+            .or_else(|| drive_power_kwh(samples)),
         max_speed_kmh: max_finite(samples.iter().filter_map(|sample| sample.speed_kmh)),
         avg_speed_kmh: average_speed(distance_km, duration_s),
         max_power_kw: max_finite(samples.iter().filter_map(|sample| sample.power_kw)),
@@ -1666,19 +1667,48 @@ pub(crate) const CHARGE_POWER_GAP_MAX_SECS: i64 = 1_800;
 /// `ACChargingPower` is published on change only, so the last value holds.
 /// `None` when no interval could be integrated.
 pub(crate) fn integrated_power_kwh(samples: &[Sample]) -> Option<f64> {
+    integrate_kwh(
+        samples,
+        |sample| sample.charger_power_kw.map(|power| power.max(0.0)),
+        CHARGE_POWER_GAP_MAX_SECS,
+    )
+}
+
+/// Net pack energy of a drive, regeneration included, from `power_kw`.
+///
+/// Used when the rated range or the car's efficiency is missing. A drive that
+/// regenerated more than it used counts as zero. Holes follow the charge limit,
+/// [`CHARGE_POWER_GAP_MAX_SECS`].
+pub(crate) fn drive_power_kwh(samples: &[Sample]) -> Option<f64> {
+    net_power_kwh(samples).map(|kwh| kwh.max(0.0))
+}
+
+/// Signed integral of `power_kw`, regeneration included.
+pub(crate) fn net_power_kwh(samples: &[Sample]) -> Option<f64> {
+    integrate_kwh(samples, |sample| sample.power_kw, CHARGE_POWER_GAP_MAX_SECS)
+}
+
+/// Left-hand integral of a held power in kW over sample times, in kWh.
+///
+/// A sample without a value keeps the previous one. Holes longer than
+/// `gap_max_secs` are skipped. `None` when no interval had a power.
+fn integrate_kwh(
+    samples: &[Sample],
+    power_of: impl Fn(&Sample) -> Option<f64>,
+    gap_max_secs: i64,
+) -> Option<f64> {
     let mut total = None;
     let mut held: Option<(DateTime<Utc>, f64)> = None;
     for sample in samples {
         if let Some((since, power)) = held {
             let millis = sample.at.signed_duration_since(since).num_milliseconds();
-            if millis > 0 && millis <= CHARGE_POWER_GAP_MAX_SECS * 1_000 {
+            if millis > 0 && millis <= gap_max_secs.saturating_mul(1_000) {
                 #[allow(clippy::cast_precision_loss)]
                 let hours = millis as f64 / 3_600_000.0;
-                total = Some(total.unwrap_or(0.0) + power.max(0.0) * hours);
+                total = Some(total.unwrap_or(0.0) + power * hours);
             }
         }
-        let power = sample
-            .charger_power_kw
+        let power = power_of(sample)
             .filter(|power| power.is_finite())
             .or(held.map(|(_, power)| power));
         held = power.map(|power| (sample.at, power));
@@ -2280,6 +2310,54 @@ mod tests {
         assert!(
             !matches!(unknown, super::ClosePlan::Continue { clock: held } if held.park_since.is_none()),
             "P with unknown speed must not ignore the park timer"
+        );
+    }
+
+    #[test]
+    fn drive_energy_falls_back_to_the_pack_power() {
+        // Telemetry drive: pack power every minute, no rated range.
+        let mut samples = Vec::new();
+        for minute in 0..=10 {
+            let mut obs = online(minute);
+            obs.shift_state = Some("D".to_owned());
+            obs.speed_kmh = Some(50.0);
+            // Regeneration during the last minute.
+            obs.power_kw = Some(if minute == 9 { -6.0 } else { 12.0 });
+            samples.push(obs.sample());
+        }
+        let used = summarize_drive(&samples, Some(0.16))
+            .unwrap()
+            .energy_used_kwh
+            .expect("energy from the pack power");
+        assert!((used - (12.0 * 9.0 - 6.0) / 60.0).abs() < 1e-9, "{used}");
+        // Same hole limit as charges: 30 minutes.
+        let mut holed = samples.clone();
+        holed[10].at = at(40);
+        let used = summarize_drive(&holed, None)
+            .unwrap()
+            .energy_used_kwh
+            .unwrap();
+        assert!((used - 12.0 * 9.0 / 60.0).abs() < 1e-9, "{used}");
+        holed[9].power_kw = Some(12.0);
+        holed[10].at = at(29);
+        let used = summarize_drive(&holed, None)
+            .unwrap()
+            .energy_used_kwh
+            .unwrap();
+        assert!((used - 12.0 * 29.0 / 60.0).abs() < 1e-9, "{used}");
+        // The rated range wins when it and the efficiency are known.
+        samples[0].rated_range_km = Some(400.0);
+        samples[10].rated_range_km = Some(390.0);
+        let used = summarize_drive(&samples, Some(0.16))
+            .unwrap()
+            .energy_used_kwh
+            .unwrap();
+        assert!((used - 1.6).abs() < 1e-9, "{used}");
+        // No power and no range: unknown.
+        let bare: Vec<_> = (0..=3).map(|minute| online(minute).sample()).collect();
+        assert_eq!(
+            summarize_drive(&bare, Some(0.16)).unwrap().energy_used_kwh,
+            None
         );
     }
 

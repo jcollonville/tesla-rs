@@ -4021,3 +4021,105 @@ async fn drive_detail_draws_the_stream_where_it_covers_telemetry() {
         "{latitudes:?}"
     );
 }
+
+#[tokio::test]
+async fn recompute_drive_fixes_the_inverted_pack_power_once() {
+    let Some(db) = TestDb::migrated("recomputedrive").await else {
+        return;
+    };
+    let (vehicle_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO vehicles (vin, name, efficiency_kwh_per_km)
+         VALUES ('5YJ3E1EA7KF000140', 'Test', 0.15) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let start = Utc.with_ymd_and_hms(2026, 11, 27, 14, 16, 23).unwrap();
+    let end = start + chrono::Duration::minutes(9);
+    let (drive_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO drives (vehicle_id, start_at, end_at, source)
+         VALUES ($1, $2, $3, 'telemetry') RETURNING id",
+    )
+    .bind(vehicle_id)
+    .bind(start)
+    .bind(end)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    // Stored by 1224370: discharge recorded as negative kW, no rated range.
+    for minute in 0..=9_i32 {
+        let power = if minute == 8 { 6.0 } else { -12.0 };
+        sqlx::query(
+            "INSERT INTO positions (vehicle_id, recorded_at, latitude, longitude, speed_kmh,
+                                    power_kw, odometer_km, battery_level, drive_id, source,
+                                    shift_state)
+             VALUES ($1, $2, 10.0, $3, 30.0, $4, $5, 72.0, $6, 'telemetry', 'D')",
+        )
+        .bind(vehicle_id)
+        .bind(start + chrono::Duration::minutes(i64::from(minute)))
+        .bind(20.0 + f64::from(minute) * 0.001)
+        .bind(power)
+        .bind(1_000.0 + f64::from(minute) * 0.5)
+        .bind(drive_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let expected = (12.0 * 8.0 - 6.0) / 60.0;
+    let stored = || async {
+        let row: (Option<f64>, Option<f64>, Option<f64>) = sqlx::query_as(
+            "SELECT energy_used_kwh, max_power_kw,
+                    (SELECT sum(power_kw) FROM positions WHERE drive_id = $1)
+             FROM drives WHERE id = $1",
+        )
+        .bind(drive_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        row
+    };
+
+    let dry = crate::persist::recompute_drive(&db.pool, drive_id, true, false)
+        .await
+        .unwrap();
+    assert!(!dry.applied);
+    assert!(dry.power_flipped);
+    assert!(
+        (dry.energy_used_kwh.unwrap() - expected).abs() < 1e-6,
+        "{dry:?}"
+    );
+    assert_eq!(
+        stored().await,
+        (None, None, Some(-102.0)),
+        "dry-run writes nothing"
+    );
+
+    let applied = crate::persist::recompute_drive(&db.pool, drive_id, true, true)
+        .await
+        .unwrap();
+    assert!(applied.applied && applied.power_flipped);
+    let (energy, max_power, sum) = stored().await;
+    assert!((energy.unwrap() - expected).abs() < 1e-6);
+    assert_eq!((max_power, sum), (Some(12.0), Some(102.0)));
+
+    // A second run does not flip back.
+    let again = crate::persist::recompute_drive(&db.pool, drive_id, true, true)
+        .await
+        .unwrap();
+    assert!(!again.power_flipped);
+    let (energy, _, sum) = stored().await;
+    assert!((energy.unwrap() - expected).abs() < 1e-6);
+    assert_eq!(sum, Some(102.0));
+
+    // An open drive is refused.
+    sqlx::query("UPDATE drives SET end_at = NULL WHERE id = $1")
+        .bind(drive_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        crate::persist::recompute_drive(&db.pool, drive_id, false, false)
+            .await
+            .is_err()
+    );
+}

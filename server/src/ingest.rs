@@ -2743,6 +2743,12 @@ mod tests {
         assert_eq!(is_dc, Some(false), "a 7 kW telemetry charge is AC");
     }
 
+    type DriveEnd = (
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<f64>,
+        Option<f64>,
+    );
+
     #[tokio::test]
     async fn telemetry_drive_closes_when_gear_and_speed_go_quiet_and_keeps_its_power() {
         use crate::ingest::apply_telemetry_for_vin;
@@ -2794,8 +2800,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let drives: Vec<(Option<chrono::DateTime<chrono::Utc>>, Option<f64>)> = sqlx::query_as(
-            "SELECT d.end_at, d.max_power_kw FROM drives d
+        let drives: Vec<DriveEnd> = sqlx::query_as(
+            "SELECT d.end_at, d.max_power_kw, d.energy_used_kwh FROM drives d
              JOIN vehicles v ON v.id = d.vehicle_id
              WHERE v.vin = $1 AND d.deleted_at IS NULL",
         )
@@ -2804,7 +2810,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(drives.len(), 1, "{drives:?}");
-        let (end_at, max_power) = drives[0];
+        let (end_at, max_power, energy) = drives[0];
+        let energy = energy.expect("energy from the pack power");
+        assert!((energy - 12.0 * 10.0 / 60.0).abs() < 1e-6, "{energy}");
         let end_at = end_at.expect("the drive is closed");
         assert_eq!(
             end_at.timestamp_millis(),

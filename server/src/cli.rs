@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Process entry points for `serve`, `import-teslamate`, `repair-drive-ends`,
-//! `rebuild-drive`, `rebuild-charge`, `register-partner`, and `healthcheck`.
+//! `rebuild-drive`, `rebuild-charge`, `recompute-drive`, `register-partner`, and
+//! `healthcheck`.
 
 use std::time::Duration;
 
@@ -57,6 +58,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             to,
             apply,
         } => rebuild_charge(vehicle_id, from, to, apply).await?,
+        Command::RecomputeDrive {
+            drive_id,
+            flip_telemetry_power,
+            apply,
+        } => recompute_drive(drive_id, flip_telemetry_power, apply).await?,
         Command::RegisterPartner => {
             let config = Config::load()?;
             crate::partner::register(&config).await?;
@@ -144,6 +150,23 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Recompute the summary of one closed drive (energy, power, ranges).
+    ///
+    /// Prints a dry-run unless `--apply` is set; the dry-run runs in a read-only
+    /// transaction. Refuses an open or deleted drive. Never run by `serve`.
+    #[command(name = "recompute-drive")]
+    RecomputeDrive {
+        /// `drives.id` of the closed drive.
+        #[arg(long)]
+        drive_id: i64,
+        /// Negate telemetry `power_kw` stored with the inverted pack-current sign.
+        /// Only applied while those points still integrate to net regeneration.
+        #[arg(long)]
+        flip_telemetry_power: bool,
+        /// Write the drive. Without this flag the command only prints the plan.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Register `TESLA_DOMAIN` with Tesla (`POST /api/1/partner_accounts`).
     ///
     /// The public key must already be reachable at
@@ -208,6 +231,18 @@ async fn rebuild_charge(
             Err(_) => println!("addresses=skipped"),
         }
     }
+    pool.close().await;
+    Ok(())
+}
+
+async fn recompute_drive(drive_id: i64, flip: bool, apply: bool) -> Result<(), AppError> {
+    let url = Config::database_url()?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await?;
+    let report = crate::persist::recompute_drive(&pool, drive_id, flip, apply).await?;
+    print!("{}", crate::persist::format_drive_recompute(&report));
     pool.close().await;
     Ok(())
 }
@@ -285,6 +320,7 @@ mod tests {
                 | Command::RepairDriveEnds { .. }
                 | Command::RebuildDrive { .. }
                 | Command::RebuildCharge { .. }
+                | Command::RecomputeDrive { .. }
                 | Command::RegisterPartner => {
                     panic!("{name} parsed as a different command");
                 }
@@ -302,6 +338,7 @@ mod tests {
             | Command::Healthcheck { .. }
             | Command::RebuildDrive { .. }
             | Command::RebuildCharge { .. }
+            | Command::RecomputeDrive { .. }
             | Command::RegisterPartner => {
                 panic!("dry-run parsed as a different command");
             }
@@ -314,6 +351,7 @@ mod tests {
             | Command::Healthcheck { .. }
             | Command::RebuildDrive { .. }
             | Command::RebuildCharge { .. }
+            | Command::RecomputeDrive { .. }
             | Command::RegisterPartner => {
                 panic!("apply parsed as a different command");
             }
@@ -370,6 +408,24 @@ mod tests {
                 vehicle_id, apply, ..
             }) => {
                 assert_eq!(vehicle_id, 7);
+                assert!(!apply);
+            }
+            _ => panic!("parsed as a different command"),
+        }
+    }
+
+    #[test]
+    fn recompute_drive_defaults_to_a_dry_run_without_a_sign_flip() {
+        let cli =
+            Cli::try_parse_from(["tesla-logger", "recompute-drive", "--drive-id", "42"]).unwrap();
+        match cli.command {
+            Some(Command::RecomputeDrive {
+                drive_id,
+                flip_telemetry_power,
+                apply,
+            }) => {
+                assert_eq!(drive_id, 42);
+                assert!(!flip_telemetry_power);
                 assert!(!apply);
             }
             _ => panic!("parsed as a different command"),

@@ -36,8 +36,10 @@ use crate::units::{miles_to_km, speed_to_kmh};
 /// Numeric fields carry a `minimum_delta` so a parked car does not publish on
 /// every sample. `DetailedChargeState` and the charge-schedule fields from the
 /// plugged-in status are included. `ChargeState` stays for older firmware.
-/// `Odometer` and `Soc` are re-sent every five minutes: the car only publishes a
-/// change, so a reconnect or a logger restart would otherwise leave them empty.
+/// `Odometer`, `Soc`, `RatedRange` and `IdealBatteryRange` are re-sent every five minutes: the car only
+/// publishes a change, so a reconnect or a logger restart would otherwise leave
+/// them empty. `RatedRange` gives the drive energy (range used × efficiency);
+/// `PackVoltage` × `PackCurrent` gives the drive power.
 /// `DCChargingEnergyIn` is the battery-side session counter, the telemetry
 /// equivalent of `charge_energy_added`, for AC and DC charging alike.
 pub(crate) fn subscription(
@@ -55,6 +57,8 @@ pub(crate) fn subscription(
         .field_with("Location", pace(3, Some(5.0), None))
         .field_with("Odometer", pace(60, Some(0.1), Some(300)))
         .field_with("Soc", pace(60, Some(1.0), Some(300)))
+        .field_with("RatedRange", pace(60, Some(0.5), Some(300)))
+        .field_with("IdealBatteryRange", pace(60, Some(0.5), Some(300)))
         .field_with("VehicleSpeed", pace(10, Some(1.0), None))
         .field_with("ChargeLimitSoc", pace(300, Some(1.0), None))
         .field_with("ScheduledChargingStartTime", pace(300, None, Some(3600)))
@@ -382,8 +386,11 @@ fn fold_datums(obs: &mut Observation, data: &[DecodedDatum], metric: bool) {
 }
 
 /// Pack power in kW: positive while discharging, negative on regeneration or charge.
+///
+/// The car reports `PackCurrent` negative while discharging; `power_kw` follows
+/// the Teslamate convention (consumption > 0), hence the sign flip.
 fn pack_power_kw(voltage: Option<f64>, current: Option<f64>) -> Option<f64> {
-    let power = voltage? * current? / 1_000.0;
+    let power = -(voltage? * current?) / 1_000.0;
     power.is_finite().then_some(power)
 }
 
@@ -701,6 +708,14 @@ mod tests {
         // Drive power is pack voltage times pack current.
         assert!(fields.contains_key("PackVoltage"));
         assert!(fields.contains_key("PackCurrent"));
+        // Drive energy is the rated range used times the car's efficiency; the
+        // value parked before a drive must already be known when it starts.
+        assert!(fields["RatedRange"].resend_interval_seconds.is_some());
+        assert!(
+            fields["IdealBatteryRange"]
+                .resend_interval_seconds
+                .is_some()
+        );
         assert!(fields.values().all(|field| field.interval_seconds > 0));
         assert_eq!(request.config.hostname, "logger.example");
         assert!(request.config.ca.contains("MIIB"));
@@ -930,16 +945,18 @@ mod tests {
         let mut obs = Observation::at(Utc::now(), Presence::Online);
         fold_datums(
             &mut obs,
-            &payload(&[(Field::PackVoltage, 400.0), (Field::PackCurrent, 50.0)]),
+            &payload(&[(Field::PackVoltage, 400.0), (Field::PackCurrent, -50.0)]),
             true,
         );
+        // The car reports a negative PackCurrent while discharging; power_kw
+        // follows the Teslamate convention: consumption > 0, regeneration < 0.
         assert_eq!(obs.power_kw, Some(20.0), "discharging: positive kW");
         assert_eq!(
             obs.charger_voltage, None,
             "pack voltage is not the charger voltage"
         );
         // Current changes far more often than voltage: the held voltage is reused.
-        fold_datums(&mut obs, &payload(&[(Field::PackCurrent, -25.0)]), true);
+        fold_datums(&mut obs, &payload(&[(Field::PackCurrent, 25.0)]), true);
         assert_eq!(obs.power_kw, Some(-10.0), "regeneration: negative kW");
         // A payload without pack data keeps the last power.
         fold_datums(&mut obs, &payload(&[(Field::Soc, 60.0)]), true);
