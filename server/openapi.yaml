@@ -252,7 +252,7 @@ paths:
         month-to-date bill at $1 per 500 calls, before Tesla's monthly credit.
         `vehicle_data_paused` is true when a cap is reached, the account is in a
         billing pause (HTTP 402, until the 1st of the next UTC month), or the
-        counters could not be read. The vehicle list and the Owner stream are
+        counters could not be read. The vehicle list and Fleet Telemetry are
         not paused by these caps.
       security: [{ bearer: [] }]
       responses:
@@ -403,30 +403,6 @@ components:
         last_data_at: { type: string, format: date-time, nullable: true }
         last_error: { type: string, nullable: true }
         updated_at: { type: string, format: date-time, nullable: true }
-        stream_status:
-          type: string
-          enum: [connected, disabled, error]
-          description: >
-            Owner API streaming socket. disabled when streaming is not configured
-            or OWNER_STREAM_ENABLED is false. The legacy streaming endpoint is
-            unofficial and may disappear. Fleet API polling continues either way.
-        stream_error:
-          type: string
-          nullable: true
-          description: Short error class when stream_status is error. Tokens are never included.
-        position_mode:
-          type: string
-          enum: [hybrid, fallback]
-          description: >
-            hybrid while the Owner stream is connected and a data:update is at
-            most 90 seconds old during a drive. vehicle_data is not polled then,
-            except one call when the drive starts and one when it ends. fallback
-            when the socket is down or that update is stale; vehicle_data then
-            runs every POLL_DRIVE_FALLBACK_SECS (default 120, minimum 60).
-            Drive-end grace and Hold use the parked cadence unless movement
-            evidence is less than 60 seconds old. Asleep cars are not woken.
-            The drive fallback is a normal vehicle_data call and counts toward
-            the daily and monthly caps.
         data_source:
           type: string
           enum: [polling, telemetry]

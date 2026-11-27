@@ -8,7 +8,6 @@ use std::time::Instant;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tesla_auth::{AuthClient, ClientConfig, PendingAuthorization, Scope, Session};
-use tesla_owner_api::OwnerLogin;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, broadcast, watch};
 
@@ -23,7 +22,6 @@ use crate::http::{Basemap, CarRenders};
 use crate::ingest::{self, Archive, FleetPoll, PollPolicy};
 use crate::logs::LogBuffer;
 use crate::mqtt;
-use crate::owner_stream::{self, StreamBoard};
 use crate::persist::LiveEvent;
 use crate::telemetry;
 
@@ -49,9 +47,7 @@ pub(crate) struct Inner {
     pub db: PgPool,
     pub session: Arc<Session<DbTokenStore>>,
     pub fleet_store: Arc<DbTokenStore>,
-    pub owner_store: Arc<DbTokenStore>,
     pub fleet_account_id: i64,
-    pub owner_account_id: i64,
     /// In-progress Fleet OAuth logins, keyed by the unguessable `state`.
     ///
     /// Each entry is bound to the logger session that called `/auth/login`.
@@ -60,9 +56,6 @@ pub(crate) struct Inner {
     pub events: broadcast::Sender<LiveEvent>,
     pub revealed: Mutex<HashMap<String, String>>,
     pub archive: Arc<Archive>,
-    pub owner_pending: Mutex<Option<(OwnerLogin, Instant)>>,
-    pub stream_board: StreamBoard,
-    pub owner_tokens: watch::Sender<u64>,
     pub logs: LogBuffer,
     pub debug: DebugBoard,
     pub car_renders: CarRenders,
@@ -130,19 +123,6 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
         )
         .await;
     });
-    let owner_state = state.clone();
-    let owner_rx = shutdown_rx.clone();
-    let owner_task = tokio::spawn(async move {
-        owner_stream::run(
-            &owner_state.inner.config,
-            Arc::clone(&owner_state.inner.archive),
-            owner_state.inner.stream_board.clone(),
-            owner_state.inner.debug.clone(),
-            owner_state.inner.owner_tokens.subscribe(),
-            owner_rx,
-        )
-        .await;
-    });
     let grace_state = state.clone();
     let mut grace_rx = shutdown_rx.clone();
     let grace_task = tokio::spawn(async move {
@@ -176,7 +156,6 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
     let _ = poll.await;
     let _ = telemetry_task.await;
     let _ = mqtt_task.await;
-    let _ = owner_task.await;
     let _ = grace_task.await;
     Ok(())
 }
@@ -184,9 +163,7 @@ pub(crate) async fn serve(logs: LogBuffer) -> Result<(), AppError> {
 pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, AppError> {
     let public_key_pem = read_public_key(&config.private_key_path)?;
     if config.token_encryption_key.is_none() {
-        tracing::warn!(
-            "TESLA_TOKEN_ENCRYPTION_KEY is unset; Fleet and Owner tokens are stored in plaintext"
-        );
+        tracing::warn!("TESLA_TOKEN_ENCRYPTION_KEY is unset; Fleet tokens are stored in plaintext");
     }
     let db = PgPoolOptions::new()
         .max_connections(10)
@@ -200,11 +177,6 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
         imported.fleet_id,
         config.token_encryption_key.as_deref(),
     )?);
-    let owner_store = Arc::new(DbTokenStore::open(
-        db.clone(),
-        imported.owner_id,
-        config.token_encryption_key.as_deref(),
-    )?);
     let auth = AuthClient::new(ClientConfig {
         client_id: config.client_id.clone(),
         client_secret: config.client_secret.clone(),
@@ -214,27 +186,20 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
     })?;
     let session = Arc::new(Session::new(auth, (*fleet_store).clone()));
     let (events, _) = broadcast::channel(256);
-    let (stream_kick, _) = broadcast::channel(32);
-    let (owner_tokens, _) = watch::channel(0_u64);
     let debug = DebugBoard::new(logs.clone());
     debug.apply_config(&config);
     let gps_wake = Arc::new(Notify::new());
-    let gps = crate::position_mode::GpsBoard::new(debug.clone(), Arc::clone(&gps_wake));
+    let gps = crate::drive_gps::GpsBoard::new(Arc::clone(&gps_wake));
     let debug_saved = debug.clone();
     fleet_store.on_saved(std::sync::Arc::new(move |expires| {
-        debug_saved.token_saved("fleet", expires);
+        debug_saved.token_saved(expires);
         gps_wake.notify_one();
-    }));
-    let owner_saved = debug.clone();
-    owner_store.on_saved(std::sync::Arc::new(move |expires| {
-        owner_saved.token_saved("owner", expires);
     }));
     let boot = Arc::new(config);
     let runtime = crate::settings::RuntimeConfig::load(db.clone(), Arc::clone(&boot)).await?;
     let geocoder = Geocoder::from_runtime(runtime.subscribe(), &boot)?;
-    let mut archive = Archive::new(db.clone(), geocoder, events.clone(), stream_kick, gps);
+    let mut archive = Archive::new(db.clone(), geocoder, events.clone(), gps);
     archive.fleet_account_id = Some(imported.fleet_id);
-    archive.owner_account_id = Some(imported.owner_id);
     let snap = runtime.snapshot();
     archive.drive_grace = crate::state::DriveGrace::from_config(
         snap.drive_end_grace.as_secs(),
@@ -286,17 +251,12 @@ pub(crate) async fn build(config: Config, logs: LogBuffer) -> Result<AppState, A
             db,
             session,
             fleet_store,
-            owner_store,
             fleet_account_id: imported.fleet_id,
-            owner_account_id: imported.owner_id,
             pending: Mutex::new(HashMap::new()),
             public_key_pem,
             events,
             revealed: Mutex::new(HashMap::new()),
             archive,
-            owner_pending: Mutex::new(None),
-            stream_board: StreamBoard::default(),
-            owner_tokens,
             logs,
             debug,
             car_renders,
@@ -453,9 +413,6 @@ async fn test_state_full(
         )
         .unwrap(),
     );
-    let owner_store = Arc::new(
-        DbTokenStore::open(pool.clone(), 0, config.token_encryption_key.as_deref()).unwrap(),
-    );
     let client_config = ClientConfig {
         client_id: config.client_id.clone(),
         client_secret: config.client_secret.clone(),
@@ -476,21 +433,13 @@ async fn test_state_full(
     };
     let session = Arc::new(Session::new(auth, (*fleet_store).clone()));
     let (events, _) = broadcast::channel(16);
-    let (stream_kick, _) = broadcast::channel(8);
-    let (owner_tokens, _) = watch::channel(0_u64);
     let logs = LogBuffer::new(50);
     logs.install_config(&config);
     let debug = DebugBoard::new(logs.clone());
     debug.apply_config(&config);
-    let gps = crate::position_mode::GpsBoard::new(debug.clone(), Arc::new(Notify::new()));
+    let gps = crate::drive_gps::GpsBoard::new(Arc::new(Notify::new()));
     let geocoder = Geocoder::disabled();
-    let archive = Arc::new(Archive::new(
-        pool.clone(),
-        geocoder,
-        events.clone(),
-        stream_kick,
-        gps,
-    ));
+    let archive = Arc::new(Archive::new(pool.clone(), geocoder, events.clone(), gps));
     let boot = Arc::new(config);
     let runtime = crate::settings::RuntimeConfig::from_boot(pool.clone(), Arc::clone(&boot));
     AppState {
@@ -500,17 +449,12 @@ async fn test_state_full(
             db: pool,
             session,
             fleet_store,
-            owner_store,
             fleet_account_id,
-            owner_account_id: 0,
             pending: Mutex::new(HashMap::new()),
             public_key_pem,
             events,
             revealed: Mutex::new(HashMap::new()),
             archive,
-            owner_pending: Mutex::new(None),
-            stream_board: StreamBoard::default(),
-            owner_tokens,
             logs,
             debug,
             car_renders: renders.unwrap_or_else(|| CarRenders::new(false, String::new(), None)),

@@ -29,7 +29,7 @@ pub(crate) struct Config {
     pub token_store_path: PathBuf,
     pub token_encryption_key: Option<String>,
     pub ui_password: SecretString,
-    /// `vehicle_data` interval while driving with the Owner stream down or stale.
+    /// `vehicle_data` interval while driving without fresh telemetry.
     pub drive_fallback_poll: Duration,
     pub charge_poll: Duration,
     pub parked_poll: Duration,
@@ -69,8 +69,6 @@ pub(crate) struct Config {
     pub fleet_month_seed: u64,
     /// Set when the seed should count. Empty in the environment means the UTC month at startup.
     pub fleet_month_seed_month: Option<chrono::NaiveDate>,
-    pub owner_stream_enabled: bool,
-    pub owner_token_store_path: PathBuf,
     /// IANA zone for stats buckets. `TESLA_TIMEZONE`, default `Europe/Paris`.
     pub timezone: String,
     /// Optional currency per kWh used when a charge has no stored cost.
@@ -186,9 +184,9 @@ impl Config {
         };
         validate_public_base(&public_base_url)?;
         let token_store_path = PathBuf::from(required(map, "TESLA_TOKEN_STORE_PATH")?);
-        let owner_stream_enabled = optional_bool(map, "OWNER_STREAM_ENABLED")?.unwrap_or(true);
-        let owner_token_store_path = optional(map, "TESLA_OWNER_TOKEN_STORE_PATH")
-            .map_or_else(|| owner_token_path(&token_store_path), PathBuf::from);
+        for key in retired_keys(map) {
+            tracing::warn!(key, "ignored: the Owner API stream was removed");
+        }
         let listen_addr = optional(map, "TESLA_LISTEN_ADDR")
             .unwrap_or_else(|| "0.0.0.0:4000".to_owned())
             .parse::<SocketAddr>()
@@ -393,8 +391,6 @@ impl Config {
             )?),
             telemetry_proxy_url,
             telemetry_proxy_ca_path,
-            owner_stream_enabled,
-            owner_token_store_path,
             timezone: timezone_name(map)?,
             energy_price_per_kwh: optional_f64(map, "ENERGY_PRICE_PER_KWH")?,
             drive_end_grace: Duration::from_secs(drive_end_grace),
@@ -577,11 +573,6 @@ impl Config {
                 .clone()
                 .unwrap_or_else(|| "—".to_owned()),
         );
-        push(
-            "Stream Owner",
-            "OWNER_STREAM_ENABLED",
-            self.owner_stream_enabled.to_string(),
-        );
         rows
     }
 
@@ -604,11 +595,15 @@ pub(crate) struct PublicSetting {
     pub source: &'static str,
 }
 
-fn owner_token_path(fleet_tokens: &std::path::Path) -> PathBuf {
-    match fleet_tokens.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join("owner-tokens.json"),
-        _ => PathBuf::from("owner-tokens.json"),
-    }
+/// Keys of the removed Owner API stream. An old `.env` may still set them.
+const RETIRED_KEYS: [&str; 2] = ["OWNER_STREAM_ENABLED", "TESLA_OWNER_TOKEN_STORE_PATH"];
+
+/// Retired keys present in `map`, so startup can warn instead of failing.
+fn retired_keys(map: &BTreeMap<String, String>) -> Vec<&'static str> {
+    RETIRED_KEYS
+        .into_iter()
+        .filter(|key| map.contains_key(*key))
+        .collect()
 }
 
 pub(crate) fn environment() -> BTreeMap<String, String> {
@@ -965,7 +960,6 @@ mod tests {
         assert_eq!(config.timezone, "Europe/Paris");
         assert_eq!(config.energy_price_per_kwh, None);
         assert_eq!(config.auth_mode, "local");
-        assert!(config.owner_stream_enabled);
         assert_eq!(
             config.gps_fallback_poll,
             std::time::Duration::from_secs(300)
@@ -993,10 +987,6 @@ mod tests {
             config.fleet_blocked_probe,
             std::time::Duration::from_secs(3600)
         );
-        assert_eq!(
-            config.owner_token_store_path,
-            std::path::PathBuf::from("/data/owner-tokens.json")
-        );
     }
 
     #[test]
@@ -1019,6 +1009,33 @@ mod tests {
         let config = Config::from_map(&map).unwrap();
         assert_eq!(config.auth_mode, "proxy");
         assert_eq!(config.proxy_allowlist, vec!["10.0.0.1", "10.0.0.2"]);
+    }
+
+    /// A prod `.env` written for the Owner stream must still start the logger.
+    #[test]
+    fn retired_owner_stream_keys_do_not_block_startup() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("TESLA_CLIENT_ID".into(), "id".into());
+        map.insert("TESLA_CLIENT_SECRET".into(), "secret".into());
+        map.insert(
+            "TESLA_FLEET_AUDIENCE".into(),
+            "https://fleet-api.prd.eu.vn.cloud.tesla.com".into(),
+        );
+        map.insert("TESLA_DOMAIN".into(), "tsl.b-612.fr".into());
+        map.insert("DATABASE_URL".into(), "postgres://localhost/tesla".into());
+        map.insert("TESLA_PRIVATE_KEY_PATH".into(), "/keys/key.pem".into());
+        map.insert("TESLA_TOKEN_STORE_PATH".into(), "/data/tokens.json".into());
+        map.insert("TESLA_LOGGER_UI_PASSWORD".into(), "password-value".into());
+        map.insert("OWNER_STREAM_ENABLED".into(), "plus utilisé".into());
+        map.insert(
+            "TESLA_OWNER_TOKEN_STORE_PATH".into(),
+            "/data/owner-tokens.json".into(),
+        );
+        assert!(Config::from_map(&map).is_ok());
+        assert_eq!(
+            super::retired_keys(&map),
+            vec!["OWNER_STREAM_ENABLED", "TESLA_OWNER_TOKEN_STORE_PATH"]
+        );
     }
 
     #[test]

@@ -27,9 +27,10 @@ const STREAM_COVER_SECS: i64 = 15;
 /// Which points of a drive to draw, given each point's time and whether it
 /// came from the Owner stream. Input is ordered by time.
 ///
-/// The stream sends about one fix per second; telemetry and polling are sparser
-/// and sampled on another clock, so interleaving them zigzags between two
-/// tracks. Where the stream covers a span only its fixes are kept; elsewhere
+/// The logger no longer records the stream, but older drives still hold
+/// its `source = 'stream'` rows. The stream sent about one fix per second;
+/// telemetry and polling are sparser and sampled on another clock, so
+/// interleaving them zigzags between two tracks. Where the stream covers a span only its fixes are kept; elsewhere
 /// every point is kept, so a telemetry-only stretch still draws.
 pub(crate) fn one_source_mask(points: &[(chrono::DateTime<chrono::Utc>, bool)]) -> Vec<bool> {
     let stream: Vec<i64> = points

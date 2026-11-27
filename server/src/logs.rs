@@ -676,7 +676,7 @@ mod tests {
 
     fn sample() -> String {
         format!(
-            "owner stream is up access_token={ACCESS} refresh_token={REFRESH} code={CODE} \
+            "poller is up access_token={ACCESS} refresh_token={REFRESH} code={CODE} \
              code_verifier={VERIFIER} Authorization: Bearer {BEARER} \
              {{\"access_token\":\"{ACCESS}\",\"password\":\"{PASSWORD}\"}} \
              {{\"msg_type\":\"data:subscribe_oauth\",\"token\":\"{SUBSCRIBE}\",\"value\":\"speed\",\"tag\":\"1\"}} \
@@ -694,7 +694,7 @@ mod tests {
         ] {
             assert!(!redacted.contains(secret), "{secret} in {redacted}");
         }
-        assert!(redacted.contains("owner stream is up"));
+        assert!(redacted.contains("poller is up"));
         assert!(redacted.contains("status_code=412"));
         assert!(redacted.contains("class=timeout"));
         assert!(redacted.contains("[subscribe frame redacted]"));
@@ -719,10 +719,9 @@ mod tests {
     }
 
     #[test]
-    fn owner_stream_status_line_drops_the_vin() {
+    fn status_line_drops_the_vin() {
         let vin = "5YJ3E1EA7KF000001";
-        let line =
-            format!("owner stream status vin={vin} status=error class=transport retry_secs=2");
+        let line = format!("telemetry status vin={vin} status=error class=transport retry_secs=2");
         let redacted = redact_line(&line, &[]);
         assert!(!redacted.contains(vin), "{redacted}");
         assert!(redacted.contains("class=transport"), "{redacted}");
@@ -744,7 +743,7 @@ mod tests {
                 status = "error",
                 class = "transport",
                 retry_secs = 2,
-                "owner stream status"
+                "telemetry status"
             );
         });
         let text = buffer
@@ -753,7 +752,7 @@ mod tests {
             .map(|line| line.text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("owner stream status"), "{text}");
+        assert!(text.contains("telemetry status"), "{text}");
         assert!(text.contains("class=transport"), "{text}");
         assert!(!text.contains(vin), "{text}");
     }
@@ -775,7 +774,7 @@ mod tests {
     #[test]
     fn buffer_keeps_a_bounded_redacted_history() {
         let buffer = LogBuffer::new(2);
-        buffer.record("INFO", "owner stream is up");
+        buffer.record("INFO", "poller is up");
         buffer.record("WARN", &format!("access_token={ACCESS}"));
         buffer.record("ERROR", "third");
         let lines = buffer.lines();
@@ -812,7 +811,7 @@ mod tests {
         };
         let state = crate::app::test_state(db.pool.clone()).await;
         let line = format!(
-            "owner stream is up access_token={ACCESS} refresh_token={REFRESH} code={CODE} \
+            "poller is up access_token={ACCESS} refresh_token={REFRESH} code={CODE} \
              code_verifier={VERIFIER} Authorization: Bearer {BEARER} \
              {{\"msg_type\":\"data:subscribe_oauth\",\"token\":\"{SUBSCRIBE}\",\"tag\":\"1\"}} \
              ui test-password and test-key <note>"
@@ -826,7 +825,7 @@ mod tests {
         assert_eq!(denied_events.status(), axum::http::StatusCode::SEE_OTHER);
         assert_eq!(denied_events.headers().get("location").unwrap(), "/");
         let denied_body = body_text(denied).await;
-        assert!(!denied_body.contains("owner stream is up"));
+        assert!(!denied_body.contains("poller is up"));
         assert_secret_free(&denied_body);
 
         let login = call(&state, "GET", "/", None, None).await;
@@ -883,9 +882,8 @@ mod tests {
         drop(events);
         assert_eq!(page.headers().get("cache-control").unwrap(), "no-store");
         let html = body_text(page).await;
-        assert!(html.contains("owner stream is up"), "{html}");
-        assert!(html.contains("Owner stream"));
-        assert!(html.contains("Connection history"));
+        assert!(html.contains("poller is up"), "{html}");
+        assert!(!html.contains("Owner stream"));
         assert!(html.contains(">Debug</h1>") || html.contains("Debug</h1>"));
         assert!(html.contains("href=\"/debug\""));
         assert!(html.contains("href=\"/\""));
@@ -894,16 +892,6 @@ mod tests {
         assert!(!html.contains("<note>"));
         assert_secret_free(&html);
 
-        let owner = call(
-            &state,
-            "GET",
-            "/auth/owner",
-            Some(&format!("__Host-tl_session={session}")),
-            None,
-        )
-        .await;
-        assert_eq!(owner.status(), axum::http::StatusCode::SEE_OTHER);
-        assert_eq!(owner.headers().get("location").unwrap(), "/connection");
         let connection = call(
             &state,
             "GET",
@@ -913,10 +901,10 @@ mod tests {
         )
         .await;
         assert_eq!(connection.status(), axum::http::StatusCode::OK);
-        let owner_html = body_text(connection).await;
-        assert!(owner_html.contains("href=\"/debug\""));
-        assert!(owner_html.contains("action=\"/auth/owner/start\""));
-        assert_secret_free(&owner_html);
+        let connection_html = body_text(connection).await;
+        assert!(connection_html.contains("href=\"/debug\""));
+        assert!(!connection_html.contains("/auth/owner"));
+        assert_secret_free(&connection_html);
     }
 
     fn assert_secret_free(text: &str) {

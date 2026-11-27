@@ -564,8 +564,6 @@ ol.setup > li { margin: 0 0 calc(var(--space) * 2); padding-bottom: calc(var(--s
 .step-help button:hover + .help-tip,
 .step-help button:focus + .help-tip,
 .step-help button:focus-visible + .help-tip { visibility: visible; }
-details.legacy { margin-top: calc(var(--space) * 3); }
-details.legacy > summary { color: var(--muted); cursor: pointer; }
 svg.check { display: block; }
 ol.steps { margin: 4px 0 calc(var(--space) * 2); padding-left: calc(var(--space) * 3); }
 ol.steps li { margin: var(--space) 0; }
@@ -625,7 +623,6 @@ ol.logs li:first-child { border-top: 0; padding-top: 0; }
 ol.logs time { color: var(--muted); margin-right: 4px; }
 ol.logs .bad { color: var(--danger); font-weight: 700; }
 ol.logs .warn { color: var(--amber); font-weight: 700; }
-ol.logs.hide-keep li[data-keep="1"] { display: none; }
 ol.logs .dir { font-weight: 700; margin-right: 4px; }
 ol.logs .dir.in { color: var(--green); }
 ol.logs .dir.out { color: var(--accent); }

@@ -312,13 +312,6 @@ pub(crate) const REGISTRY: &[SettingSpec] = &[
         kind: ValueKind::Bool,
         mode: ReloadMode::Hot,
     },
-    SettingSpec {
-        key: "OWNER_STREAM_ENABLED",
-        group: SettingGroup::Misc,
-        label: "Stream Owner",
-        kind: ValueKind::Bool,
-        mode: ReloadMode::Hot,
-    },
 ];
 
 /// Keys accepted by [`set`]. Kept for call sites that iterate the whitelist.
@@ -351,7 +344,6 @@ pub(crate) const KEYS: &[&str] = &[
     "MQTT_PORT",
     "MQTT_TOPIC_PREFIX",
     "ADMIN_SEES_ALL_TRIPS",
-    "OWNER_STREAM_ENABLED",
 ];
 
 pub(crate) fn spec(key: &str) -> Option<&'static SettingSpec> {
@@ -393,7 +385,6 @@ pub(crate) struct RuntimeSnapshot {
     pub timezone: String,
     pub energy_price_per_kwh: Option<f64>,
     pub admin_sees_all_trips: bool,
-    pub owner_stream_enabled: bool,
     /// Global DB overrides only (`settings` table). Vehicle rows stay on demand.
     pub db_overrides: HashMap<String, String>,
     pub generation: u64,
@@ -430,7 +421,6 @@ impl RuntimeSnapshot {
             timezone: config.timezone.clone(),
             energy_price_per_kwh: config.energy_price_per_kwh,
             admin_sees_all_trips: true,
-            owner_stream_enabled: config.owner_stream_enabled,
             db_overrides: HashMap::new(),
             generation: 0,
         }
@@ -616,11 +606,6 @@ impl RuntimeSnapshot {
             "ADMIN_SEES_ALL_TRIPS" => {
                 if let Some(flag) = parse_bool(value) {
                     self.admin_sees_all_trips = flag;
-                }
-            }
-            "OWNER_STREAM_ENABLED" => {
-                if let Some(flag) = parse_bool(value) {
-                    self.owner_stream_enabled = flag;
                 }
             }
             _ => {}

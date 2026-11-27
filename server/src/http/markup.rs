@@ -53,7 +53,6 @@ pub(super) struct FleetCard {
     pub name: String,
     pub activity: String,
     pub battery: String,
-    pub position_mode: String,
     pub last_seen: String,
     pub last_error: Option<String>,
     pub month: String,
@@ -191,12 +190,9 @@ pub(super) struct Overview {
     pub name: String,
     pub activity: String,
     pub battery: String,
-    pub position_mode: String,
     pub last_poll: String,
     pub last_data: String,
     pub last_error: String,
-    pub stream_lag: String,
-    pub stream_queue: String,
     pub last_drive: Option<Recent>,
     pub last_charge: Option<Recent>,
     pub car: CarCard,
@@ -207,23 +203,12 @@ pub(super) struct Overview {
 pub(super) struct ConnectionView<'a> {
     pub admin: bool,
     pub sudo: bool,
-    pub owner_status: String,
-    pub owner_tone: &'static str,
-    pub owner_expires: String,
-    pub owner_scopes: String,
-    pub owner_last_refresh: String,
-    pub owner_last_error: Option<String>,
-    pub owner_connected: bool,
-    pub fingerprint: String,
     pub shared_names: Vec<String>,
     pub shared_ok: bool,
     pub csrf: &'a str,
     pub vehicle_id: Option<i64>,
     pub error: Option<&'a str>,
     pub notice: Option<&'a str>,
-    pub stream_status: &'a str,
-    pub streaming_enabled: bool,
-    pub authorize_url: Option<&'a str>,
     pub report: crate::connection::Report,
 }
 
@@ -468,7 +453,6 @@ pub(super) fn fleet_page(chrome: &Chrome, cards: &[FleetCard], month_total: &str
                             }
                             div { dt { "Ce mois" } dd { (card.month) } }
                             div { dt { "Dernière activité" } dd { (card.last_seen) } }
-                            div { dt { "Mode GPS" } dd { (card.position_mode) } }
                         }
                         @if let Some(error) = &card.last_error {
                             p class="banner bad" { "Dernière erreur : " (error) }
@@ -704,16 +688,13 @@ pub(super) fn overview_page(chrome: &Chrome, overview: &Overview) -> String {
             (recent_card("derniere-charge", "Dernière charge", overview.last_charge.as_ref(), "Aucune charge", charges_href.as_deref(), "Toutes les charges"))
             (month_card)
             details class="card diagnostics" {
-                summary { "Diagnostic" span class="muted" { " · " (overview.activity) " · GPS " (overview.position_mode) } }
+                summary { "Diagnostic" span class="muted" { " · " (overview.activity) } }
                 dl class="facts" {
                     div { dt { "Activité" } dd { (overview.activity) } }
                     div { dt { "Batterie" } dd { (overview.battery) } }
-                    div { dt { "Mode GPS" } dd { (overview.position_mode) } }
                     div { dt { "Dernier poll" } dd { (overview.last_poll) } }
                     div { dt { "Dernière donnée" } dd { (overview.last_data) } }
                     div { dt { "Dernière erreur" } dd { (overview.last_error) } }
-                    div { dt { "Retard stream" } dd { (overview.stream_lag) } }
-                    div { dt { "File stream" } dd { (overview.stream_queue) } }
                 }
             }
         }
@@ -835,7 +816,7 @@ pub(super) fn connection_page(chrome: &Chrome, view: &ConnectionView<'_>) -> Str
                 @if view.report.show_disconnect {
                     details class="danger-zone" {
                         summary { "Déconnecter mon compte Tesla" }
-                        p { "Tesla ne fournit pas d'endpoint serveur pour révoquer le jeton Fleet. La documentation ne propose qu'une page de consentement, à confirmer sur le compte Tesla. Cette action retire la configuration de télémétrie des véhicules de ce compte si Tesla l'accepte, efface les jetons Fleet et Owner stockés ici, et arrête l'interrogation et le streaming. Les véhicules, trajets, charges, positions et réglages sont conservés." }
+                        p { "Tesla ne fournit pas d'endpoint serveur pour révoquer le jeton Fleet. La documentation ne propose qu'une page de consentement, à confirmer sur le compte Tesla. Cette action retire la configuration de télémétrie des véhicules de ce compte si Tesla l'accepte, efface les jetons Fleet stockés ici et arrête l'interrogation. Les véhicules, trajets, charges, positions et réglages sont conservés." }
                         @if let Some(url) = &view.report.revoke_url {
                             p { a href=(url) rel="noreferrer noopener" target="_blank" { "Ouvrir la page Tesla pour retirer l'application" } }
                         }
@@ -866,81 +847,6 @@ pub(super) fn connection_page(chrome: &Chrome, view: &ConnectionView<'_>) -> Str
                         }
                     } @else {
                         p class="muted" { "Un administrateur avec sudo actif peut supprimer les données. Sudo dure 5 minutes." }
-                    }
-                }
-            }
-            details class="legacy" {
-                summary { "Streaming Owner API (ancien)" }
-                p { "Utilise l'Owner API et le socket de streaming historiques de Tesla. Ils sont non officiels et Tesla peut les retirer. Le polling Fleet reste la source pour le reste. Le stream ajoute environ une position par seconde en conduite." }
-                div class="meta" {
-                    span class=(format!("chip {}", stream_tone(view.stream_status))) {
-                        "Stream " (view.stream_status)
-                    }
-                    @if view.owner_connected {
-                        span class="chip ok" { "Jeton Owner enregistré" }
-                    } @else {
-                        span class="chip" { "Pas de jeton Owner" }
-                    }
-                }
-                @if !view.streaming_enabled {
-                    div class="banner note" role="status" {
-                        p { "Le streaming est désactivé (OWNER_STREAM_ENABLED=false). Les jetons peuvent toujours être enregistrés." }
-                    }
-                }
-                ol class="steps" {
-                    li { "Choisissez " strong { "Préparer la connexion Tesla" } "." }
-                    li { "Ouvrez le lien Tesla et connectez-vous avec le compte qui possède la voiture. Le lien s'ouvre dans un nouvel onglet." }
-                    li { "Le navigateur ne peut pas ouvrir " code { "tesla://" } ". Ne lancez pas l'application Tesla." }
-                    li { "Copiez l'URL complète depuis la barre d'adresse. Elle commence par " code { "tesla://auth/callback?" } "." }
-                    li { "Collez-la dans " strong { "URL de redirection" } " puis " strong { "Enregistrer" } ". Le champ est masqué." }
-                }
-                form class="stack" method="post" action="/auth/owner/start" {
-                    input type="hidden" name="csrf" value=(view.csrf);
-                    (vehicle_field(view.vehicle_id))
-                    button type="submit" { "Préparer la connexion Tesla" }
-                }
-                @if let Some(url) = view.authorize_url {
-                    p class="stack" {
-                        a class="button" href=(url) rel="noreferrer noopener" target="_blank" { "Ouvrir la connexion Tesla" }
-                    }
-                } @else {
-                    p class="muted" { "Préparez une connexion pour obtenir le lien Tesla." }
-                }
-                form class="stack" method="post" action="/auth/owner/callback" {
-                    input type="hidden" name="csrf" value=(view.csrf);
-                    (vehicle_field(view.vehicle_id))
-                    label class="field" for="redirect_url" {
-                        "URL de redirection"
-                        input id="redirect_url" type="password" name="redirect_url" autocomplete="off" spellcheck="false" maxlength="8000" required;
-                    }
-                    button type="submit" { "Enregistrer" }
-                }
-                h2 { "Jeton de rafraîchissement" }
-                p { "Collez un refresh token créé pour ce logger. N'utilisez pas celui de TeslaMate : Tesla les fait tourner et cela peut déconnecter TeslaMate." }
-                form class="stack" method="post" action="/auth/owner/refresh" {
-                    input type="hidden" name="csrf" value=(view.csrf);
-                    (vehicle_field(view.vehicle_id))
-                    label class="field" for="refresh_token" {
-                        "Refresh token Owner API"
-                        input id="refresh_token" type="password" name="refresh_token" autocomplete="off" spellcheck="false" maxlength="8000" required;
-                    }
-                    button type="submit" { "Enregistrer le refresh token" }
-                }
-                h2 { "Déconnexion" }
-                p class="muted" { "Supprime le jeton Owner API stocké. Le polling Fleet n'est pas modifié." }
-                form method="post" action="/auth/owner/disconnect" {
-                    input type="hidden" name="csrf" value=(view.csrf);
-                    (vehicle_field(view.vehicle_id))
-                    button class="danger" type="submit" { "Déconnecter l'Owner API" }
-                }
-                dl class="facts" {
-                    div { dt { "État" } dd { span class=(format!("chip {}", view.owner_tone)) { (view.owner_status) } } }
-                    div { dt { "Expiration du jeton" } dd { (view.owner_expires) } }
-                    div { dt { "Scopes" } dd { (view.owner_scopes) } }
-                    div { dt { "Dernier rafraîchissement" } dd { (view.owner_last_refresh) } }
-                    div { dt { "Empreinte de la clé publique" } dd { code { (view.fingerprint) } } }
-                    @if let Some(error) = &view.owner_last_error {
-                        div { dt { "Dernière erreur" } dd { (error) } }
                     }
                 }
             }
@@ -1400,14 +1306,6 @@ fn current_id(chrome: &Chrome) -> Option<i64> {
         .map(|vehicle| vehicle.id)
 }
 
-fn stream_tone(status: &str) -> &'static str {
-    match status {
-        "connected" => "ok",
-        "error" => "bad",
-        _ => "neutral",
-    }
-}
-
 /// App icon shown before the "Tesla Logger" label in page headers.
 fn brand_mark() -> Markup {
     html! {
@@ -1672,7 +1570,6 @@ mod tests {
             name: "Red <script>".to_owned(),
             activity: "driving".to_owned(),
             battery: "72%".to_owned(),
-            position_mode: "fallback".to_owned(),
             last_seen: "—".to_owned(),
             last_error: Some("poll failed".to_owned()),
             month: "1.0 km".to_owned(),
@@ -1700,7 +1597,7 @@ mod tests {
         assert!(banner.contains("href=\"/connection\">Connexion</a>"));
         assert!(banner.contains("aria-hidden=\"true\">!"));
         assert!(html.contains("72%"));
-        assert!(html.contains("fallback"));
+        assert!(!html.contains("Mode GPS"));
         assert!(html.contains("href=\"/settings\""));
         assert!(html.contains("href=\"/debug\""));
         assert!(html.contains("action=\"/logout\""));
@@ -1724,12 +1621,9 @@ mod tests {
                 name: "Faucon".to_owned(),
                 activity: "online".to_owned(),
                 battery: "80%".to_owned(),
-                position_mode: "hybrid".to_owned(),
                 last_poll: "jamais".to_owned(),
                 last_data: "jamais".to_owned(),
                 last_error: "—".to_owned(),
-                stream_lag: "3 s".to_owned(),
-                stream_queue: "0".to_owned(),
                 last_drive: None,
                 last_charge: None,
                 ..Overview::default()
@@ -1738,8 +1632,8 @@ mod tests {
         assert!(html.contains("<tl-tabs"));
         assert!(html.contains("\"selected\":true"));
         assert!(html.contains("Aperçu"));
-        assert!(html.contains("hybrid"));
-        assert!(html.contains("Retard stream"));
+        assert!(!html.contains("Mode GPS"));
+        assert!(!html.contains("stream"));
         assert!(!html.contains("<svg class=\"car\""));
         assert!(html.contains("Image du véhicule indisponible"));
         assert!(html.contains("Aucun trajet"));
@@ -1749,7 +1643,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_page_groups_fleet_and_owner_without_secrets() {
+    fn connection_page_has_no_owner_step_and_no_secrets() {
         let chrome = Chrome {
             vehicles: vec![NavVehicle {
                 id: 4,
@@ -1764,32 +1658,15 @@ mod tests {
             &ConnectionView {
                 admin: true,
                 sudo: false,
-                owner_status: "déconnecté".to_owned(),
-                owner_tone: "neutral",
-                owner_expires: "—".to_owned(),
-                owner_scopes: "—".to_owned(),
-                owner_last_refresh: "—".to_owned(),
-                owner_last_error: None,
-                owner_connected: false,
-                fingerprint: "sha256:abcd".to_owned(),
                 shared_names: vec!["Millenium".to_owned()],
                 shared_ok: true,
                 csrf: "csrf-token",
                 vehicle_id: Some(4),
-                error: Some("Owner API sign-in failed"),
+                error: Some("Fleet sign-in failed"),
                 notice: None,
-                stream_status: "disabled",
-                streaming_enabled: true,
-                authorize_url: Some(
-                    "https://auth.tesla.com/oauth2/v3/authorize?client_id=ownerapi&redirect_uri=tesla%3A%2F%2Fauth%2Fcallback",
-                ),
                 report: crate::connection::Report::blank(),
             },
         );
-        assert!(html.contains("tesla://auth/callback?"));
-        assert!(html.contains("Ne lancez pas l'application Tesla"));
-        assert!(html.contains("Préparer la connexion Tesla"));
-        assert!(html.contains("N'utilisez pas celui de TeslaMate"));
         assert!(!html.contains("void/callback"));
         assert!(html.contains("href=\"/debug\""));
         assert!(html.contains("<ol class=\"setup\" start=\"0\""));
@@ -1805,18 +1682,12 @@ mod tests {
         assert!(!html.contains("action=\"/auth/refresh\""));
         assert!(!html.contains("action=\"/auth/disconnect\""));
         assert!(html.contains("sudo"));
-        assert!(html.contains("action=\"/auth/owner/start\""));
-        assert!(html.contains("action=\"/auth/owner/callback\""));
-        assert!(html.contains("action=\"/auth/owner/refresh\""));
-        assert!(html.contains("action=\"/auth/owner/disconnect\""));
-        assert!(html.contains("name=\"redirect_url\""));
-        assert!(html.contains("name=\"refresh_token\""));
+        assert!(!html.contains("/auth/owner"));
+        assert!(!html.contains("Owner"));
+        assert!(!html.contains("name=\"redirect_url\""));
         assert!(html.contains("name=\"csrf\" value=\"csrf-token\""));
         assert!(html.contains("name=\"vehicle_id\" value=\"4\""));
-        assert!(html.contains("redirect_uri=tesla%3A%2F%2Fauth%2Fcallback"));
-        assert!(html.contains("&amp;redirect_uri="));
         assert!(html.contains("role=\"alert\""));
-        assert!(html.contains("sha256:abcd"));
         assert!(html.contains("Ce compte gère aussi"));
         assert!(html.contains("Millenium"));
         assert!(!html.contains("OWNER_STREAM_ENABLED"));
@@ -1835,23 +1706,12 @@ mod tests {
             &ConnectionView {
                 admin: true,
                 sudo: true,
-                owner_status: "déconnecté".to_owned(),
-                owner_tone: "neutral",
-                owner_expires: "—".to_owned(),
-                owner_scopes: "—".to_owned(),
-                owner_last_refresh: "—".to_owned(),
-                owner_last_error: None,
-                owner_connected: false,
-                fingerprint: "sha256:abcd".to_owned(),
                 shared_names: Vec::new(),
                 shared_ok: true,
                 csrf: "csrf-token",
                 vehicle_id: None,
                 error: None,
                 notice: None,
-                stream_status: "disabled",
-                streaming_enabled: true,
-                authorize_url: None,
                 report: crate::connection::build(facts),
             },
         )
@@ -1923,7 +1783,7 @@ mod tests {
         assert!(early.contains("Enregistrer le domaine"));
         assert!(!early.contains("href=\"/auth/login\""));
         assert!(!early.contains("https://tesla.com/_ak/logger.example"));
-        assert!(early.contains("Streaming Owner API (ancien)"));
+        assert!(!early.contains("Owner"));
         assert!(early.contains("name=\"csrf\" value=\"csrf-token\""));
     }
 
@@ -1972,12 +1832,9 @@ mod tests {
                 name: "Faucon".to_owned(),
                 activity: "online".to_owned(),
                 battery: "80%".to_owned(),
-                position_mode: "hybrid".to_owned(),
                 last_poll: "jamais".to_owned(),
                 last_data: "jamais".to_owned(),
                 last_error: "—".to_owned(),
-                stream_lag: "3 s".to_owned(),
-                stream_queue: "0".to_owned(),
                 last_drive: None,
                 last_charge: None,
                 ..Overview::default()
@@ -1992,23 +1849,12 @@ mod tests {
             &ConnectionView {
                 admin: false,
                 sudo: false,
-                owner_status: "déconnecté".to_owned(),
-                owner_tone: "neutral",
-                owner_expires: "—".to_owned(),
-                owner_scopes: "—".to_owned(),
-                owner_last_refresh: "—".to_owned(),
-                owner_last_error: None,
-                owner_connected: false,
-                fingerprint: "sha256:abcd".to_owned(),
                 shared_names: Vec::new(),
                 shared_ok: true,
                 csrf: "csrf-token",
                 vehicle_id: Some(4),
                 error: None,
                 notice: None,
-                stream_status: "disabled",
-                streaming_enabled: false,
-                authorize_url: None,
                 report: crate::connection::Report::blank(),
             },
         );
@@ -2048,12 +1894,9 @@ mod tests {
                         name: "Faucon".to_owned(),
                         activity: "online".to_owned(),
                         battery: "80%".to_owned(),
-                        position_mode: "hybrid".to_owned(),
                         last_poll: "—".to_owned(),
                         last_data: "—".to_owned(),
                         last_error: "—".to_owned(),
-                        stream_lag: "—".to_owned(),
-                        stream_queue: "0".to_owned(),
                         last_drive: None,
                         last_charge: None,
                         ..Overview::default()
@@ -2071,23 +1914,12 @@ mod tests {
                     &ConnectionView {
                         admin: false,
                         sudo: false,
-                        owner_status: "déconnecté".to_owned(),
-                        owner_tone: "neutral",
-                        owner_expires: "—".to_owned(),
-                        owner_scopes: "—".to_owned(),
-                        owner_last_refresh: "—".to_owned(),
-                        owner_last_error: None,
-                        owner_connected: false,
-                        fingerprint: "sha256:abcd".to_owned(),
                         shared_names: Vec::new(),
                         shared_ok: true,
                         csrf: "csrf-token",
                         vehicle_id: Some(4),
                         error: None,
                         notice: None,
-                        stream_status: "disabled",
-                        streaming_enabled: false,
-                        authorize_url: None,
                         report: crate::connection::Report::blank(),
                     },
                 ),

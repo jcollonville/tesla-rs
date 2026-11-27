@@ -658,7 +658,7 @@ pub(crate) enum DriveMotion {
     Charging,
     /// Asleep, offline, incomplete poll, or park while still moving.
     Gap,
-    /// Stream frame with no shift and no moving speed. Keeps the open drive.
+    /// Sample with no shift and no moving speed. Keeps the open drive.
     Hold,
 }
 
@@ -830,36 +830,6 @@ pub(crate) fn observation_motion(obs: &Observation) -> DriveMotion {
         return DriveMotion::Driving;
     }
     DriveMotion::Gap
-}
-
-/// Classifies one streaming sample.
-///
-/// An unknown shift on an open drive is [`DriveMotion::Hold`]: frames often omit
-/// `shift_state` when it did not change. Confirmed park is shift `P` with speed
-/// about zero. `P` while still moving is a gap, not a park.
-pub(crate) fn stream_motion(
-    shift: Option<&str>,
-    speed_kmh: Option<f64>,
-    drive_open: bool,
-) -> DriveMotion {
-    match normalized_shift(shift) {
-        Some("D" | "R" | "N") if known_standstill(speed_kmh) => DriveMotion::StoppedInGear,
-        Some("D" | "R" | "N") => DriveMotion::Driving,
-        Some("P") if speed_is_standstill(speed_kmh) => DriveMotion::Park,
-        Some("P") => DriveMotion::Gap,
-        _ => match speed_kmh {
-            Some(speed) if speed.is_finite() && speed > STANDSTILL_KMH => DriveMotion::Driving,
-            Some(speed) if speed_is_exact_zero(Some(speed)) => {
-                if drive_open {
-                    DriveMotion::UnknownStandstill
-                } else {
-                    DriveMotion::Gap
-                }
-            }
-            _ if drive_open => DriveMotion::Hold,
-            _ => DriveMotion::Gap,
-        },
-    }
 }
 
 /// Decides whether the open drive should close at `at`.
@@ -1338,66 +1308,7 @@ fn speed_above(speed: Option<f64>, threshold: f64) -> bool {
     speed.is_some_and(|speed| speed.is_finite() && speed > threshold)
 }
 
-/// Drive boundaries implied by one Owner API streaming sample.
-///
-/// An unknown shift keeps the current drive open. Streaming frames often omit
-/// `shift_state` when the value did not change, and that must not close the drive.
-/// [`StreamDrive::end_drive`] marks a confirmed park sample so it is stored. The
-/// caller closes only after [`plan_drive_close`] says the park grace has elapsed.
-/// A charge stays open until a drive actually starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct StreamDrive {
-    /// This sample should open a drive when none is open.
-    pub start_drive: bool,
-    /// Confirmed park on an open drive. Storage only; closing waits for the grace.
-    pub end_drive: bool,
-    /// Starting a drive ends an open charge.
-    pub end_charge: bool,
-    /// Activity implied by this sample, ignoring an unelapsed grace.
-    pub activity: Activity,
-    /// The car is driving, or an unknown frame is keeping an open drive.
-    pub driving: bool,
-    /// How this sample affects the close clock.
-    pub motion: DriveMotion,
-}
-
-pub(crate) fn stream_drive_decision(
-    tracker: &Tracker,
-    shift: Option<&str>,
-    speed_kmh: Option<f64>,
-) -> StreamDrive {
-    let motion = stream_motion(shift, speed_kmh, tracker.drive_open);
-    let start_drive =
-        !tracker.drive_open && matches!(motion, DriveMotion::Driving | DriveMotion::StoppedInGear);
-    let driving = start_drive
-        || (tracker.drive_open
-            && matches!(
-                motion,
-                DriveMotion::Driving | DriveMotion::Hold | DriveMotion::StoppedInGear
-            ));
-    let end_drive = motion == DriveMotion::Park && tracker.drive_open;
-    let end_charge = start_drive && tracker.charge_open;
-    let charge_open = tracker.charge_open && !end_charge;
-    let activity = if driving {
-        Activity::Driving
-    } else if charge_open {
-        Activity::Charging
-    } else if tracker.activity == Activity::Updating {
-        Activity::Updating
-    } else {
-        Activity::Online
-    };
-    StreamDrive {
-        start_drive,
-        end_drive,
-        end_charge,
-        activity,
-        driving,
-        motion,
-    }
-}
-
-/// A drive that has already been closed. Late stream samples may join it.
+/// A drive that has already been closed. Late telemetry samples may join it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ClosedDrive {
     pub id: i64,
@@ -1409,72 +1320,38 @@ pub(crate) struct ClosedDrive {
 }
 
 /// Samples older than this at processing time must not open a drive.
-pub(crate) const STALE_STREAM_OPEN: chrono::Duration = chrono::Duration::seconds(30);
+pub(crate) const STALE_LIVE_OPEN: chrono::Duration = chrono::Duration::seconds(30);
 
 /// How far before a closed drive a late sample may still belong to it.
 pub(crate) const CLOSED_DRIVE_SLACK: chrono::Duration = chrono::Duration::seconds(30);
 
-/// Whether one stream sample may open a drive, and which closed drive it joins.
+/// Whether one live sample may open a drive, and which closed drive it joins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct StreamSampleGate {
+pub(crate) struct LiveSampleGate {
     pub allow_open: bool,
     pub attach_closed: Option<i64>,
 }
 
-/// Gates a stream sample against the last closed drive and the processing clock.
+/// Gates a live (telemetry) sample against the last closed drive and the processing clock.
 ///
-/// A sample at or before that drive's `end_at`, or older than [`STALE_STREAM_OPEN`],
+/// A sample at or before that drive's `end_at`, or older than [`STALE_LIVE_OPEN`],
 /// must not open a drive. A sample inside the drive, or up to [`CLOSED_DRIVE_SLACK`]
 /// before it started, is attached to that drive instead.
-pub(crate) fn gate_stream_sample(
+pub(crate) fn gate_live_sample(
     at: DateTime<Utc>,
     now: DateTime<Utc>,
     last_closed: Option<ClosedDrive>,
-) -> StreamSampleGate {
-    let stale = now.signed_duration_since(at) > STALE_STREAM_OPEN;
+) -> LiveSampleGate {
+    let stale = now.signed_duration_since(at) > STALE_LIVE_OPEN;
     let covers_closed = last_closed.is_some_and(|closed| at <= closed.end_at);
     let attach_closed = last_closed.and_then(|closed| {
         let earliest = closed.start_at - CLOSED_DRIVE_SLACK;
         (at >= earliest && at <= closed.end_at).then_some(closed.id)
     });
-    StreamSampleGate {
+    LiveSampleGate {
         allow_open: !stale && !covers_closed,
         attach_closed,
     }
-}
-
-/// A streamed fix within two seconds of a polled row is the same moment.
-///
-/// Poll rows are every fifteen seconds or slower, so this only drops the stream
-/// sample that landed on the poll. Neighbouring one-hertz samples stay.
-#[allow(dead_code)] // Unit tests lock this window. The SQL uses the same two seconds.
-pub(crate) fn stream_collides_with_poll(at: DateTime<Utc>, poll_at: DateTime<Utc>) -> bool {
-    at.signed_duration_since(poll_at)
-        .num_milliseconds()
-        .unsigned_abs()
-        <= 2_000
-}
-
-/// Whether this streaming fix should become a `positions` row.
-pub(crate) fn should_store_stream_position(
-    driving: bool,
-    ending_drive: bool,
-    latitude: Option<f64>,
-    longitude: Option<f64>,
-) -> bool {
-    let Some(latitude) = latitude else {
-        return false;
-    };
-    let Some(longitude) = longitude else {
-        return false;
-    };
-    if !latitude.is_finite() || !longitude.is_finite() {
-        return false;
-    }
-    if latitude.abs() < 1e-7 && longitude.abs() < 1e-7 {
-        return false;
-    }
-    driving || ending_drive
 }
 
 fn normalized_shift(shift: Option<&str>) -> Option<&str> {
@@ -1852,10 +1729,9 @@ mod tests {
 
     use super::{
         Activity, ClosedDrive, DriveClock, Observation, Presence, Sample, StopKind, Tracker,
-        Transition, drive_end_cutoff, gate_stream_sample, keep_closed_drive, merge_clock,
-        plan_drive_close, reduce, sanitize_charger_type, should_reopen_drive,
-        should_store_stream_position, stream_collides_with_poll, stream_drive_decision,
-        stream_motion, summarize_charge, summarize_drive, window_shows_movement,
+        Transition, drive_end_cutoff, gate_live_sample, keep_closed_drive, merge_clock,
+        plan_drive_close, reduce, sanitize_charger_type, should_reopen_drive, summarize_charge,
+        summarize_drive, window_shows_movement,
     };
 
     fn odometer_sample(minute: i64, odometer_km: Option<f64>, latitude: f64) -> Sample {
@@ -2307,7 +2183,10 @@ mod tests {
     fn drive_at_zero_for_ten_minutes_does_not_close() {
         let grace = super::DriveGrace::standard();
         let start = at(0);
-        let motion = stream_motion(Some("D"), Some(0.0), true);
+        let mut stopped = super::Observation::at(start, super::Presence::Online);
+        stopped.shift_state = Some("D".to_owned());
+        stopped.speed_kmh = Some(0.0);
+        let motion = super::observation_motion(&stopped);
         let first = plan_drive_close(motion, start, clock_at(0), grace, Some(0.0));
         let (super::ClosePlan::Continue { clock } | super::ClosePlan::Wait { clock, .. }) = first
         else {
@@ -2836,91 +2715,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_shift_keeps_an_open_drive_and_a_charge() {
-        let parked = Tracker {
-            activity: Activity::Online,
-            drive_open: false,
-            charge_open: false,
-        };
-        let started = stream_drive_decision(&parked, Some("D"), Some(0.0));
-        assert!(started.start_drive);
-        assert!(started.driving);
-        assert_eq!(started.activity, Activity::Driving);
-
-        let driving = Tracker {
-            activity: Activity::Driving,
-            drive_open: true,
-            charge_open: false,
-        };
-        let held = stream_drive_decision(&driving, None, None);
-        assert!(!held.end_drive);
-        assert!(held.driving);
-        let ended = stream_drive_decision(&driving, Some("P"), Some(0.0));
-        assert!(ended.end_drive);
-        assert_eq!(ended.motion, super::DriveMotion::Park);
-        assert!(!ended.driving);
-        let grace = super::DriveGrace::standard();
-        let waited = plan_drive_close(ended.motion, at(0), clock_at(0), grace, Some(0.0));
-        assert!(matches!(waited, super::ClosePlan::Wait { .. }));
-        assert_eq!(ended.activity, Activity::Online);
-
-        let charging = Tracker {
-            activity: Activity::Charging,
-            drive_open: false,
-            charge_open: true,
-        };
-        let still = stream_drive_decision(&charging, Some("P"), Some(0.0));
-        assert!(!still.end_charge);
-        assert_eq!(still.activity, Activity::Charging);
-        let depart = stream_drive_decision(&charging, None, Some(5.0));
-        assert!(depart.start_drive);
-        assert!(depart.end_charge);
-
-        let updating = Tracker {
-            activity: Activity::Updating,
-            drive_open: false,
-            charge_open: false,
-        };
-        assert_eq!(
-            stream_drive_decision(&updating, None, None).activity,
-            Activity::Updating
-        );
-
-        let poll = at(0);
-        assert!(stream_collides_with_poll(poll, poll));
-        assert!(stream_collides_with_poll(poll + Duration::seconds(2), poll));
-        assert!(!stream_collides_with_poll(
-            poll + Duration::seconds(3),
-            poll
-        ));
-        assert!(should_store_stream_position(
-            true,
-            false,
-            Some(48.1),
-            Some(11.5)
-        ));
-        assert!(!should_store_stream_position(
-            false,
-            false,
-            Some(48.1),
-            Some(11.5)
-        ));
-        assert!(should_store_stream_position(
-            false,
-            true,
-            Some(48.1),
-            Some(11.5)
-        ));
-        assert!(!should_store_stream_position(
-            true,
-            false,
-            Some(0.0),
-            Some(0.0)
-        ));
-        assert!(!should_store_stream_position(true, false, None, Some(11.5)));
-    }
-
-    #[test]
     fn late_samples_attach_to_the_closed_drive_and_do_not_open() {
         let start = Utc.with_ymd_and_hms(2024, 11, 10, 12, 9, 0).unwrap();
         let end = start + Duration::minutes(10);
@@ -2932,19 +2726,19 @@ mod tests {
             end_longitude: None,
         };
         let now = Utc::now();
-        let inside = gate_stream_sample(start + Duration::minutes(2), now, Some(closed));
+        let inside = gate_live_sample(start + Duration::minutes(2), now, Some(closed));
         assert!(!inside.allow_open);
         assert_eq!(inside.attach_closed, Some(7));
-        let before = gate_stream_sample(start - Duration::seconds(10), now, Some(closed));
+        let before = gate_live_sample(start - Duration::seconds(10), now, Some(closed));
         assert!(!before.allow_open);
         assert_eq!(before.attach_closed, Some(7));
-        let ancient = gate_stream_sample(start - Duration::hours(2), now, Some(closed));
+        let ancient = gate_live_sample(start - Duration::hours(2), now, Some(closed));
         assert!(!ancient.allow_open);
         assert_eq!(ancient.attach_closed, None);
-        let stale = gate_stream_sample(now - Duration::seconds(45), now, Some(closed));
+        let stale = gate_live_sample(now - Duration::seconds(45), now, Some(closed));
         assert!(!stale.allow_open);
         assert_eq!(stale.attach_closed, None);
-        let fresh = gate_stream_sample(now, now, Some(closed));
+        let fresh = gate_live_sample(now, now, Some(closed));
         assert!(fresh.allow_open);
         assert_eq!(fresh.attach_closed, None);
     }

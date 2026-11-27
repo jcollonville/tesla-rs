@@ -18,15 +18,10 @@
   if (framePane) framePane.addEventListener("scroll", function () { stickFrames = nearBottom(framePane); });
   if (logPane) logPane.addEventListener("scroll", function () { stickLogs = nearBottom(logPane); });
   function applyFilters() {
-    var dir = document.getElementById("dir").value;
     var kind = document.getElementById("kind").value;
     var level = document.getElementById("level").value;
-    var showKeep = document.getElementById("keepalives").checked;
-    frames.classList.toggle("hide-keep", !showKeep);
     frames.querySelectorAll("li").forEach(function (li) {
-      var dirOk = !dir || li.dataset.dir === dir;
-      var kindOk = !kind || li.dataset.type === kind;
-      li.hidden = !(dirOk && kindOk);
+      li.hidden = !(!kind || li.dataset.type === kind);
     });
     logs.querySelectorAll("li").forEach(function (li) {
       var value = li.dataset.level || "";
@@ -68,7 +63,7 @@
       }
     });
   }
-  ["dir", "kind", "level", "keepalives"].forEach(function (id) {
+  ["kind", "level"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.addEventListener("change", applyFilters);
   });

@@ -78,11 +78,6 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/auth/callback/complete", get(oauth_complete))
         .route("/auth/disconnect", post(disconnect))
         .route("/auth/refresh", post(fleet_refresh))
-        .route("/auth/owner", get(owner_redirect))
-        .route("/auth/owner/start", post(super::owner::start))
-        .route("/auth/owner/callback", post(super::owner::callback))
-        .route("/auth/owner/refresh", post(super::owner::refresh))
-        .route("/auth/owner/disconnect", post(super::owner::disconnect))
         .route("/tokens", post(create_token))
         .route("/tokens/{id}/revoke", post(revoke_token))
         .route("/static/ui.css", get(ui_css))
@@ -168,7 +163,6 @@ async fn home(State(app): State<AppState>, headers: HeaderMap) -> Response {
         let (km, kwh) = months.get(&vehicle.id).copied().unwrap_or((0.0, 0.0));
         total_km += km;
         total_kwh += kwh;
-        let mode = app.inner.archive.gps.mode_name(vehicle.id).await;
         let mut card = FleetCard {
             id: vehicle.id,
             name: vehicle.name.clone(),
@@ -177,7 +171,6 @@ async fn home(State(app): State<AppState>, headers: HeaderMap) -> Response {
                 .clone()
                 .unwrap_or_else(|| "inconnu".to_owned()),
             battery: fmt_battery(vehicle.battery_level),
-            position_mode: mode,
             last_seen: super::format::ago(
                 vehicle.last_data_at.or(vehicle.last_poll_at),
                 Utc::now(),
@@ -223,8 +216,6 @@ async fn overview(
         );
     };
     remember_vehicle(&app, &page.session_id, id).await;
-    let mode = app.inner.archive.gps.mode_name(id).await;
-    let (latest_sample, queue_depth) = app.inner.stream_board.snapshot().await.ingestion(id);
     let tz = super::format::zone(&app, Some(id)).await;
     let (last_drive, last_charge, car, month) = tokio::join!(
         super::overview::recent_drive(&app, id, tz),
@@ -239,12 +230,9 @@ async fn overview(
             .clone()
             .unwrap_or_else(|| "inconnu".to_owned()),
         battery: fmt_battery(vehicle.battery_level),
-        position_mode: mode,
         last_poll: fmt_time(vehicle.last_poll_at),
         last_data: fmt_time(vehicle.last_data_at),
         last_error: vehicle.last_error.clone().unwrap_or_else(|| "—".to_owned()),
-        stream_lag: fmt_lag(latest_sample),
-        stream_queue: queue_depth.to_string(),
         last_drive,
         last_charge,
         telemetry_notice: super::overview::telemetry_notice(&app, id).await,
@@ -264,21 +252,6 @@ async fn overview(
         ),
         page.cookie,
     )
-}
-
-/// Age of the newest Owner stream sample, `—` when none was seen.
-fn fmt_lag(at: Option<DateTime<Utc>>) -> String {
-    let Some(at) = at else {
-        return "—".to_owned();
-    };
-    let secs = (Utc::now() - at).num_seconds().max(0);
-    if secs < 60 {
-        format!("{secs} s")
-    } else if secs < 3_600 {
-        format!("{} min", secs / 60)
-    } else {
-        format!("{} h", secs / 3_600)
-    }
 }
 
 async fn stats(
@@ -362,12 +335,7 @@ pub(super) async fn render_connection(
         .await
         .ok()
         .flatten();
-    let owner_account = accounts::load_account(&app.inner.db, app.inner.owner_account_id)
-        .await
-        .ok()
-        .flatten();
     let fleet_token = app.inner.fleet_store.public_view().await;
-    let owner_token = app.inner.owner_store.public_view().await;
     let shared = match accounts::vehicles_for_account(&app.inner.db, account_id).await {
         Ok(rows) => Ok(rows),
         Err(err) => {
@@ -384,11 +352,6 @@ pub(super) async fn render_connection(
             .map(|vehicle| vehicle.name.clone())
             .collect::<Vec<_>>()
     });
-    let snapshot = app.inner.stream_board.snapshot().await;
-    let pending = app.inner.owner_pending.lock().await.clone();
-    let authorize_url = pending.and_then(|(login, created)| {
-        (created.elapsed() <= super::owner::PENDING_TTL).then(|| login.authorize_url().to_string())
-    });
     if let Some(id) = vehicle_id {
         remember_vehicle(app, &page.session_id, id).await;
     }
@@ -397,43 +360,12 @@ pub(super) async fn render_connection(
     let view = ConnectionView {
         admin: page.admin,
         sudo: page.sudo,
-        owner_status: owner_account.as_ref().map_or_else(
-            || {
-                if owner_token.present {
-                    "connecté".to_owned()
-                } else {
-                    "déconnecté".to_owned()
-                }
-            },
-            |account| account.status.clone(),
-        ),
-        owner_tone: token_tone(
-            &owner_token,
-            owner_account
-                .as_ref()
-                .and_then(|account| account.last_error.as_deref()),
-        ),
-        owner_expires: fmt_time(owner_token.expires_at),
-        owner_scopes: fmt_scopes(&owner_token.scopes),
-        owner_last_refresh: fmt_time(
-            owner_account
-                .as_ref()
-                .and_then(|account| account.last_refresh_at),
-        ),
-        owner_last_error: owner_account
-            .as_ref()
-            .and_then(|account| account.last_error.clone()),
-        owner_connected: owner_token.present,
-        fingerprint: public_key_fingerprint(&app.inner.public_key_pem),
         shared_names: shared_names.clone().unwrap_or_default(),
         shared_ok: shared_names.is_ok(),
         csrf: &page.csrf,
         vehicle_id,
         error,
         notice,
-        stream_status: snapshot.summary(),
-        streaming_enabled: app.inner.config.owner_stream_enabled,
-        authorize_url: authorize_url.as_deref(),
         report: connection_report(app, &page, account_id, &fleet_token, fleet_account.as_ref())
             .await,
     };
@@ -752,24 +684,6 @@ async fn resend_telemetry(
         .await;
     }
     Redirect::to(&connection_location(form.vehicle_id)).into_response()
-}
-
-fn token_tone(token: &TokenPublic, error: Option<&str>) -> &'static str {
-    if !token.readable || error.is_some() {
-        "bad"
-    } else if token.present {
-        "ok"
-    } else {
-        "neutral"
-    }
-}
-
-fn fmt_scopes(scopes: &[String]) -> String {
-    if scopes.is_empty() {
-        "—".to_owned()
-    } else {
-        scopes.join(" ")
-    }
 }
 
 #[derive(Deserialize)]
@@ -1192,7 +1106,6 @@ fn setting_key_for_label(label: &str) -> Option<&'static str> {
         "MQTT hôte" => Some("MQTT_HOST"),
         "MQTT port" => Some("MQTT_PORT"),
         "MQTT préfixe" => Some("MQTT_TOPIC_PREFIX"),
-        "Stream Owner" => Some("OWNER_STREAM_ENABLED"),
         _ => None,
     }
 }
@@ -1616,20 +1529,6 @@ async fn logs_redirect(State(app): State<AppState>, headers: HeaderMap) -> Respo
     Redirect::to("/debug").into_response()
 }
 
-async fn owner_redirect(State(app): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(principal) = ui_session(&app, &headers).await else {
-        return Redirect::to("/").into_response();
-    };
-    let vehicles = vehicle_rows(&app, principal.user_id, principal.is_admin())
-        .await
-        .unwrap_or_default();
-    if vehicles.len() == 1 {
-        Redirect::to(&format!("/v/{}/connection", vehicles[0].id)).into_response()
-    } else {
-        Redirect::to("/connection").into_response()
-    }
-}
-
 async fn logs_events(
     State(app): State<AppState>,
     headers: HeaderMap,
@@ -1975,32 +1874,13 @@ async fn disconnect(
             false
         }
     };
-    let owner_cleared = if app.inner.owner_account_id > 0 {
-        match app.inner.owner_store.clear().await {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(
-                    error = %crate::logs::redact_line(&err.to_string(), &[]),
-                    "could not clear owner tokens"
-                );
-                false
-            }
-        }
-    } else {
-        true
-    };
-    if app.inner.owner_account_id > 0 {
-        app.inner
-            .owner_tokens
-            .send_modify(|value| *value = value.wrapping_add(1));
-    }
     app.inner.archive.gps.notify();
     {
         let mut cache = app.inner.links.lock().await;
         cache.pairing.clear();
         cache.pairing_at = None;
     }
-    if !fleet_cleared || !owner_cleared {
+    if !fleet_cleared {
         return render_connection(
             &app,
             &headers,
