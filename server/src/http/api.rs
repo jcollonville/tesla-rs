@@ -267,12 +267,12 @@ pub(crate) async fn drive_detail(
     allow_vehicle(drive.vehicle_id)?;
     let points = sqlx::query_as::<_, PointRow>(
         "SELECT recorded_at, latitude, longitude, speed_kmh, power_kw, battery_level,
-                elevation_m, rated_range_km, odometer_km
+                elevation_m, rated_range_km, odometer_km, source
          FROM positions
          WHERE drive_id = $1
            AND ($2::timestamptz IS NULL OR recorded_at >= $2)
            AND ($3::timestamptz IS NULL OR recorded_at <= $3)
-         ORDER BY recorded_at",
+         ORDER BY recorded_at, id",
     )
     .bind(id)
     .bind(drive.start_at)
@@ -280,6 +280,15 @@ pub(crate) async fn drive_detail(
     .fetch_all(&app.inner.db)
     .await
     .map_err(internal)?;
+    let keys: Vec<_> = points
+        .iter()
+        .map(|point| (point.recorded_at, point.source == "stream"))
+        .collect();
+    let points: Vec<PointRow> = points
+        .into_iter()
+        .zip(super::viz::one_source_mask(&keys))
+        .filter_map(|(point, keep)| keep.then_some(point))
+        .collect();
     let coords: Vec<[f64; 2]> = points
         .iter()
         .filter_map(|point| Some([point.latitude?, point.longitude?]))
@@ -1160,6 +1169,7 @@ struct PointRow {
     elevation_m: Option<f64>,
     rated_range_km: Option<f64>,
     odometer_km: Option<f64>,
+    source: String,
 }
 
 impl PointRow {

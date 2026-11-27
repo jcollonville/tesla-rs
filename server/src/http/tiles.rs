@@ -311,7 +311,7 @@ fn kind_of(path: &str) -> Kind {
 }
 
 fn ttl(path: &str) -> Duration {
-    if path.starts_with("styles/") || path == "planet" {
+    if path.starts_with("styles/") || tile_set(path) {
         STYLE_TTL
     } else {
         TILE_TTL
@@ -391,13 +391,21 @@ fn allowed(path: &str) -> bool {
     let parts: Vec<&str> = path.split('/').collect();
     match parts.as_slice() {
         ["styles", style] => *style == "positron" || *style == "dark",
-        ["planet"] => true,
+        [set] if tile_set(set) => true,
         ["fonts", stack, range] => font_stack(stack) && font_range(range),
         ["sprites", id, file] => sprite_id(id) && sprite_file(file),
-        ["planet", stamp, z, x, file] => planet_stamp(stamp) && tile_file(z, x, file, 14, "pbf"),
+        [set, stamp, z, x, file] if tile_set(set) => {
+            planet_stamp(stamp) && tile_file(z, x, file, 14, "pbf")
+        }
         ["natural_earth", "ne2sr", z, x, file] => tile_file(z, x, file, 6, "png"),
         _ => false,
     }
+}
+
+/// OpenFreeMap's vector set is usually `planet`. The published styles
+/// currently point at the failover set `backup_planet`.
+fn tile_set(value: &str) -> bool {
+    matches!(value, "planet" | "backup_planet")
 }
 
 fn font_stack(value: &str) -> bool {
@@ -538,6 +546,21 @@ mod tests {
         assert!(allowed("natural_earth/ne2sr/2/1/1.png"));
         assert!(!allowed("natural_earth/ne2sr/7/0/0.png"));
         assert!(!allowed("planet/20261115_080022_pt/3/9/1.pbf"));
+        assert!(allowed("backup_planet"));
+        assert!(allowed("backup_planet/20261122_124456_pt/3/2/1.pbf"));
+        assert!(!allowed("backup_planet/20261122_124456_pt/15/0/0.pbf"));
+        assert!(!allowed("backup_planet/not-a-stamp/0/0/0.pbf"));
+        assert!(!allowed("other_planet"));
+        assert!(!allowed("backup_planet/extra"));
+    }
+
+    #[test]
+    fn tilejson_documents_share_the_short_style_ttl() {
+        use super::{STYLE_TTL, TILE_TTL, ttl};
+        assert_eq!(ttl("planet"), STYLE_TTL);
+        assert_eq!(ttl("backup_planet"), STYLE_TTL);
+        assert_eq!(ttl("styles/positron"), STYLE_TTL);
+        assert_eq!(ttl("backup_planet/20261122_124456_pt/2/1/1.pbf"), TILE_TTL);
     }
 
     #[test]
@@ -616,5 +639,58 @@ mod tests {
         assert!(text.contains("/tiles/p/sprites/ofm_f384/ofm"), "{text}");
         assert!(!text.contains(&server.uri()), "{text}");
         let _ = map.fetch("styles/positron").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backup_planet_style_and_tiles_are_proxied() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let style = format!(
+            "{{\"sources\":{{\"openmaptiles\":{{\"type\":\"vector\",\"url\":\"{}/backup_planet\"}}}}}}",
+            server.uri()
+        );
+        let tilejson = format!(
+            "{{\"tiles\":[\"{}/backup_planet/20261122_124456_pt/{{z}}/{{x}}/{{y}}.pbf\"]}}",
+            server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/styles/positron"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(style))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/backup_planet"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tilejson))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/backup_planet/20261122_124456_pt/2/1/1.pbf"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(b"pbf".as_slice(), "application/vnd.mapbox-vector-tile"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let map = Basemap::new(server.uri(), None);
+        let style = map.fetch("styles/positron").await.unwrap();
+        let text = std::str::from_utf8(&style.bytes).unwrap();
+        assert!(text.contains("/tiles/p/backup_planet"), "{text}");
+        assert!(!text.contains(&server.uri()), "{text}");
+        let tilejson = map.fetch("backup_planet").await.unwrap();
+        let text = std::str::from_utf8(&tilejson.bytes).unwrap();
+        assert!(
+            text.contains("/tiles/p/backup_planet/20261122_124456_pt/{z}/{x}/{y}.pbf"),
+            "{text}"
+        );
+        let tile = map
+            .fetch("backup_planet/20261122_124456_pt/2/1/1.pbf")
+            .await
+            .unwrap();
+        assert_eq!(tile.bytes.as_slice(), b"pbf");
     }
 }

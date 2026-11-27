@@ -509,6 +509,21 @@ pub(crate) struct ApplyOptions {
     pub live: bool,
     pub store_position: bool,
     pub source: &'static str,
+    /// The coordinates were measured with this observation. When false the
+    /// stored point drops them: they would place an old fix at a new time.
+    pub fresh_location: bool,
+}
+
+/// The point stored for `obs`, without coordinates it did not measure.
+fn stored_point(obs: &Observation, fresh_location: bool) -> std::borrow::Cow<'_, Observation> {
+    if fresh_location {
+        return std::borrow::Cow::Borrowed(obs);
+    }
+    std::borrow::Cow::Owned(Observation {
+        latitude: None,
+        longitude: None,
+        ..obs.clone()
+    })
 }
 
 /// Applies one observation: session boundaries, positions, and current state.
@@ -527,6 +542,7 @@ pub(crate) async fn apply_observation(
         live,
         store_position,
         source: record_source,
+        fresh_location,
     } = options;
     let grace = runtime.drive_grace;
     let previous = runtime.tracker.clone();
@@ -561,7 +577,7 @@ pub(crate) async fn apply_observation(
                 insert_position(
                     &mut tx,
                     runtime.vehicle_id,
-                    obs,
+                    &stored_point(obs, fresh_location),
                     Some(closed_id),
                     None,
                     record_source,
@@ -624,7 +640,7 @@ pub(crate) async fn apply_observation(
         insert_position(
             &mut tx,
             runtime.vehicle_id,
-            obs,
+            &stored_point(obs, fresh_location),
             attach_drive,
             attach_charge,
             record_source,

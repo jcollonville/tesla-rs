@@ -50,7 +50,7 @@ pub(crate) fn subscription(
         .field_with("DetailedChargeState", pace(60, None, Some(900)))
         .field_with("ChargeState", pace(60, None, Some(900)))
         .field_with("Gear", pace(5, None, None))
-        .field_with("Location", pace(30, Some(25.0), None))
+        .field_with("Location", pace(3, Some(5.0), None))
         .field_with("Odometer", pace(60, Some(0.1), Some(300)))
         .field_with("Soc", pace(60, Some(1.0), Some(300)))
         .field_with("VehicleSpeed", pace(10, Some(1.0), None))
@@ -202,9 +202,10 @@ async fn handle_record(
             if slot.connection_id.is_empty() {
                 slot.connection_id.clone_from(&record.connection_id);
             }
+            let fresh_location = carries_location(&data);
             fold_vehicle_data(&mut slot.obs, &data);
             let snapshot = slot.obs.clone();
-            apply_for_vin(
+            crate::ingest::apply_telemetry_for_vin(
                 archive,
                 &vin,
                 VehicleIdentity {
@@ -214,8 +215,7 @@ async fn handle_record(
                     name: None,
                 },
                 snapshot,
-                true,
-                true,
+                fresh_location,
             )
             .await
         }
@@ -300,6 +300,15 @@ fn clip_label(value: &str) -> String {
     } else {
         out
     }
+}
+
+/// The payload itself carries a `Location`. The folded observation keeps the
+/// last one, which is stale on a speed- or gear-only message.
+fn carries_location(data: &VehicleData) -> bool {
+    data.iter().any(|datum| {
+        datum.field == FieldKey::Known(Field::Location)
+            && matches!(datum.value, DatumValue::Location(_))
+    })
 }
 
 pub(crate) fn fold_vehicle_data(obs: &mut Observation, data: &VehicleData) {
@@ -631,7 +640,9 @@ mod tests {
         assert!(fields.contains_key("Gear"));
         assert!(fields.contains_key("ScheduledChargingMode"));
         assert!(fields.contains_key("ScheduledDepartureTime"));
-        assert_eq!(fields["Location"].minimum_delta, Some(25.0));
+        // About one fix every 3 s while driving; nothing from a parked car.
+        assert_eq!(fields["Location"].interval_seconds, 3);
+        assert_eq!(fields["Location"].minimum_delta, Some(5.0));
         assert_eq!(fields["Soc"].minimum_delta, Some(1.0));
         // Re-sent so a reconnect or a logger restart gets them back without a change.
         assert_eq!(fields["Odometer"].resend_interval_seconds, Some(300));
@@ -1132,6 +1143,57 @@ mod replay_tests {
             .await
             .unwrap();
         assert!(distance.0.is_some_and(|km| km > 6.0), "{distance:?}");
+    }
+
+    /// Stream at 1 Hz and telemetry side by side, the car driving north.
+    /// A speed-only telemetry message must not store the 30 s old `Location`
+    /// at its own time: the track would jump back between two stream fixes.
+    #[tokio::test]
+    async fn telemetry_without_location_stores_no_stale_coordinates() {
+        let Some(db) = TestDb::migrated("tstale").await else {
+            return;
+        };
+        let mut replay = Replay::new(db.pool.clone());
+        let start = Utc::now();
+        let at = |secs: i64| start + Duration::seconds(secs);
+        let latitude = |secs: i32| 10.0 + 0.0001 * f64::from(secs);
+        replay.send(connected(at(0))).await;
+        for secs in 0..=120_i32 {
+            let km = 1_000.0 + 0.011 * f64::from(secs);
+            replay
+                .stream(at(secs.into()), Some("D"), 40.0, km, latitude(secs))
+                .await;
+            if secs % 10 == 0 {
+                let mut signals = vec![Signal::Gear(ShiftState::D), Signal::Speed(25.0)];
+                if secs % 30 == 0 {
+                    signals.push(Signal::Location(latitude(secs), 20.0));
+                }
+                let half = at(secs.into()) + Duration::milliseconds(500);
+                replay.send(vehicle_data(half, &signals)).await;
+            }
+        }
+        let track: Vec<(Option<f64>, String)> = sqlx::query_as(
+            "SELECT latitude, source FROM positions
+             WHERE drive_id IS NOT NULL ORDER BY recorded_at, id",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        let telemetry = track.iter().filter(|(_, source)| source == "telemetry");
+        assert!(telemetry.count() >= 8, "telemetry points are kept");
+        let mut previous = f64::MIN;
+        for (lat, source) in &track {
+            let Some(lat) = lat else { continue };
+            assert!(*lat >= previous, "{source} point jumps back to {lat}");
+            previous = *lat;
+        }
+        let located: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM positions WHERE source = 'telemetry' AND latitude IS NOT NULL",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(located.0 <= 5, "only Location messages carry coordinates");
     }
 
     #[tokio::test]

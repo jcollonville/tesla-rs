@@ -21,6 +21,41 @@ use super::widget::element;
 
 use crate::rdp::rdp_limit;
 
+/// A stream fix this close to another point covers it on the map and charts.
+const STREAM_COVER_SECS: i64 = 15;
+
+/// Which points of a drive to draw, given each point's time and whether it
+/// came from the Owner stream. Input is ordered by time.
+///
+/// The stream sends about one fix per second; telemetry and polling are sparser
+/// and sampled on another clock, so interleaving them zigzags between two
+/// tracks. Where the stream covers a span only its fixes are kept; elsewhere
+/// every point is kept, so a telemetry-only stretch still draws.
+pub(crate) fn one_source_mask(points: &[(chrono::DateTime<chrono::Utc>, bool)]) -> Vec<bool> {
+    let stream: Vec<i64> = points
+        .iter()
+        .filter(|(_, is_stream)| *is_stream)
+        .map(|(at, _)| at.timestamp_millis())
+        .collect();
+    let cover = STREAM_COVER_SECS.saturating_mul(1_000);
+    points
+        .iter()
+        .map(|(at, is_stream)| {
+            if *is_stream {
+                return true;
+            }
+            let ms = at.timestamp_millis();
+            let next = stream.partition_point(|stamp| *stamp < ms);
+            let near = |index: usize| {
+                stream
+                    .get(index)
+                    .is_some_and(|stamp| stamp.abs_diff(ms) <= cover.unsigned_abs())
+            };
+            !(near(next) || next.checked_sub(1).is_some_and(near))
+        })
+        .collect()
+}
+
 /// Metres per degree of latitude.
 const M_PER_DEG: f64 = 111_320.0;
 
@@ -561,6 +596,41 @@ pub(crate) fn soc_bar(start: Option<f64>, end: Option<f64>) -> Markup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn one_source_mask_prefers_the_stream_where_it_covers() {
+        let start = chrono::Utc::now();
+        let at = |ms: i64| start + chrono::Duration::milliseconds(ms);
+        let mut points = Vec::new();
+        for secs in 0..60_i64 {
+            points.push((at(secs * 1_000), true));
+            if secs % 10 == 0 {
+                points.push((at(secs * 1_000 + 500), false));
+            }
+        }
+        for secs in [120_i64, 130, 140] {
+            points.push((at(secs * 1_000), false));
+        }
+        let mask = super::one_source_mask(&points);
+        let kept: Vec<_> = points
+            .iter()
+            .zip(&mask)
+            .filter(|(_, keep)| **keep)
+            .collect();
+        assert_eq!(kept.len(), 63, "stream span plus the telemetry-only tail");
+        assert!(kept[..60].iter().all(|((_, stream), _)| *stream));
+        assert!(kept[60..].iter().all(|((_, stream), _)| !*stream));
+    }
+
+    #[test]
+    fn one_source_mask_keeps_everything_without_a_stream() {
+        let start = chrono::Utc::now();
+        let points: Vec<_> = (0..5_i64)
+            .map(|secs| (start + chrono::Duration::seconds(secs * 10), false))
+            .collect();
+        assert!(super::one_source_mask(&points).iter().all(|keep| *keep));
+        assert_eq!(super::one_source_mask(&[]), Vec::<bool>::new());
+    }
+
     use super::{
         Frame, MiniMap, chart_svg, map_json, mini_map, mini_map_model, point_json, route_map,
         stride,
